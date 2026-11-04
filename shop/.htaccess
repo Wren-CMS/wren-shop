@@ -1,0 +1,8 @@
+# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,
+# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.
+Options -Indexes
+RewriteEngine On
+RewriteRule ^data(/|$) - [F]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ index.php?q=$1 [QSA,L]

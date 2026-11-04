@@ -1,0 +1,9 @@
+# Live data never belongs in the repository
+shop/data/
+shop/media/p/
+# Downloads and unzipped releases
+*.zip
+wren-shop-*/
+.DS_Store
+# The wiki is its own repository, often cloned inside this one
+wren-shop.wiki/
