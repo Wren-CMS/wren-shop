@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0 (4 November 2026)
+
+**Digital downloads and Wren theme licences.**
+
+- Sell downloads: a product can be a zip file instead of something to post. Downloads-only orders skip delivery, and customers find their files in their account as soon as they've paid.
+- Wren themes can be licensed for one website. Each copy bought gets a licence key; customers choose and change the website in their account (up to 3 moves in 30 days, all logged). Licences include 12 months of updates (you choose), with a paid **Renew** for more.
+- Licences are signed with a key your shop makes for itself, and Wren 1.11 checks them and renews them by itself, so refunds and moves take effect. Only themes marked as licensed are checked; people's own and free themes never need one.
+- **Customers → Licences**: search, change website, extend updates, cancel or reinstate, and each licence's history. Refunding an order cancels its licences; refunding a renewal takes its months back.
+- Checkout records the customer's agreement to download straight away (UK rules on cancelling digital content).
+- Buying a download needs a customer account.
+- A deleted customer's number is never given to a new account.
+
 ## 1.0.0 (4 November 2026)
 
 First public release.

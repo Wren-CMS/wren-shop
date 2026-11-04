@@ -12,6 +12,7 @@ It's one PHP file and a SQLite database, made for small UK businesses.
 - VAT shown for VAT-registered shops
 - Order emails over your own SMTP, packing slips, refunds through PayPal
 - Customer accounts (guest checkout always works), discount codes, and customer groups such as reseller prices
+- **Digital downloads**, including Wren themes licensed per website, with renewals for updates
 - Low-stock emails, CSV export for bookkeeping, and a tool for customers' data requests
 - An admin that works on a phone, with two-factor sign-in and a "Getting ready" checklist for launch or handover
 

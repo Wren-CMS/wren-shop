@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.0.0';
+const SHOP_VERSION    = '1.1.0';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -517,6 +517,74 @@ function shop_migrate(PDO $pdo): void
         @chmod(SHOP_DB, 0600);
         $pdo->exec("UPDATE settings SET value = '10' WHERE name = 'schema_version'");
         $pdo->commit();
+    }
+    if ((int)$pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn() < 11) {   // 1.1.0: downloads and theme licences
+        $pdo->beginTransaction();
+        $pdo->exec('
+            ALTER TABLE products ADD COLUMN kind TEXT NOT NULL DEFAULT "physical";
+            ALTER TABLE products ADD COLUMN licensed INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE products ADD COLUMN theme_id TEXT NOT NULL DEFAULT "";
+            ALTER TABLE products ADD COLUMN renew_pence INTEGER DEFAULT NULL;
+            ALTER TABLE products ADD COLUMN update_months INTEGER NOT NULL DEFAULT 12;
+            CREATE TABLE product_files (
+                id         INTEGER PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                version    TEXT NOT NULL,
+                file       TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                size       INTEGER NOT NULL DEFAULT 0,
+                uploaded   TEXT NOT NULL
+            );
+            CREATE INDEX idx_product_files ON product_files (product_id, uploaded);
+            CREATE TABLE licences (
+                id            INTEGER PRIMARY KEY,
+                lkey          TEXT NOT NULL UNIQUE,
+                product_id    INTEGER NOT NULL,
+                order_id      INTEGER NOT NULL,
+                customer_id   INTEGER DEFAULT NULL,
+                domain        TEXT NOT NULL DEFAULT "",
+                status        TEXT NOT NULL DEFAULT "active",
+                created       TEXT NOT NULL,
+                updates_until TEXT NOT NULL
+            );
+            CREATE INDEX idx_licences_customer ON licences (customer_id);
+            CREATE INDEX idx_licences_order ON licences (order_id);
+            CREATE TABLE licence_log (
+                id         INTEGER PRIMARY KEY,
+                licence_id INTEGER NOT NULL,
+                at         TEXT NOT NULL,
+                action     TEXT NOT NULL,
+                detail     TEXT NOT NULL DEFAULT ""
+            );
+            CREATE INDEX idx_licence_log ON licence_log (licence_id, at);
+            ALTER TABLE order_items ADD COLUMN licence_id INTEGER DEFAULT NULL;
+            ALTER TABLE orders ADD COLUMN digital_consent TEXT NOT NULL DEFAULT "";
+        ');
+        $pdo->exec("UPDATE settings SET value = '11' WHERE name = 'schema_version'");
+        $pdo->commit();
+    }
+    if ((int)$pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn() < 12) {
+        // 1.1.0: a deleted customer's number is never given to a new account (with it went
+        // their licences, and any session still signed in elsewhere). Rebuild with AUTOINCREMENT.
+        $pdo->exec('PRAGMA foreign_keys = OFF');
+        $pdo->beginTransaction();
+        $sql = (string)$pdo->query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'customers'")->fetchColumn();
+        $idx = $pdo->query("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'customers' AND sql IS NOT NULL")->fetchAll(PDO::FETCH_COLUMN);
+        if (!preg_match('/AUTOINCREMENT/i', $sql)) {
+            $new = preg_replace('/^\s*CREATE TABLE\s+"?customers"?/i', 'CREATE TABLE customers_v12', $sql);
+            $new = preg_replace('/\bid\s+INTEGER\s+PRIMARY\s+KEY\b/i', 'id INTEGER PRIMARY KEY AUTOINCREMENT', $new, 1);
+            $pdo->exec($new);
+            $pdo->exec('INSERT INTO customers_v12 SELECT * FROM customers');
+            $pdo->exec('DROP TABLE customers');
+            $pdo->exec('ALTER TABLE customers_v12 RENAME TO customers');
+            foreach ($idx as $i) {
+                $pdo->exec($i);
+            }
+        }
+        $pdo->exec('ALTER TABLE order_items ADD COLUMN months INTEGER NOT NULL DEFAULT 0');   // months a renewal added
+        $pdo->exec("UPDATE settings SET value = '12' WHERE name = 'schema_version'");
+        $pdo->commit();
+        $pdo->exec('PRAGMA foreign_keys = ON');
     }
 }
 
@@ -1364,6 +1432,10 @@ function view_product(string $slug): never
               . 'var o=s.options[s.selectedIndex];p.innerHTML=o.value?o.dataset.price:d;'
               . 'q.max=o.value?o.dataset.max:"' . QTY_LIMIT . '";if(+q.value>+q.max)q.value=q.max;});})();</script>';
     }
+    if (is_digital($p)) {
+        $buy .= '<p class="shop-hint shop-digital">Download: yours to download from your account as soon as you\'ve paid'
+              . ((int)$p['licensed'] ? '. Licensed for one website, with ' . (int)$p['update_months'] . ' months of updates included.' : '.') . '</p>';
+    }
     if (!$out && !$vars && $p['stock'] !== null && (int)$p['stock'] <= 3) {
         $buy .= '<p><em>Only ' . (int)$p['stock'] . ' left.</em></p>';
     }
@@ -1426,6 +1498,9 @@ function basket_key(int $pid, ?int $vid): string
    has been hidden, deleted, or its choices have changed since. */
 function basket_item(string|int $key): ?array
 {
+    if (str_starts_with((string)$key, 'r')) {
+        return renewal_item((string)$key);
+    }
     $parts = explode(':', (string)$key, 2);
     $pid = (int)$parts[0];
     $vid = isset($parts[1]) ? (int)$parts[1] : null;
@@ -1455,6 +1530,9 @@ function item_name(array $p, ?array $v): string
 /* The most of a product, or of one of its choices, one basket may hold. */
 function qty_max(array $p, ?array $v = null): int
 {
+    if (is_digital($p)) {   // one copy of a download; a theme licence per website, so a few at most
+        return isset($p['renew_licence']) || !(int)$p['licensed'] ? 1 : 10;
+    }
     $stock = $v ? $v['stock'] : $p['stock'];
     return $stock === null ? QTY_LIMIT : max(0, min(QTY_LIMIT, (int)$stock));
 }
@@ -1577,9 +1655,12 @@ function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0):
     if ($method === '') {
         $method = can_deliver() ? 'deliver' : (can_collect() ? 'collect' : 'deliver');
     }
+    if (!basket_physical()) {   // downloads only: nothing to post or collect
+        $method = 'none';
+    }
     $postage = null;   // null = not set up yet
     $toFree = null;
-    if ($method === 'collect') {
+    if ($method === 'collect' || $method === 'none') {
         $postage = 0;
     } elseif (setting('postage_price') !== '') {
         $postage = (int)setting('postage_price');
@@ -1687,7 +1768,7 @@ function view_basket(): never
         }
         $collectNote = trim(setting('postage_collect_note'));
         $choice = '';
-        if (can_deliver() && can_collect()) {
+        if (can_deliver() && can_collect() && $t['method'] !== 'none') {
             // What delivery would cost for this basket, whichever option is ticked now.
             $over = setting('postage_free_over');
             $dp = setting('postage_price');
@@ -1699,7 +1780,7 @@ function view_basket(): never
                 . '<label><input type="radio" name="delivery" value="collect"' . ($t['method'] === 'collect' ? ' checked' : '')
                 . ' onchange="this.form.requestSubmit(this.form.querySelector(\'.shop-default\'))"> Collect (free)</label></fieldset>';
         }
-        $postLabel = $t['method'] === 'collect' ? 'Collection' : 'UK delivery';
+        $postLabel = $t['method'] === 'collect' ? 'Collection' : ($t['method'] === 'none' ? '' : 'UK delivery');
         $postCell = $t['postage'] === null ? 'Added at checkout' : ($t['postage'] === 0 ? 'Free' : money($t['postage']));
         $body .= '<form method="post" action="' . e(shop_url('basket/update')) . '">' . csrf_field()
             // Pressing Enter in a quantity box uses the form's first button, so it must be Update.
@@ -1714,7 +1795,7 @@ function view_basket(): never
                 . '<td class="shop-num"><button class="shop-remove" name="discount_remove" value="1" aria-label="Remove discount code ' . e($t['code']) . '">Remove</button></td></tr>' : '')
             . ($t['group_pence'] > 0 ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="3">' . e($t['group']) . ' prices</th>'
                 . '<td class="shop-num">−' . money($t['group_pence']) . '</td><td></td></tr>' : '')
-            . '<tr class="shop-sub"><th scope="row" colspan="3">' . $postLabel . '</th><td class="shop-num shop-postage">' . $postCell . '</td><td></td></tr>'
+            . ($postLabel !== '' ? '<tr class="shop-sub"><th scope="row" colspan="3">' . $postLabel . '</th><td class="shop-num shop-postage">' . $postCell . '</td><td></td></tr>' : '')
             . '<tr class="shop-grand"><th scope="row" colspan="3">Total</th><td class="shop-num shop-total">' . money($t['total']) . '</td><td></td></tr>'
             . ($t['vat'] !== null ? '<tr class="shop-sub"><td colspan="4" class="shop-num shop-vat">Includes VAT of ' . money($t['vat']) . '</td><td></td></tr>' : '')
             . '</tfoot></table>'
@@ -2519,6 +2600,7 @@ function view_admin_products(): never
             . ($ph ? '<img src="' . e(media_url($ph['thumb'])) . '" alt="">' : '<span class="noimg"></span>')
             . '<div class="pname"><a href="' . $edit . '">' . e($p['name']) . '</a>'
             . (!$p['visible'] ? '<span class="pill">Hidden</span>' : '')
+            . (is_digital($p) ? '<span class="pill">' . ((int)$p['licensed'] ? 'Theme' : 'Download') . '</span>' : '')
             . (sold_out($p, $pv) ? '<span class="pill out">Sold out</span>' : (stock_low($p, $pv) ? '<span class="pill wait">Low stock</span>' : ''))
             . '<small>' . price_label($p, $pv) . ($p['cat'] ? ' · ' . e($p['cat']) : '') . '</small></div>'
             . $stockForm
@@ -2646,6 +2728,7 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         . '<input type="number" name="stock" min="0" inputmode="numeric" value="' . e($v['stock']) . '"></label>'
         . '<p class="muted" id="stocknote"' . ($hasOpts ? '' : ' hidden') . '>Stock is counted for each choice in Options below.</p>'
         . $optionsHtml
+        . digital_fields_html($p, $v)
         . '<label class="check"><input type="checkbox" name="visible" value="1"' . ($v['visible'] ? ' checked' : '') . '> Show in the shop</label>'
         . (!$isNew ? '<details' . ($errors && $v['slug'] !== $p['slug'] ? ' open' : '') . '><summary>More</summary>'
             . '<label>Web address <span class="hint">(' . e(abs_shop_url('p/')) . '…) Changing it breaks old links.</span>'
@@ -2780,8 +2863,9 @@ function admin_save(): never
         $errors[] = 'A product needs at least one photo. Add another before removing this one.';
         $op = '';
     }
+    $dg = digital_input($p, $v, $errors);
     if ($errors) {
-        view_product_form($p, $v, array_merge($errors, $uploads ? ['Please choose the new photos again.'] : []));
+        view_product_form($p, $v, array_merge($errors, $dg['upload'] ? ['Please choose the files again.'] : ($uploads ? ['Please choose the new photos again.'] : [])));
     }
 
     $pdo = db();
@@ -2879,6 +2963,12 @@ function admin_save(): never
         }
     }
 
+    digital_save($pid, $dg, $msgs);
+    if ($dg['kind'] === 'digital' && !product_files($pid) && $v['visible']) {   // nothing to download yet
+        $pdo->prepare('UPDATE products SET visible = 0 WHERE id = ?')->execute([$pid]);
+        $msgs[] = 'It\'s hidden until it has a file to download.';
+    }
+
     // Uploads can all fail (wrong file type): never leave a photo-less product on sale.
     $hidden = false;
     if (!product_photos($pid) && $v['visible']) {
@@ -2918,6 +3008,8 @@ function admin_duplicate(): never
         ->execute([unique_slug('products', slugify($name)), $name, $p['price_pence'], $p['description'],
                    $p['category_id'], $p['stock'], $p['option_name'], now(), now()]);
     $nid = (int)$pdo->lastInsertId();
+    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, renew_pence = ?, update_months = ? WHERE id = ?')
+        ->execute([$p['kind'], $p['licensed'], $p['renew_pence'], $p['update_months'], $nid]);
     foreach (product_variants((int)$p['id']) as $x) {
         $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position) VALUES (?, ?, ?, ?, ?)')
             ->execute([$nid, $x['name'], $x['price_pence'], $x['stock'], $x['position']]);
@@ -2945,6 +3037,11 @@ function admin_delete(): never
     require_admin();
     csrf_check();
     $p = product_by_id((int)($_POST['id'] ?? 0));
+    $sold = $p ? (int)db()->query('SELECT COUNT(*) FROM licences WHERE product_id = ' . (int)$p['id'])->fetchColumn() : 0;
+    if ($sold) {
+        flash($p['name'] . ' has been bought as a download, and customers still need it. Hide it instead (untick "Show in the shop").');
+        redirect(admin_url('edit/' . $p['id']));
+    }
     if ($p) {
         foreach (product_photos((int)$p['id']) as $ph) {
             $st = db()->prepare('SELECT COUNT(*) FROM photos WHERE file = ? AND id != ?');
@@ -2953,6 +3050,10 @@ function admin_delete(): never
                 photo_delete_files($ph);
             }
         }
+        foreach (product_files((int)$p['id']) as $f) {   // never bought, so nobody needs these
+            @unlink(files_dir() . '/' . basename($f['file']));
+        }
+        db()->prepare('DELETE FROM product_files WHERE product_id = ?')->execute([$p['id']]);
         db()->prepare('DELETE FROM products WHERE id = ?')->execute([$p['id']]);
         flash($p['name'] . ' deleted.');
     }
@@ -3430,6 +3531,8 @@ function view_admin_settings(): never
         <label class="check"><input type="checkbox" name="show_version" value="1"' . (setting('show_version', '1') === '1' ? ' checked' : '') . '> Show the Wren Shop version in the footer, after Wren\'s</label>
         <button class="quiet">Save</button></form>
 
+      ' . licence_settings_html() . '
+
       <h2 id="demo">Demo mode</h2>
       <p class="muted">For showing the shop off rather than selling. Every page has a banner saying it\'s a demo, search engines are asked
       not to list it, and visitors can\'t check out or create accounts. While you\'re signed in here you still can, so you can test.
@@ -3591,6 +3694,7 @@ function order_mark_paid(int $oid, string $captureId, string $how): bool
         return false;
     }
     order_note($oid, 'Paid: ' . $how);
+    digital_on_paid($oid);
     $o = order_by('id', $oid);
     if ($o['payment_method'] === 'paypal') {
         mail_order_event($oid, 'paid');
@@ -3615,6 +3719,7 @@ function order_mark_refunded(int $oid, bool $restock, string $how): bool
             order_restock($oid);
         }
         order_note($oid, $how . ($restock ? ', stock put back' : ''));
+        digital_on_refund($oid);
     }
     $pdo->exec('COMMIT');
     if ($done) {
@@ -3897,6 +4002,9 @@ function checkout_blocked(?array $t = null): ?string
     if (!pay_enabled('paypal') && !pay_enabled('bank') && !pay_enabled('collection')) {
         return 'This shop isn\'t taking orders online just yet.';
     }
+    if (!accounts_on() && basket_digital()) {
+        return 'Downloads need a customer account, and accounts are switched off in this shop.';
+    }
     if (data_known_exposed()) {   // don't collect anyone's details until the owner fixes it
         return 'This shop isn\'t taking orders online just now. Please try again later.';
     }
@@ -3960,8 +4068,8 @@ function summary_table(string $rows, int $sub, ?int $post, string $postLabel, in
          . ($code !== '' ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="2">Discount <span class="shop-code-name">' . e($code) . '</span></th><td class="shop-num">'
              . ($disc > 0 ? '−' . money($disc) : 'Free delivery') . '</td></tr>' : '')
          . ($gp > 0 ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="2">' . e($group) . ' prices</th><td class="shop-num">−' . money($gp) . '</td></tr>' : '')
-         . '<tr class="shop-sub"><th scope="row" colspan="2">' . e($postLabel) . '</th><td class="shop-num">'
-         . ($post === null ? 'Added at checkout' : ($post === 0 ? 'Free' : money($post))) . '</td></tr>'
+         . ($postLabel !== '' ? '<tr class="shop-sub"><th scope="row" colspan="2">' . e($postLabel) . '</th><td class="shop-num">'
+         . ($post === null ? 'Added at checkout' : ($post === 0 ? 'Free' : money($post))) . '</td></tr>' : '')
          . '<tr class="shop-grand"><th scope="row" colspan="2">Total</th><td class="shop-num shop-total">' . money($total) . '</td></tr>';
     if ($vat !== null && $vatShown) {
         $out .= '<tr class="shop-sub"><td colspan="3" class="shop-num shop-vat">Includes VAT of ' . money($vat) . '</td></tr>';
@@ -4028,8 +4136,17 @@ function view_checkout(array $errors = [], ?array $v = null): never
            'bill_postcode' => '', 'same' => '1', 'ship_name' => '', 'ship_line1' => '', 'ship_line2' => '', 'ship_town' => '',
            'ship_postcode' => '', 'note' => '', 'pay' => ''];
     $deliver = $t['method'] === 'deliver';
+    $digital = basket_digital();
+    if ($digital && !$me) {   // downloads live in the customer's account
+        flash('Please sign in or create an account to buy downloads. They\'ll be waiting in your account once you\'ve paid.');
+        redirect(shop_url('account/login') . '?next=checkout');
+    }
     $methods = array_values(array_filter(['paypal', 'bank', 'collection'],
-        fn($m) => pay_enabled($m) && ($m !== 'collection' || !$deliver)));
+        fn($m) => pay_enabled($m) && ($m !== 'collection' || $t['method'] === 'collect')));
+    if (!$methods) {
+        flash('This order can\'t be paid online yet.');
+        redirect(shop_url('basket'));
+    }
     if (!in_array($v['pay'], $methods, true)) {
         $v['pay'] = $methods[0];
     }
@@ -4088,6 +4205,8 @@ function view_checkout(array $errors = [], ?array $v = null): never
             . $field('ship_town', 'Town or city', 'autocomplete="shipping address-level2" maxlength="80"')
             . $field('ship_postcode', 'Postcode', 'autocomplete="shipping postal-code" maxlength="10" class="shop-short" autocapitalize="characters"')
             . '</div><p class="shop-hint">We deliver to UK addresses.</p></fieldset>';
+    } elseif ($t['method'] === 'none') {
+        $body .= '';   // downloads only: nothing to deliver
     } else {
         $body .= '<fieldset><legend>Collection</legend><p>You\'ve chosen to collect your order.'
             . ($collectNote !== '' ? '</p><p>' . nl2br(e($collectNote)) : '') . '</p>'
@@ -4100,7 +4219,9 @@ function view_checkout(array $errors = [], ?array $v = null): never
     $body .= '<fieldset><legend>Payment</legend>' . $pay . '</fieldset>'
         . '<label>Note for the shop <span class="shop-hint">(optional)</span><textarea name="note" maxlength="500" rows="3">' . e($v['note']) . '</textarea></label>'
         . '<h2 class="shop-h2">Your order</h2>'
-        . summary_table($rows, $t['subtotal'], $t['postage'], $deliver ? 'UK delivery' : 'Collection', $t['total'], $t['vat'], true, $t['code'], $t['discount'], $t['group'], $t['group_pence'])
+        . ($digital ? '<label class="shop-radio"><input type="checkbox" name="digital_ok" value="1" required> <span>I want my download'
+            . ' straight away, and understand that once I\'ve started downloading I lose my right to cancel.</span></label>' : '')
+        . summary_table($rows, $t['subtotal'], $t['postage'], $deliver ? 'UK delivery' : ($t['method'] === 'none' ? '' : 'Collection'), $t['total'], $t['vat'], true, $t['code'], $t['discount'], $t['group'], $t['group_pence'])
         . '<p class="shop-hint"><a href="' . e(shop_url('basket')) . '">Change your basket</a>'
         . ($t['code'] === '' && discounts_live() ? ' · Have a discount code? Add it in your basket.' : '') . '</p>'
         . seller_html()
@@ -4143,6 +4264,7 @@ function checkout_post(): never
         $v[$k] = mb_substr(post($k), 0, $k === 'note' ? 500 : 200);
     }
     $v['same'] = !$deliver || !empty($_POST['same']) ? '1' : '0';
+    $digital = basket_digital();
     $v['save'] = !empty($_POST['save']) ? '1' : '0';
     $me = current_customer();
     $_SESSION['shop_checkout'] = $v;   // so nothing typed is lost
@@ -4175,7 +4297,14 @@ function checkout_post(): never
             $v['ship_postcode'] = $sp;
         }
     }
-    $methodOk = pay_enabled($v['pay']) && ($v['pay'] !== 'collection' || !$deliver);
+    $methodOk = pay_enabled($v['pay']) && ($v['pay'] !== 'collection' || $t['method'] === 'collect');
+    if ($digital && !$me) {
+        flash('Please sign in or create an account to buy downloads.');
+        redirect(shop_url('account/login') . '?next=checkout');
+    }
+    if ($digital && empty($_POST['digital_ok'])) {
+        $errors[] = 'Please tick to say you want your download straight away (you lose the right to cancel once you start downloading).';
+    }
     if (!$methodOk) {
         $errors[] = 'Choose how you\'d like to pay.';
     }
@@ -4257,19 +4386,19 @@ function checkout_post(): never
                    bill_name, bill_line1, bill_line2, bill_town, bill_postcode,
                    ship_name, ship_line1, ship_line2, ship_town, ship_postcode, same_address, customer_note,
                    subtotal_pence, postage_pence, total_pence, vat_pence, vat_number, created, updated, customer_id,
-                   discount_id, discount_code, discount_pence, group_name, group_pence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                   discount_id, discount_code, discount_pence, group_name, group_pence, digital_consent)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         ->execute([$number, $token, $status, $v['pay'], $t['method'], $v['email'], $v['phone'],
                    $v['bill_name'], $v['bill_line1'], $v['bill_line2'], $v['bill_town'], $v['bill_postcode'],
                    $deliver ? $v['ship_name'] : '', $deliver ? $v['ship_line1'] : '', $deliver ? $v['ship_line2'] : '',
                    $deliver ? $v['ship_town'] : '', $deliver ? $v['ship_postcode'] : '', (int)$v['same'], $v['note'],
                    $t['subtotal'], (int)$t['postage'], $t['total'], $t['vat'],
                    $t['vat'] !== null ? setting('vat_number') : '', now(), now(), $me ? (int)$me['id'] : null,
-                   $t['discount_id'], $t['code'], $t['discount'], $t['group'], $t['group_pence']]);
+                   $t['discount_id'], $t['code'], $t['discount'], $t['group'], $t['group_pence'], $digital ? now() : '']);
     $oid = (int)$pdo->lastInsertId();
     foreach ($lines as $l) {
-        $pdo->prepare('INSERT INTO order_items (order_id, product_id, variant_id, name, option_label, unit_pence, qty) VALUES (?, ?, ?, ?, ?, ?, ?)')
-            ->execute([$oid, $l['p']['id'], $l['v'] ? $l['v']['id'] : null, $l['p']['name'], $l['option'], $l['price'], $l['qty']]);
+        $pdo->prepare('INSERT INTO order_items (order_id, product_id, variant_id, name, option_label, unit_pence, qty, licence_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$oid, $l['p']['id'], $l['v'] ? $l['v']['id'] : null, $l['p']['name'], $l['option'], $l['price'], $l['qty'], $l['p']['renew_licence'] ?? null]);
         if ($l['v']) {
             $pdo->prepare('UPDATE variants SET stock = stock - ? WHERE id = ? AND stock IS NOT NULL')->execute([$l['qty'], $l['v']['id']]);
         } else {
@@ -4414,16 +4543,19 @@ function view_order(string $token): never
             . (unpaid_days() > 0 && $o['created'] >= setting('unpaid_since', '2100-01-01') ? '<dt>Please pay by</dt><dd>' . e(pay_by_date($o)) . '</dd>' : '') . '</dl>'
             . (trim(setting('bank_note')) !== '' ? '<p>' . nl2br(e(setting('bank_note'))) . '</p>' : '') . '</div>';
     }
-    $where = $o['delivery'] === 'collect'
+    $where = $o['delivery'] === 'none'
+        ? '<h2 class="shop-h2">Your downloads</h2><p>' . ($o['status'] === 'paid' ? 'Ready in your account: <a href="' . e(shop_url('account/licences')) . '">Downloads and licences</a>.'
+            : 'They\'ll be in your account under Downloads and licences as soon as payment arrives.') . '</p>'
+        : ($o['delivery'] === 'collect'
         ? '<h2 class="shop-h2">Collection</h2>' . (trim(setting('postage_collect_note')) !== '' ? '<p>' . nl2br(e(setting('postage_collect_note'))) . '</p>' : '<p>We\'ll be in touch about collection.</p>')
-        : '<h2 class="shop-h2">Delivery address</h2><p>' . address_html('ship_', $o) . '</p>';
+        : '<h2 class="shop-h2">Delivery address</h2><p>' . address_html('ship_', $o) . '</p>');
     $body = $head . '<div class="post-body">' . $bank
         . ($o['fulfilled'] === 'sent' ? '<p class="shop-note">Sent on ' . e(gmdate('j F Y', strtotime($o['fulfilled_at'] . ' UTC')))
             . ($o['tracking'] !== '' ? '. Tracking: ' . e($o['tracking']) : '') . '.</p>' : '')
         . ($o['fulfilled'] === 'collected' ? '<p class="shop-note">Collected on ' . e(gmdate('j F Y', strtotime($o['fulfilled_at'] . ' UTC'))) . '.</p>' : '')
         . '<h2 class="shop-h2">Your order</h2>'
         . summary_table(order_rows($o), (int)$o['subtotal_pence'], (int)$o['postage_pence'],
-                        $o['delivery'] === 'collect' ? 'Collection' : 'UK delivery', (int)$o['total_pence'],
+                        $o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? '' : 'UK delivery'), (int)$o['total_pence'],
                         $o['vat_pence'] === null ? null : (int)$o['vat_pence'], true, $o['discount_code'], (int)$o['discount_pence'], $o['group_name'], (int)$o['group_pence'])
         . '<p class="shop-hint">' . (in_array($o['status'], ['paid', 'refunded'], true) ? 'Paid by: ' : 'Paying by: ') . method_label($o['payment_method'])
         . ' · Placed ' . e(gmdate('j F Y, H:i', strtotime($o['created'] . ' UTC'))) . ' UTC'
@@ -4451,7 +4583,7 @@ function status_pill(array $o): string
     $cls = in_array($o['status'], ['cancelled', 'refunded'], true) ? '' : ($o['status'] === 'paid' ? ' ok' : ' wait');
     $out = '<span class="pill' . $cls . '">' . e(status_label($o['status'])) . '</span>';
     if ($o['fulfilled'] !== '') {
-        $out .= '<span class="pill">' . ($o['fulfilled'] === 'sent' ? 'Sent' : 'Collected') . '</span>';
+        $out .= '<span class="pill">' . (['sent' => 'Sent', 'digital' => 'Download'][$o['fulfilled']] ?? 'Collected') . '</span>';
     } elseif ($o['status'] === 'paid') {
         $out .= '<span class="pill out">' . ($o['delivery'] === 'collect' ? 'To collect' : 'To send') . '</span>';
     }
@@ -4471,7 +4603,7 @@ function view_admin_orders(): never
         $list .= '<li><div class="pname"><a href="' . e(admin_url('order/' . $o['id'])) . '">#' . (int)$o['number'] . ' · ' . e($o['bill_name']) . '</a>'
                . status_pill($o)
                . '<small>' . money((int)$o['total_pence']) . ' · ' . method_label($o['payment_method'])
-               . ' · ' . ($o['delivery'] === 'collect' ? 'Collection' : 'Delivery')
+               . ' · ' . ($o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? 'Download' : 'Delivery'))
                . ($o['discount_code'] !== '' ? ' · ' . e($o['discount_code']) : '')
                . ($o['group_name'] !== '' ? ' · ' . e($o['group_name']) : '')
                . ' · ' . e(gmdate('j M H:i', strtotime($o['created'] . ' UTC'))) . '</small></div></li>';
@@ -4551,7 +4683,7 @@ function view_admin_order(int $id): never
             . ($o['discount_code'] !== '' ? '<tr><td colspan="2">Discount <a href="' . e(admin_url('discount/' . (int)$o['discount_id'])) . '"><code>' . e($o['discount_code']) . '</code></a></td><td style="text-align:right">'
                 . ((int)$o['discount_pence'] > 0 ? '−' . money((int)$o['discount_pence']) : 'Free delivery') . '</td></tr>' : '')
             . ((int)$o['group_pence'] > 0 ? '<tr><td colspan="2">' . e($o['group_name']) . ' prices</td><td style="text-align:right">−' . money((int)$o['group_pence']) . '</td></tr>' : '')
-            . '<tr><td colspan="2">' . ($o['delivery'] === 'collect' ? 'Collection' : 'UK delivery') . '</td><td style="text-align:right">'
+            . '<tr><td colspan="2">' . ($o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? 'Delivery (download)' : 'UK delivery')) . '</td><td style="text-align:right">'
             . ((int)$o['postage_pence'] ? money((int)$o['postage_pence']) : 'Free') . '</td></tr>'
             . '<tr><td colspan="2"><b>Total</b></td><td style="text-align:right"><b>' . money((int)$o['total_pence']) . '</b></td></tr>'
             . ($o['vat_pence'] !== null ? '<tr><td colspan="3" class="muted" style="text-align:right">Includes VAT of ' . money((int)$o['vat_pence']) . '</td></tr>' : '');
@@ -4564,7 +4696,7 @@ function view_admin_order(int $id): never
         . ($o['fulfilled_at'] !== '' ? ' · ' . $o['fulfilled'] . ' ' . $f($o['fulfilled_at']) : '')
         . ($o['tracking'] !== '' ? ' · tracking ' . e($o['tracking']) : '') . '</p>'
         . ($actions !== '' ? '<div class="actions-row" style="margin-top:1rem;border:0;padding:0">' . $actions . '</div>' : '')
-        . '<h2>Items</h2><table>' . $items . '</table>'
+        . '<h2>Items</h2><table>' . $items . '</table>' . order_licences_html((int)$o['id'])
         . '<h2>Customer</h2><p>' . e($o['bill_name']) . '<br><a href="mailto:' . e($o['email']) . '">' . e($o['email']) . '</a>'
         . (($cust = $o['customer_id'] !== null ? customer_by_id((int)$o['customer_id']) : customer_by_email($o['email']))
             ? '<br><a href="' . e(admin_url('customer/' . $cust['id'])) . '">Customer account &rarr;</a>' : '')
@@ -5045,19 +5177,19 @@ function mail_order_table(array $o): array
         $text .= (int)$it['qty'] . ' × ' . $name . '  ' . money($line) . "\n";
     }
     $post = (int)$o['postage_pence'];
-    $postLabel = $o['delivery'] === 'collect' ? 'Collection' : 'UK delivery';
+    $postLabel = $o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? '' : 'UK delivery');
     $sum = fn(string $l, string $v, bool $b = false) => '<tr><td colspan="2" style="padding:6px 0;text-align:right' . ($b ? ';font-weight:700' : '') . '">' . $l
         . '</td><td style="padding:6px 0 6px 12px;text-align:right;white-space:nowrap' . ($b ? ';font-weight:700' : '') . '">' . $v . '</td></tr>';
     $disc = $o['discount_code'] !== '' ? ((int)$o['discount_pence'] > 0 ? '−' . money((int)$o['discount_pence']) : 'Free delivery') : '';
     $rows .= $sum('Subtotal', money((int)$o['subtotal_pence']))
            . ($disc !== '' ? $sum('Discount (' . e($o['discount_code']) . ')', $disc) : '')
            . ((int)$o['group_pence'] > 0 ? $sum(e($o['group_name']) . ' prices', '−' . money((int)$o['group_pence'])) : '')
-           . $sum($postLabel, $post ? money($post) : 'Free')
+           . ($postLabel !== '' ? $sum($postLabel, $post ? money($post) : 'Free') : '')
            . $sum('Total', money((int)$o['total_pence']), true);
     $text .= "\nSubtotal  " . money((int)$o['subtotal_pence'])
            . ($disc !== '' ? "\nDiscount (" . $o['discount_code'] . ")  " . $disc : '')
            . ((int)$o['group_pence'] > 0 ? "\n" . $o['group_name'] . ' prices  −' . money((int)$o['group_pence']) : '')
-           . "\n$postLabel  " . ($post ? money($post) : 'Free')
+           . ($postLabel !== '' ? "\n$postLabel  " . ($post ? money($post) : 'Free') : '')
            . "\nTotal  " . money((int)$o['total_pence']) . "\n";
     if ($o['vat_pence'] !== null) {
         $rows .= '<tr><td colspan="3" style="padding:2px 0;text-align:right;color:#6b7280;font-size:14px">Includes VAT of ' . money((int)$o['vat_pence'])
@@ -5094,9 +5226,12 @@ function mail_order_event(int $oid, string $event): ?int
     [$table, $tableText] = mail_order_table($o);
     [$foot, $footText] = mail_footer();
     $collect = $o['delivery'] === 'collect';
-    $where = $collect
+    $where = $o['delivery'] === 'none'
+        ? ['Your downloads', [in_array($o['status'], ['paid'], true) ? 'Ready in your account: ' . abs_shop_url('account/licences')
+                                                                    : 'In your account under Downloads and licences as soon as payment arrives.']]
+        : ($collect
         ? ['Collection', trim(setting('postage_collect_note')) !== '' ? explode("\n", trim(str_replace("\r", '', setting('postage_collect_note')))) : ['We\'ll be in touch about collection.']]
-        : ['Delivery address', mail_address_lines('ship_', $o)];
+        : ['Delivery address', mail_address_lines('ship_', $o)]);
     $whereHtml = '<h2 style="font-size:16px;margin:22px 0 6px">' . $where[0] . '</h2><p style="margin:0">' . implode('<br>', array_map('e', $where[1])) . '</p>';
     $whereText = "\n" . strtoupper($where[0]) . "\n" . implode("\n", $where[1]) . "\n";
 
@@ -5129,12 +5264,12 @@ function mail_order_event(int $oid, string $event): ?int
         case 'paid':        // PayPal, confirmed
             $subject = 'Order ' . $n . ' confirmed';
             $heading = 'Thank you. Your order is confirmed';
-            $paras[] = 'We\'ve received your payment for order <strong>' . $n . '</strong>. ' . ($collect ? 'We\'ll let you know when it\'s ready to collect.' : 'We\'ll email you when it\'s on its way.');
+            $paras[] = 'We\'ve received your payment for order <strong>' . $n . '</strong>. ' . ($o['delivery'] === 'none' ? 'Your downloads are ready in your account.' : ($collect ? 'We\'ll let you know when it\'s ready to collect.' : 'We\'ll email you when it\'s on its way.'));
             break;
         case 'payment_received':   // bank transfer marked paid
             $subject = 'Payment received for order ' . $n;
             $heading = 'Payment received';
-            $paras[] = 'Thanks, your payment for order <strong>' . $n . '</strong> has arrived. ' . ($collect ? 'We\'ll let you know when it\'s ready to collect.' : 'We\'ll email you when it\'s on its way.');
+            $paras[] = 'Thanks, your payment for order <strong>' . $n . '</strong> has arrived. ' . ($o['delivery'] === 'none' ? 'Your downloads are ready in your account.' : ($collect ? 'We\'ll let you know when it\'s ready to collect.' : 'We\'ll email you when it\'s on its way.'));
             break;
         case 'sent':
             $subject = 'Order ' . $n . ' is on its way';
@@ -5169,7 +5304,7 @@ function mail_order_event(int $oid, string $event): ?int
                     'pay_on_collection' => 'to be paid on collection'][$o['status']] ?? $o['status'];
             $subject = 'New order ' . $n . ' - ' . money((int)$o['total_pence']) . ' (' . $how . ')';
             $heading = 'New order ' . $n;
-            $paras[] = e($o['bill_name']) . ' ordered ' . money((int)$o['total_pence']) . ', ' . $how . '. ' . ($collect ? 'They\'ll collect.' : 'To be sent.');
+            $paras[] = e($o['bill_name']) . ' ordered ' . money((int)$o['total_pence']) . ', ' . $how . '. ' . ($o['delivery'] === 'none' ? 'Downloads only.' : ($collect ? 'They\'ll collect.' : 'To be sent.'));
             $paras[] = 'Email: <a href="mailto:' . e($o['email']) . '">' . e($o['email']) . '</a>' . ($o['phone'] !== '' ? '<br>Phone: ' . e($o['phone']) : '');
             if ($o['customer_note'] !== '') {
                 $paras[] = 'Their note: ' . nl2br(e($o['customer_note']));
@@ -5800,7 +5935,7 @@ function customer_orders(array $c): array
 function customer_status(array $o): string
 {
     if ($o['status'] === 'paid') {
-        return ['sent' => 'Sent', 'collected' => 'Collected'][$o['fulfilled']] ?? ($o['delivery'] === 'collect' ? 'Paid, to collect' : 'Paid, being prepared');
+        return ['sent' => 'Sent', 'collected' => 'Collected', 'digital' => 'Paid: ready to download'][$o['fulfilled']] ?? ($o['delivery'] === 'collect' ? 'Paid, to collect' : 'Paid, being prepared');
     }
     return ['awaiting_payment' => 'Waiting for your bank transfer', 'pay_on_collection' => 'Pay when you collect',
             'cancelled' => 'Cancelled', 'refunded' => 'Refunded'][$o['status']] ?? status_label($o['status']);
@@ -5833,6 +5968,8 @@ function view_account(): never
             . $rows . '</tbody></table>' : '<p>No orders yet. <a href="' . e(shop_url()) . '">Have a look around the shop</a>.</p>')
         . '<h2 class="shop-h2">Your details</h2>'
         . '<ul class="shop-links">'
+        . ((int)db()->query('SELECT COUNT(*) FROM licences WHERE customer_id = ' . (int)$c['id'])->fetchColumn()
+            ? '<li><a href="' . e(shop_url('account/licences')) . '">Downloads and licences</a></li>' : '')
         . '<li><a href="' . e(shop_url('account/addresses')) . '">Addresses</a> <span class="shop-hint">' . ($addr ? e(implode(', ', $addr)) : 'none saved yet') . '</span></li>'
         . '<li><a href="' . e(shop_url('account/details')) . '">Name, phone and email</a></li>'
         . '<li><a href="' . e(shop_url('account/password')) . '">Change password</a></li>'
@@ -6038,6 +6175,7 @@ function customer_delete(int $cid): void
     $pdo = db();
     $pdo->exec('BEGIN IMMEDIATE');
     $pdo->prepare('UPDATE orders SET customer_id = NULL WHERE customer_id = ?')->execute([$cid]);
+    $pdo->prepare('UPDATE licences SET customer_id = NULL WHERE customer_id = ?')->execute([$cid]);   // theirs no longer
     $pdo->prepare("DELETE FROM emails WHERE order_id IS NULL AND kind LIKE 'account%' AND to_addr IN
                    (SELECT email FROM customers WHERE id = ?)")->execute([$cid]);   // their account emails
     $pdo->prepare('DELETE FROM customers WHERE id = ?')->execute([$cid]);   // tokens and devices go with it
@@ -6068,6 +6206,8 @@ function view_account_delete(): never
         . '<p>This deletes your account, your saved addresses and your password straight away. It can\'t be undone.</p>'
         . '<p>Details of orders you\'ve placed are kept as the shop\'s sales records, which the law requires, but they\'re no longer linked to an account. '
         . 'You can still check out as a guest or create a new account later.</p>'
+        . (customer_licences((int)$c['id']) ? '<div class="shop-note"><strong>You\'ll lose your downloads.</strong> Downloads and licences you\'ve bought live in your account, '
+            . 'so you won\'t be able to download them or move a licence to another website afterwards.</div>' : '')
         . '<form class="shop-form shop-narrow" method="post">' . csrf_field()
         . password_field('password', 'Your password, to confirm', 'current-password')
         . '<button class="shop-button shop-danger">Delete my account</button></form>'
@@ -6171,7 +6311,7 @@ function view_admin_customers(): never
                . '</td><td class="muted">joined ' . e(gmdate('j M Y', strtotime($c['created'] . ' UTC'))) . '</td></tr>';
     }
     $total = (int)db()->query('SELECT COUNT(*) FROM customers')->fetchColumn();
-    admin_shell('Customers', '<div class="topline"><h1>Customers</h1><a class="btn quiet" href="' . e(admin_url('groups')) . '">Customer groups</a></div>'
+    admin_shell('Customers', '<div class="topline"><h1>Customers</h1><span><a class="btn quiet" href="' . e(admin_url('licences')) . '">Licences</a> <a class="btn quiet" href="' . e(admin_url('groups')) . '">Customer groups</a></span></div>'
         . '<p class="muted"><a href="' . e(admin_url('privacy')) . '">Find a person\'s data</a> (for requests to see or remove their details)</p>'
         . (!accounts_on() ? '<p class="flash">Customer accounts are switched off in Settings, so customers can\'t sign in.</p>' : '')
         . '<form method="get" class="search"><input name="find" value="' . e($q) . '" placeholder="Name, email or postcode" aria-label="Search customers"><button class="quiet">Search</button></form>'
@@ -7234,8 +7374,8 @@ function view_admin_export(): never
             $items = implode('; ', array_map(fn($it) => $it['qty'] . ' x ' . $it['name'] . ($it['option_label'] !== '' ? ' (' . $it['option_label'] . ')' : ''),
                                              order_items((int)$o['id'])));
             $rows[] = [$o['number'], $local($o['created']), status_label($o['status']), method_label($o['payment_method']), $local($o['paid_at']),
-                       $o['bill_name'], $o['email'], $o['phone'], $o['delivery'] === 'collect' ? 'Collect' : 'Deliver',
-                       implode(', ', mail_address_lines('bill_', $o)), $o['delivery'] === 'collect' ? '' : implode(', ', mail_address_lines('ship_', $o)),
+                       $o['bill_name'], $o['email'], $o['phone'], ['collect' => 'Collect', 'none' => 'Download'][$o['delivery']] ?? 'Deliver',
+                       implode(', ', mail_address_lines('bill_', $o)), $o['delivery'] !== 'deliver' ? '' : implode(', ', mail_address_lines('ship_', $o)),
                        $items, csv_money((int)$o['subtotal_pence']), $o['discount_code'], csv_money((int)$o['discount_pence']),
                        $o['group_name'], csv_money((int)$o['group_pence']), csv_money((int)$o['postage_pence']), csv_money((int)$o['total_pence']),
                        $o['vat_pence'] === null ? '' : csv_money((int)$o['vat_pence']), $o['vat_number'],
@@ -7364,6 +7504,658 @@ function view_admin_privacy(): never
     }
     admin_shell('Find a person\'s data', $body);
 }
+/* ======================================================= digital products */
+/* A product can be a download instead of a thing to post. Downloads need the
+   customer signed in, because what they buy lives in their account: a
+   "licence" row per copy bought, holding the download rights and, for Wren
+   themes, the licence key, the website it's for and how long updates last.
+
+   Wren themes are licensed per website. The shop signs a small licence
+   document (Ed25519, with a key made on this server) naming the theme and the
+   domain; Wren checks the signature with the shop's public key built into it.
+   Customers change the domain in their account whenever they like; Wren then
+   fetches a fresh document from this shop. */
+
+const LICENCE_PREFIX     = 'WREN';
+const DOMAIN_MOVES       = 3;      // per licence per 30 days, so one licence can't keep lots of sites going
+const LICENCE_DAYS       = 30;     // a licence document lasts this long; Wren fetches a fresh one well before
+const DOWNLOADS_DAY      = 20;     // per licence
+const DOWNLOAD_MAX       = 100 * 1024 * 1024;
+
+function is_digital(array $p): bool
+{
+    return ($p['kind'] ?? 'physical') === 'digital';
+}
+
+function files_dir(): string
+{
+    $d = data_dir() . '/files';
+    if (!is_dir($d)) {
+        mkdir($d, 0750, true);
+    }
+    return $d;
+}
+
+/* ------------------------------------------------------------- the basket */
+
+/* Renewal lines in the basket have keys like "r12" (licence 12). */
+function renewal_item(string $key): ?array
+{
+    if (!preg_match('/^r(\d+)$/', $key, $m) || !accounts_on() || !($me = current_customer())) {
+        return null;
+    }
+    $l = licence_by_id((int)$m[1]);
+    if (!$l || (int)$l['customer_id'] !== (int)$me['id'] || $l['status'] !== 'active') {
+        return null;
+    }
+    $p = product_by_id((int)$l['product_id']);
+    if (!$p || !is_digital($p)) {
+        return null;
+    }
+    $p['price_pence'] = $p['renew_pence'] ?? $p['price_pence'];
+    $p['name'] = $p['name'] . ': ' . (int)$p['update_months'] . ' more months of updates';
+    $p['stock'] = null;
+    $p['renew_licence'] = (int)$l['id'];
+    return [$p, null];
+}
+
+/* Does the basket hold anything to post or collect? */
+function basket_physical(): bool
+{
+    foreach (array_keys($_SESSION['shop_basket'] ?? []) as $key) {
+        $item = basket_item((string)$key);
+        if ($item && !is_digital($item[0])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function basket_digital(): bool
+{
+    foreach (array_keys($_SESSION['shop_basket'] ?? []) as $key) {
+        $item = basket_item((string)$key);
+        if ($item && is_digital($item[0])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ------------------------------------------------------- admin: the product */
+
+function digital_input(?array $p, array &$v, array &$errors): array
+{
+    $d = [
+        'kind'     => post('kind') === 'digital' ? 'digital' : 'physical',
+        'licensed' => !empty($_POST['licensed']),
+        'theme_id' => strtolower(trim(post('theme_id'))),
+        'renew'    => post('renew_price'),
+        'months'   => post('update_months') === '' ? '12' : post('update_months'),
+        'version'  => mb_substr(post('dl_version'), 0, 30),
+        'upload'   => null,
+    ];
+    $v['dg'] = $d;
+    if ($d['kind'] !== 'digital') {
+        return $d;
+    }
+    if ($v['opts']) {
+        $errors[] = 'A download can\'t have options. Make a separate product for each one.';
+    }
+    if ($d['licensed'] && !function_exists('sodium_crypto_sign_detached')) {
+        $errors[] = 'Selling licensed themes needs PHP\'s sodium extension, which this server doesn\'t have. Ask your host to turn it on.';
+    } elseif ($d['licensed']) {
+        if (!preg_match('/^[a-z0-9][a-z0-9-]{1,39}$/', $d['theme_id'])) {
+            $errors[] = 'Give the theme a short ID of letters, numbers and dashes, like aurora. It must match the one in the theme\'s theme.html.';
+        } else {
+            $st = db()->prepare('SELECT id FROM products WHERE theme_id = ? AND id != ?');
+            $st->execute([$d['theme_id'], $p ? (int)$p['id'] : 0]);
+            if ($st->fetchColumn()) {
+                $errors[] = 'Another product already uses the theme ID ' . $d['theme_id'] . '.';
+            }
+        }
+        if ($d['renew'] !== '' && parse_price($d['renew']) === null) {
+            $errors[] = 'The renewal price needs to be a price, like 25, or left empty to use the full price.';
+        }
+        if (!ctype_digit($d['months']) || (int)$d['months'] < 1 || (int)$d['months'] > 120) {
+            $errors[] = 'Updates last a whole number of months, like 12.';
+        }
+    }
+    $f = $_FILES['dl_file'] ?? null;
+    if (is_array($f) && is_int($f['error'] ?? null) && $f['error'] !== UPLOAD_ERR_NO_FILE) {
+        if ($f['error'] !== UPLOAD_ERR_OK) {
+            $errors[] = 'The download file didn\'t upload (' . ($f['error'] === UPLOAD_ERR_INI_SIZE || $f['error'] === UPLOAD_ERR_FORM_SIZE
+                ? 'it\'s bigger than this server allows: ' . upload_limit_text() : 'error ' . $f['error']) . ').';
+        } elseif (!preg_match('/\.zip$/i', (string)$f['name'])) {
+            $errors[] = 'The download needs to be a .zip file.';
+        } elseif ((int)$f['size'] > DOWNLOAD_MAX || file_get_contents($f['tmp_name'], false, null, 0, 4) !== "PK\x03\x04") {
+            $errors[] = 'That doesn\'t look like a zip file.';
+        } elseif ($d['version'] === '') {
+            $errors[] = 'Give the new file a version number, like 1.0.';
+        } else {
+            $d['upload'] = $f;
+        }
+    }
+    $v['dg'] = $d;
+    return $d;
+}
+
+function digital_save(int $pid, array $d, array &$msgs): void
+{
+    $pdo = db();
+    $digital = $d['kind'] === 'digital';
+    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, theme_id = ?, renew_pence = ?, update_months = ?' . ($digital ? ', stock = NULL, option_name = \'\'' : '') . ' WHERE id = ?')
+        ->execute([$d['kind'], $digital && $d['licensed'] ? 1 : 0, $digital && $d['licensed'] ? $d['theme_id'] : '',
+                   $digital && $d['licensed'] && $d['renew'] !== '' ? parse_price($d['renew']) : null,
+                   $digital ? (int)$d['months'] : 12, $pid]);
+    if ($digital && $d['upload']) {
+        $name = bin2hex(random_bytes(12)) . '.zip';
+        if (move_uploaded_file($d['upload']['tmp_name'], files_dir() . '/' . $name)
+            || (getenv('WRENSHOP_TESTING') === '1' && @rename($d['upload']['tmp_name'], files_dir() . '/' . $name))) {
+            @chmod(files_dir() . '/' . $name, 0600);
+            $pdo->prepare('INSERT INTO product_files (product_id, version, file, name, size, uploaded) VALUES (?, ?, ?, ?, ?, ?)')
+                ->execute([$pid, $d['version'], $name, basename((string)$d['upload']['name']), (int)$d['upload']['size'], now()]);
+            $msgs[] = 'Version ' . $d['version'] . ' uploaded. Customers with current updates can download it now.';
+        } else {
+            $msgs[] = 'The file couldn\'t be saved. Check the shop\'s data folder can be written to.';
+        }
+    }
+}
+
+function product_files(int $pid): array
+{
+    $st = db()->prepare('SELECT * FROM product_files WHERE product_id = ? ORDER BY uploaded DESC, id DESC');
+    $st->execute([$pid]);
+    return $st->fetchAll();
+}
+
+function digital_fields_html(?array $p, array $v): string
+{
+    $d = $v['dg'] ?? [
+        'kind' => $p['kind'] ?? 'physical', 'licensed' => (bool)($p['licensed'] ?? 0), 'theme_id' => $p['theme_id'] ?? '',
+        'renew' => isset($p['renew_pence']) ? price_input((int)$p['renew_pence']) : '', 'months' => (string)($p['update_months'] ?? 12), 'version' => '',
+    ];
+    $files = $p ? product_files((int)$p['id']) : [];
+    $list = '';
+    foreach ($files as $i => $f) {
+        $list .= '<li>Version <strong>' . e($f['version']) . '</strong> · ' . e($f['name']) . ' · ' . max(1, (int)round((int)$f['size'] / 1024)) . ' KB · '
+               . e(gmdate('j M Y', strtotime($f['uploaded'] . ' UTC'))) . ($i === 0 ? ' <span class="pill ok">Latest</span>' : '') . '</li>';
+    }
+    $dig = $d['kind'] === 'digital';
+    return '<details class="opts" id="digital"' . ($dig ? ' open' : '') . '><summary>Download <span class="hint">(for files customers download, like Wren themes)</span></summary>'
+        . '<label class="check"><input type="checkbox" name="kind" value="digital"' . ($dig ? ' checked' : '') . '> This is a download, not something to post</label>'
+        . '<p class="muted">Customers need to be signed in to buy downloads. Their downloads, and any licences, appear in their account as soon as they\'ve paid.</p>'
+        . ($list !== '' ? '<p><b>Files</b></p><ul class="muted" style="margin-top:0">' . $list . '</ul>' : '')
+        . '<label>' . ($files ? 'Upload a new version' : 'The file') . ' <span class="hint">(.zip)</span><input type="file" name="dl_file" accept=".zip,application/zip"></label>'
+        . '<label>Version <span class="hint">(of this file, e.g. 1.0)</span><input name="dl_version" value="' . e($d['version']) . '" maxlength="30" style="max-width:9rem;display:block"></label>'
+        . '<label class="check" style="margin-top:1.4rem"><input type="checkbox" name="licensed" value="1"' . ($d['licensed'] ? ' checked' : '') . '> Wren theme, licensed for one website</label>'
+        . '<label>Theme ID <span class="hint">(as in the theme\'s theme.html, e.g. aurora)</span><input name="theme_id" value="' . e($d['theme_id']) . '" maxlength="40" autocapitalize="none" style="max-width:14rem;display:block"></label>'
+        . '<div class="row"><label>Updates for <span class="hint">(months)</span><input type="number" name="update_months" min="1" max="120" value="' . e($d['months']) . '" style="max-width:7rem;display:block"></label>'
+        . '<label>Renewal price <span class="hint">(another period of updates; empty = full price)</span><div class="price" style="max-width:9rem"><span>£</span><input name="renew_price" inputmode="decimal" value="' . e($d['renew']) . '"></div></label></div>'
+        . '</details>';
+}
+
+/* ---------------------------------------------------------------- licences */
+
+function licence_by_id(int $id): ?array
+{
+    $st = db()->prepare('SELECT * FROM licences WHERE id = ?');
+    $st->execute([$id]);
+    return $st->fetch() ?: null;
+}
+
+function licence_by_key(string $key): ?array
+{
+    $st = db()->prepare('SELECT * FROM licences WHERE lkey = ?');
+    $st->execute([strtoupper(trim($key))]);
+    return $st->fetch() ?: null;
+}
+
+function licence_new_key(): string
+{
+    $abc = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   // no 0/O or 1/I
+    do {
+        $k = LICENCE_PREFIX;
+        for ($g = 0; $g < 4; $g++) {
+            $k .= '-';
+            for ($i = 0; $i < 4; $i++) {
+                $k .= $abc[random_int(0, 31)];
+            }
+        }
+    } while (licence_by_key($k));
+    return $k;
+}
+
+function licence_log(int $lid, string $action, string $detail = ''): void
+{
+    db()->prepare('INSERT INTO licence_log (licence_id, at, action, detail) VALUES (?, ?, ?, ?)')->execute([$lid, now(), $action, $detail]);
+}
+
+function add_months(string $from, int $months): string
+{
+    return (new DateTimeImmutable($from, new DateTimeZone('UTC')))->modify(sprintf('%+d months', $months))->format('Y-m-d H:i:s');
+}
+
+/* "https://www.Example.com/path" -> "example.com"; null if it isn't a domain. */
+function bare_domain(string $s): ?string
+{
+    $s = strtolower(trim($s));
+    $s = preg_replace('#^[a-z]+://#', '', $s);
+    $s = preg_replace('#[/?\#].*$#', '', $s);
+    $s = preg_replace('#:\d+$#', '', $s);
+    $s = preg_replace('#^www\.#', '', rtrim($s, '.'));
+    if (function_exists('idn_to_ascii') && preg_match('/[^\x00-\x7f]/', $s)) {
+        $s = (string)idn_to_ascii($s, IDNA_NONTRANSITIONAL_TO_ASCII, INTL_IDNA_VARIANT_UTS46);   // as browsers do: ß stays ß
+    }
+    return strlen($s) <= 253 && preg_match('/^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}$/', $s) ? $s : null;
+}
+
+/* Paid: each download bought becomes a licence row; renewals extend theirs. */
+function digital_on_paid(int $oid): void
+{
+    $o = order_by('id', $oid);
+    if (!$o) {
+        return;
+    }
+    $pdo = db();
+    $any = false;
+    $own = !$pdo->inTransaction();
+    if ($own) {
+        $pdo->exec('BEGIN IMMEDIATE');
+    }
+    foreach (order_items($oid) as $it) {
+        if ($it['licence_id'] !== null) {   // a renewal
+            $l = licence_by_id((int)$it['licence_id']);
+            $p = $l ? product_by_id((int)$l['product_id']) : null;
+            if ($l) {
+                $months = (int)($p['update_months'] ?? 12) * (int)$it['qty'];
+                $from = max($l['updates_until'], now());
+                $until = add_months($from, $months);
+                $pdo->prepare('UPDATE licences SET updates_until = ? WHERE id = ?')->execute([$until, $l['id']]);
+                $pdo->prepare('UPDATE order_items SET months = ? WHERE id = ?')->execute([$months, $it['id']]);
+                licence_log((int)$l['id'], 'renewed', 'Updates until ' . substr($until, 0, 10) . ' (order #' . $o['number'] . ')');
+                $any = true;
+            }
+            continue;
+        }
+        $p = product_by_id((int)$it['product_id']);
+        if (!$p || !is_digital($p)) {
+            continue;
+        }
+        $have = $pdo->prepare('SELECT COUNT(*) FROM licences WHERE order_id = ? AND product_id = ?');
+        $have->execute([$oid, $p['id']]);
+        for ($i = (int)$have->fetchColumn(); $i < (int)$it['qty']; $i++) {   // safe to run twice
+            $pdo->prepare("INSERT INTO licences (lkey, product_id, order_id, customer_id, domain, status, created, updates_until)
+                           VALUES (?, ?, ?, ?, '', 'active', ?, ?)")
+                ->execute([licence_new_key(), $p['id'], $oid, $o['customer_id'], now(), add_months(now(), (int)$p['update_months'])]);
+            licence_log((int)$pdo->lastInsertId(), 'issued', 'Order #' . $o['number']);
+            $any = true;
+        }
+    }
+    if ($any && $o['delivery'] === 'none') {   // nothing to post: done as soon as it's paid
+        $pdo->prepare("UPDATE orders SET fulfilled = 'digital', fulfilled_at = ? WHERE id = ? AND fulfilled = ''")->execute([now(), $oid]);
+    }
+    if ($own) {
+        $pdo->exec('COMMIT');
+    }
+}
+
+function digital_on_refund(int $oid): void
+{
+    $st = db()->prepare("SELECT id FROM licences WHERE order_id = ? AND status = 'active'");
+    $st->execute([$oid]);
+    foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $lid) {
+        db()->prepare("UPDATE licences SET status = 'revoked' WHERE id = ?")->execute([$lid]);
+        licence_log((int)$lid, 'revoked', 'Order refunded');
+    }
+    $st = db()->prepare('SELECT id, licence_id, months FROM order_items WHERE order_id = ? AND licence_id IS NOT NULL AND months > 0');
+    $st->execute([$oid]);
+    foreach ($st->fetchAll() as $it) {   // a refunded renewal takes its months back
+        $l = licence_by_id((int)$it['licence_id']);
+        if ($l) {
+            $until = add_months($l['updates_until'], -(int)$it['months']);
+            db()->prepare('UPDATE licences SET updates_until = ? WHERE id = ?')->execute([$until, $l['id']]);
+            db()->prepare('UPDATE order_items SET months = 0 WHERE id = ?')->execute([$it['id']]);
+            licence_log((int)$l['id'], 'renewal refunded', 'Updates until ' . substr($until, 0, 10));
+        }
+    }
+}
+
+/* ----------------------------------------------------------------- signing */
+
+function licences_possible(): bool
+{
+    return function_exists('sodium_crypto_sign_detached');
+}
+
+/* [secret, public], made once on this server. Only the secret is the source of truth
+   (two first visits at once can't leave a mismatched pair); the public half is derived. */
+function licence_keypair(): array
+{
+    if (setting('licence_sk') === '') {
+        db()->prepare('INSERT OR IGNORE INTO settings (name, value) VALUES (\'licence_sk\', ?)')
+            ->execute([base64_encode(sodium_crypto_sign_secretkey(sodium_crypto_sign_keypair()))]);
+    }
+    $sk = base64_decode(setting('licence_sk'));
+    $pk = sodium_crypto_sign_publickey_from_secretkey($sk);
+    if (setting('licence_pk') !== base64_encode($pk)) {
+        set_setting('licence_pk', base64_encode($pk));   // for reference only
+    }
+    return [$sk, $pk];
+}
+
+/* The document Wren keeps: a signed statement of which theme is licensed for
+   which website. Base64 of the JSON, a dot, and the base64 signature. */
+function licence_document(array $l): string
+{
+    $p = product_by_id((int)$l['product_id']);
+    $payload = json_encode([
+        'v' => 1, 'key' => $l['lkey'], 'theme' => $p['theme_id'] ?? '', 'name' => $p['name'] ?? '',
+        'domain' => $l['domain'], 'issued' => gmdate('Y-m-d'), 'expires' => time() + LICENCE_DAYS * 86400,
+        'updates_until' => substr($l['updates_until'], 0, 10),
+        'issuer' => abs_shop_url(),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    [$sk] = licence_keypair();
+    $sig = sodium_crypto_sign_detached($payload, $sk);
+    return "-----BEGIN WREN THEME LICENCE-----\n" . chunk_split(base64_encode($payload) . '.' . base64_encode($sig), 64, "\n")
+         . "-----END WREN THEME LICENCE-----\n";
+}
+
+/* The address Wren asks for a fresh licence document: /shop/licence/KEY?domain=... */
+function licence_api(string $key): never
+{
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store');
+    header('X-Robots-Tag: noindex');
+    $fail = function (int $code, string $msg) {
+        http_response_code($code);
+        echo $msg, "\n";
+        exit;
+    };
+    if (throttled('lapi:' . client_ip(), 60, 3600)) {
+        $fail(429, 'Too many requests. Try again later.');
+    }
+    throttle_hit('lapi:' . client_ip());
+    if (!licences_possible()) {
+        $fail(503, 'This shop can\'t issue licences just now (its server needs PHP\'s sodium extension).');
+    }
+    $l = licence_by_key($key);
+    $p = $l ? product_by_id((int)$l['product_id']) : null;
+    if (!$l || !$p || !(int)$p['licensed']) {
+        $fail(404, 'That licence key isn\'t recognised. Check it in your account at ' . abs_shop_url('account/licences') . '.');
+    }
+    if ($l['status'] !== 'active') {
+        $fail(403, 'That licence has been cancelled.');
+    }
+    if ($l['domain'] === '') {
+        $fail(409, 'This licence isn\'t set to a website yet. Choose one in your account: ' . abs_shop_url('account/licence/' . $l['id']));
+    }
+    $asked = bare_domain(str_in($_GET['domain'] ?? ''));
+    if ($asked !== null && $asked !== $l['domain']) {
+        $fail(409, 'This licence is for ' . $l['domain'] . ', not ' . $asked . '. To move it, change the website in your account: '
+            . abs_shop_url('account/licence/' . $l['id']));
+    }
+    echo licence_document($l);
+    exit;
+}
+
+/* ---------------------------------------------------- the customer's account */
+
+function customer_licences(int $cid): array
+{
+    $st = db()->prepare("SELECT l.*, p.name AS pname, p.licensed, p.slug, p.update_months, p.renew_pence, p.price_pence, o.number AS onum
+                         FROM licences l JOIN products p ON p.id = l.product_id LEFT JOIN orders o ON o.id = l.order_id
+                         WHERE l.customer_id = ? ORDER BY l.status, l.id DESC");
+    $st->execute([$cid]);
+    return $st->fetchAll();
+}
+
+function own_licence(int $id): array
+{
+    $me = require_customer('account/licences');
+    $l = licence_by_id($id);
+    if (!$l || (int)$l['customer_id'] !== (int)$me['id']) {
+        view_404();
+    }
+    return $l;
+}
+
+/* The file a licence may download: the latest, or the last one from within its updates. */
+function licence_file(array $l): ?array
+{
+    $files = product_files((int)$l['product_id']);
+    if (!$files) {
+        return null;
+    }
+    if ($l['updates_until'] >= now()) {
+        return $files[0];
+    }
+    foreach ($files as $f) {
+        if ($f['uploaded'] <= $l['updates_until']) {
+            return $f;
+        }
+    }
+    return end($files);   // everything is newer: the first version they could have had
+}
+
+function view_account_licences(): never
+{
+    $me = require_customer('account/licences');
+    $rows = '';
+    foreach (customer_licences((int)$me['id']) as $l) {
+        $f = licence_file($l);
+        $state = $l['status'] !== 'active' ? 'Cancelled'
+               : ((int)$l['licensed'] ? ($l['domain'] !== '' ? 'For ' . $l['domain'] : 'Choose its website') : 'Download');
+        $rows .= '<tr><td><a href="' . e(shop_url('account/licence/' . $l['id'])) . '">' . e($l['pname']) . '</a>'
+               . ((int)$l['licensed'] ? '<br><small class="shop-hint">' . e($l['lkey']) . '</small>' : '') . '</td>'
+               . '<td>' . e($state) . '</td><td>' . ($f && $l['status'] === 'active' ? 'Version ' . e($f['version']) : '') . '</td></tr>';
+    }
+    account_page('Downloads and licences', $rows !== ''
+        ? '<table class="shop-basket shop-orders"><thead><tr><th>Product</th><th>Licence</th><th>Download</th></tr></thead><tbody>' . $rows . '</tbody></table>'
+        : '<p>Nothing here yet. Downloads you buy appear here as soon as they\'re paid for.</p>', [['Your account', 'account'], ['Downloads and licences', null]]);
+}
+
+function view_account_licence(int $id): never
+{
+    $l = own_licence($id);
+    $p = product_by_id((int)$l['product_id']);
+    $me = current_customer();
+    $errors = [];
+    if (is_post()) {
+        csrf_check();
+        if (post('do') === 'domain' && $l['status'] === 'active' && (int)$p['licensed']) {
+            $new = bare_domain(post('domain'));
+            $since = db()->prepare("SELECT COUNT(*) FROM licence_log WHERE licence_id = ? AND action = 'domain' AND at > ?
+                                    AND detail NOT LIKE '(none)%' AND detail NOT LIKE '%(by the shop)'");
+            $since->execute([$l['id'], gmdate('Y-m-d H:i:s', time() - 30 * 86400)]);
+            if ($new === null) {
+                $errors[] = 'Enter the website\'s address, like example.com.';
+            } elseif ($new === $l['domain']) {
+                $errors[] = 'That\'s already its website.';
+            } elseif ($l['domain'] !== '' && (int)$since->fetchColumn() >= DOMAIN_MOVES) {
+                $errors[] = 'This licence has moved ' . DOMAIN_MOVES . ' times in the last 30 days, which is the most it can. Please contact us if you need to move it again.';
+            } else {
+                db()->prepare('UPDATE licences SET domain = ? WHERE id = ?')->execute([$new, $l['id']]);
+                licence_log((int)$l['id'], 'domain', ($l['domain'] !== '' ? $l['domain'] : '(none)') . ' → ' . $new);
+                flash('Now licensed for ' . $new . '. In Wren\'s admin on that site, press Get licence to update it.');
+                redirect(shop_url('account/licence/' . $l['id']));
+            }
+        } elseif (post('do') === 'renew' && $l['status'] === 'active' && (int)$p['licensed']) {
+            $_SESSION['shop_basket']['r' . $l['id']] = 1;
+            flash('Renewal added to your basket.');
+            redirect(shop_url('basket'));
+        }
+    }
+    $f = licence_file($l);
+    $active = $l['status'] === 'active';
+    $updates = $l['updates_until'] >= now();
+    $until = gmdate('j F Y', strtotime($l['updates_until'] . ' UTC'));
+    $body = account_errors($errors)
+        . (!$active ? '<div class="shop-note"><strong>This licence has been cancelled</strong>, so it can\'t be downloaded or used any more.</div>' : '')
+        . '<p>Bought on order <a href="' . e(shop_url('order/' . (order_by('id', (int)$l['order_id'])['token'] ?? ''))) . '">#' . (int)(order_by('id', (int)$l['order_id'])['number'] ?? 0) . '</a>.</p>';
+    if ($active && $f) {
+        $body .= '<h2 class="shop-h2">Download</h2><p><a class="shop-button" href="' . e(shop_url('account/download/' . $l['id'])) . '">Download version ' . e($f['version']) . '</a></p>'
+               . ((int)$p['licensed'] ? '<p class="shop-hint">' . ($updates ? 'Updates until ' . e($until) . ': you always get the latest version.'
+                    : 'Updates ended on ' . e($until) . ', so this is the last version from within them. Renew to get the latest.') . '</p>' : '');
+    }
+    if ((int)$p['licensed']) {
+        $body .= '<h2 class="shop-h2">Licence</h2><dl class="shop-licence"><dt>Licence key</dt><dd><code>' . e($l['lkey']) . '</code></dd>'
+            . '<dt>Website</dt><dd>' . ($l['domain'] !== '' ? '<strong>' . e($l['domain']) . '</strong> <span class="shop-hint">(with or without www)</span>' : 'Not chosen yet') . '</dd></dl>';
+        if ($active) {
+            $body .= '<form class="shop-form shop-narrow" method="post">' . csrf_field() . '<input type="hidden" name="do" value="domain">'
+                . account_field('domain', $l['domain'] !== '' ? 'Move it to another website' : 'Which website is it for?', '', 'required maxlength="253" autocapitalize="none" placeholder="example.com"')
+                . '<button class="shop-button">' . ($l['domain'] !== '' ? 'Move licence' : 'Save') . '</button></form>'
+                . '<p class="shop-hint">The theme works on its licensed website, and always on localhost while you build. After choosing or changing the website, '
+                . 'open Wren\'s admin on that site, enter the licence key and press <strong>Get licence</strong>. A licence can move ' . DOMAIN_MOVES . ' times in 30 days.</p>'
+                . '<h2 class="shop-h2">Updates</h2><p>' . ($updates ? 'Included until <strong>' . e($until) . '</strong>.' : 'Ended on <strong>' . e($until) . '</strong>. The theme keeps working; renewing gets you new versions again.') . '</p>'
+                . '<form method="post">' . csrf_field() . '<input type="hidden" name="do" value="renew"><button class="shop-button shop-quiet">Renew: '
+                . (int)$p['update_months'] . ' more months for ' . money((int)($p['renew_pence'] ?? $p['price_pence'])) . '</button></form>';
+        }
+    }
+    $body .= '<p><a href="' . e(shop_url('account/licences')) . '">&larr; Downloads and licences</a></p>';
+    account_page($p['name'] ?? 'Licence', $body, [['Your account', 'account'], ['Downloads and licences', 'account/licences'], [$p['name'] ?? 'Licence', null]]);
+}
+
+function account_download(int $id): never
+{
+    $l = own_licence($id);
+    $f = $l['status'] === 'active' ? licence_file($l) : null;
+    $path = $f ? files_dir() . '/' . basename($f['file']) : '';
+    if (!$f || !is_file($path)) {
+        flash('That download isn\'t available.');
+        redirect(shop_url('account/licence/' . $id));
+    }
+    if (throttled('dl:' . $l['id'], DOWNLOADS_DAY, 86400)) {
+        flash('That\'s a lot of downloads today. Please try again tomorrow.');
+        redirect(shop_url('account/licence/' . $id));
+    }
+    throttle_hit('dl:' . $l['id']);
+    licence_log((int)$l['id'], 'download', 'Version ' . $f['version']);
+    header('Content-Type: application/zip');
+    header('Content-Disposition: attachment; filename="' . preg_replace('/[^A-Za-z0-9._-]+/', '-', $f['name']) . '"');
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: no-store');
+    readfile($path);
+    exit;
+}
+
+/* ------------------------------------------------------------ admin: licences */
+
+function view_admin_licences(): never
+{
+    require_admin();
+    $q = trim(str_in($_GET['find'] ?? ''));
+    $sql = "SELECT l.*, p.name AS pname, p.licensed, c.email, c.name AS cname FROM licences l JOIN products p ON p.id = l.product_id
+            LEFT JOIN customers c ON c.id = l.customer_id";
+    $args = [];
+    if ($q !== '') {
+        $like = '%' . str_replace(['%', '_'], ['\%', '\_'], $q) . '%';
+        $sql .= " WHERE l.lkey LIKE ? ESCAPE '\\' OR l.domain LIKE ? ESCAPE '\\' OR c.email LIKE ? ESCAPE '\\' OR p.name LIKE ? ESCAPE '\\'";
+        $args = [$like, $like, $like, $like];
+    }
+    $st = db()->prepare($sql . ' ORDER BY l.id DESC LIMIT 300');
+    $st->execute($args);
+    $rows = '';
+    foreach ($st->fetchAll() as $l) {
+        $rows .= '<tr><td><a href="' . e(admin_url('licence/' . $l['id'])) . '">' . e($l['pname']) . '</a>'
+               . ((int)$l['licensed'] ? '<br><span class="muted"><code>' . e($l['lkey']) . '</code></span>' : '') . '</td>'
+               . '<td>' . e($l['cname'] ?: ($l['email'] ?? '(account deleted)')) . '<br><span class="muted">' . e($l['domain']) . '</span></td>'
+               . '<td>' . ($l['status'] === 'active' ? '<span class="pill ok">Active</span>' : '<span class="pill">Cancelled</span>') . '</td></tr>';
+    }
+    admin_shell('Licences', '<p class="muted"><a href="' . e(admin_url('customers')) . '">&larr; Customers</a></p><h1>Downloads and licences</h1>'
+        . '<form method="get" class="search"><input name="find" value="' . e($q) . '" placeholder="Key, website, email or product" aria-label="Search licences"><button class="quiet">Search</button></form>'
+        . ($rows !== '' ? '<table>' . $rows . '</table>' : '<p class="muted">' . ($q !== '' ? 'Nothing matches that.' : 'None yet. They appear when someone pays for a download.') . '</p>'));
+}
+
+function view_admin_licence(int $id): never
+{
+    require_admin();
+    $l = licence_by_id($id);
+    if (!$l) {
+        redirect(admin_url('licences'));
+    }
+    $p = product_by_id((int)$l['product_id']);
+    if (is_post()) {
+        csrf_check();
+        switch (post('do')) {
+            case 'domain':
+                $new = post('domain') === '' ? '' : bare_domain(post('domain'));
+                if ($new === null) {
+                    flash('That isn\'t a website address.');
+                    break;
+                }
+                db()->prepare('UPDATE licences SET domain = ? WHERE id = ?')->execute([$new, $id]);
+                licence_log($id, 'domain', ($l['domain'] ?: '(none)') . ' → ' . ($new ?: '(none)') . ' (by the shop)');
+                flash('Website changed.');
+                break;
+            case 'extend':
+                $until = add_months(max($l['updates_until'], now()), max(1, min(120, (int)post('months'))));
+                db()->prepare('UPDATE licences SET updates_until = ? WHERE id = ?')->execute([$until, $id]);
+                licence_log($id, 'renewed', 'Updates until ' . substr($until, 0, 10) . ' (by the shop)');
+                flash('Updates now run until ' . gmdate('j M Y', strtotime($until . ' UTC')) . '.');
+                break;
+            case 'revoke':
+            case 'reinstate':
+                $s = post('do') === 'revoke' ? 'revoked' : 'active';
+                db()->prepare('UPDATE licences SET status = ? WHERE id = ?')->execute([$s, $id]);
+                licence_log($id, $s === 'revoked' ? 'revoked' : 'reinstated', 'By the shop');
+                flash($s === 'revoked' ? 'Licence cancelled.' : 'Licence reinstated.');
+                break;
+        }
+        redirect(admin_url('licence/' . $id));
+    }
+    $c = $l['customer_id'] !== null ? customer_by_id((int)$l['customer_id']) : null;
+    $o = order_by('id', (int)$l['order_id']);
+    $log = db()->prepare('SELECT * FROM licence_log WHERE licence_id = ? ORDER BY id DESC LIMIT 100');
+    $log->execute([$id]);
+    $logRows = '';
+    foreach ($log->fetchAll() as $x) {
+        $logRows .= '<tr><td class="muted">' . e(gmdate('j M Y H:i', strtotime($x['at'] . ' UTC'))) . '</td><td>' . e(ucfirst($x['action'])) . '</td><td>' . e($x['detail']) . '</td></tr>';
+    }
+    $act = fn(string $do, string $label, string $extra = '', string $cls = 'quiet') => '<form method="post">' . csrf_field()
+        . '<input type="hidden" name="do" value="' . $do . '">' . $extra . '<button class="' . $cls . '">' . $label . '</button></form>';
+    admin_shell('Licence', '<p class="muted"><a href="' . e(admin_url('licences')) . '">&larr; Licences</a></p>'
+        . '<h1>' . e($p['name'] ?? 'Licence') . '</h1>'
+        . '<p>' . ($l['status'] === 'active' ? '<span class="pill ok">Active</span>' : '<span class="pill">Cancelled</span>')
+        . ((int)($p['licensed'] ?? 0) ? ' <code>' . e($l['lkey']) . '</code>' : '') . '</p>'
+        . '<p>' . ($c ? '<a href="' . e(admin_url('customer/' . $c['id'])) . '">' . e($c['name'] ?: $c['email']) . '</a> · ' . e($c['email']) : 'Account deleted')
+        . ($o ? ' · order <a href="' . e(admin_url('order/' . $o['id'])) . '">#' . (int)$o['number'] . '</a>' : '') . '</p>'
+        . ((int)($p['licensed'] ?? 0) ? '<p>Website: <strong>' . e($l['domain'] ?: 'not chosen yet') . '</strong> · updates until '
+            . e(gmdate('j M Y', strtotime($l['updates_until'] . ' UTC'))) . '</p>'
+            . $act('domain', 'Change website', '<label>Website <input name="domain" value="' . e($l['domain']) . '" autocapitalize="none" placeholder="example.com"></label>')
+            . $act('extend', 'Extend updates', '<label>By <span class="hint">(months)</span><input type="number" name="months" min="1" max="120" value="12" style="max-width:7rem;display:block"></label>') : '')
+        . ($l['status'] === 'active' ? $act('revoke', 'Cancel licence', '', 'danger') : $act('reinstate', 'Reinstate licence'))
+        . '<h2>History</h2>' . ($logRows !== '' ? '<table>' . $logRows . '</table>' : '<p class="muted">Nothing yet.</p>'));
+}
+
+function licence_settings_html(): string
+{
+    if (!licences_possible()) {
+        return '<h2 id="licences">Theme licences</h2><p class="muted">Selling licensed Wren themes needs PHP\'s <b>sodium</b> extension, '
+            . 'which this server doesn\'t have. Other downloads work without it.</p>';
+    }
+    [, $pk] = licence_keypair();
+    return '<h2 id="licences">Theme licences</h2>'
+        . '<p class="muted">For selling Wren themes. Your shop signs each licence with its own private key, kept only on this server. '
+        . 'Wren checks licences with the public key below, which is built into Wren.</p>'
+        . '<label>Public key <input value="' . e(base64_encode($pk)) . '" readonly onclick="this.select()"></label>'
+        . '<p class="muted">Licence address for Wren: <code>' . e(abs_shop_url('licence/')) . '</code> · <a href="' . e(admin_url('licences')) . '">All licences</a></p>';
+}
+
+/* On the admin order page: what the order issued. */
+function order_licences_html(int $oid): string
+{
+    $st = db()->prepare('SELECT l.*, p.name AS pname, p.licensed, (l.order_id != ?) AS renewal FROM licences l JOIN products p ON p.id = l.product_id
+                         WHERE l.order_id = ? OR l.id IN (SELECT licence_id FROM order_items WHERE order_id = ? AND licence_id IS NOT NULL) ORDER BY l.id');
+    $st->execute([$oid, $oid, $oid]);
+    $rows = '';
+    foreach ($st->fetchAll() as $l) {
+        $rows .= '<tr><td><a href="' . e(admin_url('licence/' . $l['id'])) . '">' . e($l['pname']) . '</a>' . ((int)$l['renewal'] ? ' <span class="muted">(renewal)</span>' : '') . '</td><td>'
+               . ((int)$l['licensed'] ? '<code>' . e($l['lkey']) . '</code> ' . e($l['domain']) : 'Download') . '</td><td>'
+               . ($l['status'] === 'active' ? '<span class="pill ok">Active</span>' : '<span class="pill">Cancelled</span>') . '</td></tr>';
+    }
+    return $rows !== '' ? '<h2>Downloads and licences</h2><table>' . $rows . '</table>' : '';
+}
 /* ------------------------------------------------------------------ router */
 
 $q = trim(str_in($_GET['q'] ?? ''), '/');
@@ -7410,6 +8202,8 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'groups'                       => view_admin_groups(),
         $sub === 'ready'                        => view_admin_ready(),
         $sub === 'export'                       => view_admin_export(),
+        $sub === 'licences'                     => view_admin_licences(),
+        $sub === 'licence' && isset($seg[2])    => view_admin_licence((int)$seg[2]),
         $sub === 'privacy'                      => view_admin_privacy(),
         $sub === 'group' && isset($seg[2])      => view_admin_group($seg[2]),
         $sub === 'discount' && isset($seg[2])   => view_admin_discount($seg[2]),
@@ -7443,6 +8237,9 @@ if (($seg[0] ?? '') === 'account') {
         $sub === 'addresses'                         => view_account_addresses(),
         $sub === 'delete'                            => view_account_delete(),
         $sub === 'from-order' && is_post()           => account_from_order(),
+        $sub === 'licences'                          => view_account_licences(),
+        $sub === 'licence' && isset($seg[2])         => view_account_licence((int)$seg[2]),
+        $sub === 'download' && isset($seg[2])        => account_download((int)$seg[2]),
         default                                      => view_404(),
     };
 }
@@ -7455,6 +8252,7 @@ match (true) {
     $q === 'basket/update' && is_post()          => basket_update(),
     $q === 'checkout'                            => is_post() ? checkout_post() : view_checkout(),
     $q === 'paypal/return'                       => paypal_return(),
+    ($seg[0] ?? '') === 'licence' && count($seg) === 2 => licence_api($seg[1]),
     $q === 'paypal/cancel'                       => paypal_cancel(),
     ($seg[0] ?? '') === 'order' && count($seg) === 2 => view_order($seg[1]),
     $q === 'basket'                              => view_basket(),
