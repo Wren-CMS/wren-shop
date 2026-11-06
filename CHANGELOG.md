@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0 (6 November 2026)
+
+**Catalogue foundations: Wren Shop for thousands of products, without making it harder for five.**
+
+- **A new admin layout**: full width, with the sections down the left and each section's pages as tabs along the top. Settings is split into tabs (Getting ready, Shop, Delivery, Payments, Email, Business and VAT, Your sign-in, Advanced), and saving brings you back to the same tab. On a phone the sections become a bar across the top.
+- **Paged, sortable lists**: the shop, each category and search show 24 products at a time (a setting, 6 to 96), with page links and a sort menu once there are a dozen. The admin product list shows 50 at a time with search (by name or SKU) and filters for category, hidden, low or sold out, sold out, on backorder and on sale.
+- **SKUs** on products and on each choice, unique, shown on the product page, basket, orders, emails, packing slips, invoices and the orders CSV. Orders keep the SKU as it was.
+- **Categories inside categories**, three levels deep, with dropdown menus in the shop (an expanding list on phones), sub-category links on category pages and full breadcrumbs. A product can show in several categories. Group rates set on a category cover the ones inside it.
+- **Sale prices** on products and on choices with their own price, with optional first and last days; they start and end by themselves. A Sale badge, the full price crossed out, and sorting by price uses them. Sale prices, group prices and discount codes never add up: the customer gets whichever is cheapest, and the basket says which.
+- **Backorders**: a product can keep selling when its counted stock runs out, quietly or telling customers what's on backorder. Orders record how many were on backorder; cancelling or refunding puts stock back correctly; low-stock emails skip these products.
+- **Product import and export** (Products → Import and export): a spreadsheet of every product, or one row per choice. Import matches by SKU, then web address; blank cells leave values alone and `-` clears them; missing categories are made from paths. Every import is checked first and shows each change before and after and every problem by row number, then applies all at once or not at all. Also `tools/woo-to-wren.php` for moving from WooCommerce.
+- **Search** in the shop menu once a shop has 12 products: names, SKUs, categories and descriptions, the start of a word is enough, exact part numbers first (and straight to the product when there's only one), and a synonyms setting. Full-text search where the host has it, a simpler search where it doesn't.
+- **VAT invoices** for paid orders, from the admin and the customer's order page, printable or saved as PDF, adding up to the order total to the penny. Shops not registered for VAT get receipts.
+- The product form has two columns on wide screens, with Save, Show in the shop, category and stock in a panel that stays in view.
+- The demo shows the new features: categories, SKUs, a sale and a backorder.
+- Upgrading needs nothing but the new `index.php`: everything is kept as it was.
+
 ## 1.1.0 (4 November 2026)
 
 **Digital downloads and Wren theme licences.**

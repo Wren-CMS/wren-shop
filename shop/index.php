@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.1.0';
+const SHOP_VERSION    = '1.2.0';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -586,6 +586,63 @@ function shop_migrate(PDO $pdo): void
         $pdo->commit();
         $pdo->exec('PRAGMA foreign_keys = ON');
     }
+    if ((int)$pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn() < 13) {
+        // 1.2.0: catalogue foundations. Part numbers (SKUs), categories inside categories
+        // (three levels), a product in several categories, backorders and sale prices.
+        // products.category_id stays as the product's main category (its breadcrumb and
+        // group rate); product_categories lists any other categories it also shows in.
+        $pdo->beginTransaction();
+        $pdo->exec('
+            ALTER TABLE products ADD COLUMN sku TEXT NOT NULL DEFAULT "";
+            ALTER TABLE products ADD COLUMN backorders TEXT NOT NULL DEFAULT "no";     -- no | yes | notify (tell the customer)
+            ALTER TABLE products ADD COLUMN sale_pence INTEGER DEFAULT NULL;
+            ALTER TABLE products ADD COLUMN sale_from TEXT NOT NULL DEFAULT "";
+            ALTER TABLE products ADD COLUMN sale_to TEXT NOT NULL DEFAULT "";
+            ALTER TABLE variants ADD COLUMN sku TEXT NOT NULL DEFAULT "";
+            ALTER TABLE variants ADD COLUMN sale_pence INTEGER DEFAULT NULL;
+            ALTER TABLE categories ADD COLUMN parent_id INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE order_items ADD COLUMN sku TEXT NOT NULL DEFAULT "";
+            ALTER TABLE order_items ADD COLUMN backorder INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE product_categories (
+                product_id  INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                category_id INTEGER NOT NULL,
+                PRIMARY KEY (product_id, category_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX idx_product_categories ON product_categories (category_id, product_id);
+            CREATE INDEX idx_categories_parent ON categories (parent_id, position);
+            CREATE INDEX idx_products_sku ON products (sku COLLATE NOCASE) WHERE sku != "";
+            CREATE INDEX idx_variants_sku ON variants (sku COLLATE NOCASE) WHERE sku != "";
+            CREATE INDEX idx_products_list ON products (visible, created);
+            CREATE INDEX idx_products_category ON products (category_id);
+        ');
+        // The demo shows off 1.2: categories with one inside another, SKUs, a sale and a backorder.
+        $demoSlugs = ['wren-mug', 'sticker-pack', 'wren-t-shirt', 'tote-bag', 'enamel-pin', 'dot-grid-notebook'];
+        $isDemo = $pdo->query("SELECT value FROM settings WHERE name = 'demo_mode'")->fetchColumn() === '1'
+               && (int)$pdo->query("SELECT COUNT(*) FROM products WHERE slug IN ('" . implode("','", $demoSlugs) . "')")->fetchColumn() === 6
+               && (int)$pdo->query('SELECT COUNT(*) FROM categories')->fetchColumn() === 0;
+        if ($isDemo) {
+            $cat = function (string $name, string $slug, int $pos, int $parent = 0) use ($pdo): int {
+                $pdo->prepare('INSERT INTO categories (name, slug, position, parent_id) VALUES (?, ?, ?, ?)')->execute([$name, $slug, $pos, $parent]);
+                return (int)$pdo->lastInsertId();
+            };
+            $clothing = $cat('Clothing and bags', 'clothing-and-bags', 0);
+            $ids = ['tees' => $cat('T-shirts', 't-shirts', 0, $clothing), 'bags' => $cat('Bags', 'bags', 1, $clothing),
+                    'kitchen' => $cat('Kitchen', 'kitchen', 1), 'desk' => $cat('Stationery', 'stationery', 2), 'gifts' => $cat('Small gifts', 'small-gifts', 3)];
+            $set = $pdo->prepare('UPDATE products SET category_id = ?, sku = ? WHERE slug = ?');
+            foreach ([['wren-t-shirt', 'tees', 'WREN-TEE'], ['tote-bag', 'bags', 'WREN-TOTE'], ['wren-mug', 'kitchen', 'WREN-MUG'],
+                      ['dot-grid-notebook', 'desk', 'WREN-NB-A5'], ['sticker-pack', 'desk', 'WREN-STK-5'], ['enamel-pin', 'gifts', 'WREN-PIN']] as [$slug, $c, $sku]) {
+                $set->execute([$ids[$c], $sku, $slug]);
+            }
+            foreach ([['sticker-pack', 'gifts'], ['wren-mug', 'gifts'], ['enamel-pin', 'desk']] as [$slug, $c]) {   // also shown in
+                $pdo->prepare('INSERT OR IGNORE INTO product_categories (product_id, category_id) SELECT id, ? FROM products WHERE slug = ?')->execute([$ids[$c], $slug]);
+            }
+            $pdo->exec("UPDATE variants SET sku = 'WREN-TEE-' || UPPER(SUBSTR(name, 1, 2)) WHERE product_id = (SELECT id FROM products WHERE slug = 'wren-t-shirt')");
+            $pdo->exec("UPDATE products SET sale_pence = 300 WHERE slug = 'sticker-pack'");
+            $pdo->exec("UPDATE products SET stock = 0, backorders = 'notify' WHERE slug = 'dot-grid-notebook'");
+        }
+        $pdo->exec("UPDATE settings SET value = '13' WHERE name = 'schema_version'");
+        $pdo->commit();
+    }
 }
 
 /* Demo mode: a banner on every page, nothing indexed by search engines, no
@@ -982,7 +1039,7 @@ function render(string $title, string $content, array $seo = [], int $status = 2
     $site = $shell['site_title'] !== '' ? $shell['site_title'] : 'Shop';
     $full = $title !== '' ? $title . ' · ' . $site : $site;
     $desc = $seo['description'] ?? '';
-    $canonical = abs_shop_url($seo['route'] ?? '');
+    $canonical = url_with(abs_shop_url($seo['route'] ?? ''), $seo['query'] ?? []);
     // Every shop page starts with the shop menu and a breadcrumb trail.
     // $seo['crumbs'] lists what comes after Home › Shop: [label, route|null].
     $trail = array_merge([['Home', null, site_base() . '/'], ['Shop', '']],
@@ -1092,26 +1149,67 @@ function crumbs_jsonld(array $trail): array
     return ['@context' => 'https://schema.org', '@type' => 'BreadcrumbList', 'itemListElement' => $items];
 }
 
-/* The shop menu: every category that has something for sale, in the owner's
-   order, plus the basket. $active is a category id, 0 for "All products". */
+/* The shop menu: the top-level categories that have something for sale, in the
+   owner's order, plus account and basket. A category with others inside it opens
+   a dropdown (on a phone, the whole menu folds into a Categories button and the
+   dropdowns open in place). $active is a category id, 0 for "All products". */
 function shop_nav(?int $active): string
 {
-    $cats = db()->query('SELECT c.* FROM categories c WHERE EXISTS
-                         (SELECT 1 FROM products p WHERE p.category_id = c.id AND p.visible = 1)
-                         ORDER BY c.position, c.name COLLATE NOCASE')->fetchAll();
+    $live = cat_live();
+    $top = array_values(array_filter(cat_children(0), fn($c) => isset($live[$c['id']])));
+    $onTrail = $active ? array_column(cat_trail($active), 'id') : [];
+    $link = fn($c, $label = null) => '<a href="' . e(shop_url('c/' . $c['slug'])) . '"'
+        . ($c['id'] === $active ? ' class="on" aria-current="page"' : '') . '>' . e($label ?? $c['name']) . '</a>';
     $li = '';
-    if ($cats) {
+    $deep = false;
+    if ($top) {
         $li .= '<li><a href="' . e(shop_url()) . '"' . ($active === 0 ? ' class="on" aria-current="page"' : '') . '>All products</a></li>';
-        foreach ($cats as $c) {
-            $on = $active === (int)$c['id'];
-            $li .= '<li><a href="' . e(shop_url('c/' . $c['slug'])) . '"' . ($on ? ' class="on"' : '') . '>' . e($c['name']) . '</a></li>';
+        foreach ($top as $c) {
+            $kids = array_filter(cat_children($c['id']), fn($k) => isset($live[$k['id']]));
+            $here = in_array($c['id'], $onTrail, true);
+            if (!$kids) {
+                $li .= '<li>' . $link($c) . '</li>';
+                continue;
+            }
+            $deep = true;
+            $sub = '<li class="shop-drop-all">' . $link($c, 'All ' . $c['name']) . '</li>';
+            foreach ($kids as $k) {
+                $grand = '';
+                foreach (cat_children($k['id']) as $g) {
+                    $grand .= isset($live[$g['id']]) ? '<li>' . $link($g) . '</li>' : '';
+                }
+                $sub .= '<li>' . $link($k) . ($grand !== '' ? '<ul>' . $grand . '</ul>' : '') . '</li>';
+            }
+            $li .= '<li class="shop-has-sub"><details><summary' . ($here ? ' class="on"' : '') . '>' . e($c['name']) . '</summary>'
+                 . '<ul class="shop-drop' . (count($kids) > 4 ? ' shop-drop-wide' : '') . '">' . $sub . '</ul></details></li>';
         }
     }
     $n = basket_count();
     $acct = accounts_on() ? '<a class="shop-account-link" href="' . e(shop_url(current_customer() ? 'account' : 'account/login')) . '">'
           . (current_customer() ? 'Your account' : 'Sign in') . '</a>' : '';
-    return '<nav class="shop-nav" aria-label="Shop">' . ($li ? '<ul class="shop-cats">' . $li . '</ul>' : '<span></span>')
-         . '<span class="shop-nav-end">' . $acct . '<a class="shop-basket-link" href="' . e(shop_url('basket')) . '">Basket' . ($n ? ' (' . $n . ')' : '') . '</a></span></nav>';
+    // Folding on a phone is only worth it for a longer menu.
+    $fold = $deep || count($top) > 5;
+    return '<nav class="shop-nav' . ($fold ? ' shop-foldable' : '') . '" aria-label="Shop">'
+         . ($li ? ($fold ? '<button type="button" class="shop-menu-btn" aria-expanded="false" aria-controls="shop-cats">Categories</button>' : '')
+                  . '<ul class="shop-cats" id="shop-cats">' . $li . '</ul>' : '<span></span>')
+         . '<span class="shop-nav-end">' . (search_box_wanted() ? search_box(($GLOBALS['shop_seg'][0] ?? '') === 'search' ? mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100) : '') : '')
+         . $acct . '<a class="shop-basket-link" href="' . e(shop_url('basket')) . '">Basket' . ($n ? ' (' . $n . ')' : '') . '</a></span></nav>'
+         . ($deep || $fold ? shop_nav_script() : '');
+}
+
+/* One dropdown open at a time; Escape or a click elsewhere closes it; the menu
+   button opens the folded menu on a phone. */
+function shop_nav_script(): string
+{
+    return '<script>(function(){var n=document.querySelector(".shop-nav");if(!n)return;var d=n.querySelectorAll(".shop-has-sub details");'
+        . 'd.forEach(function(x){x.addEventListener("toggle",function(){if(!x.open)return;d.forEach(function(y){if(y!==x)y.open=false;});'
+        . 'var u=x.querySelector(".shop-drop");u.style.left="";var r=u.getBoundingClientRect(),w=document.documentElement.clientWidth;'
+        . 'if(r.right>w-8)u.style.left=(parseFloat(getComputedStyle(u).left)-(r.right-w+8))+"px";});});'
+        . 'document.addEventListener("click",function(e){if(!n.contains(e.target))d.forEach(function(y){y.open=false;});});'
+        . 'document.addEventListener("keydown",function(e){if(e.key==="Escape")d.forEach(function(y){if(y.open){y.open=false;y.querySelector("summary").focus();}});});'
+        . 'var b=n.querySelector(".shop-menu-btn");if(b){n.classList.add("shop-js");b.addEventListener("click",function(){'
+        . 'var o=b.getAttribute("aria-expanded")!=="true";b.setAttribute("aria-expanded",o);n.classList.toggle("shop-open",o);});}'
+        . 'if(window.matchMedia("(min-width:641px)").matches)d.forEach(function(x){x.addEventListener("mouseleave",function(){x.open=false;});});})();</script>';
 }
 
 /* Shop layout only. Text, links and fonts come from the theme via Wren's own
@@ -1130,6 +1228,44 @@ function shop_css(): string
 .wren-shop .shop-cats a:hover,.wren-shop .shop-cats a.on{color:var(--shop-acc)}
 .wren-shop .shop-cats a.on{text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:5px}
 .wren-shop .shop-basket-link{white-space:nowrap;font-weight:600;color:var(--shop-acc)}
+.wren-shop .shop-cats>li{position:relative}
+.wren-shop .shop-has-sub summary{cursor:pointer;font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:.3em}
+.wren-shop .shop-has-sub summary::-webkit-details-marker{display:none}
+.wren-shop .shop-has-sub summary::after{content:"";width:.38em;height:.38em;border:solid currentColor;border-width:0 2px 2px 0;transform:translateY(-.15em) rotate(45deg);opacity:.6}
+.wren-shop .shop-has-sub details[open] summary::after{transform:translateY(.1em) rotate(-135deg)}
+.wren-shop .shop-has-sub summary:hover,.wren-shop .shop-has-sub summary.on{color:var(--shop-acc)}
+.wren-shop .shop-drop{list-style:none;margin:0;padding:.5rem .9rem .7rem;position:absolute;z-index:20;top:calc(100% + .45rem);left:-.9rem;
+  min-width:14rem;max-width:90vw;max-height:70vh;overflow-y:auto;background:var(--bg,var(--paper,#fff));
+  border:1px solid var(--line,rgba(127,127,127,.3));border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+.wren-shop .shop-drop-wide{display:grid;grid-template-columns:repeat(auto-fill,minmax(9.5rem,1fr));gap:.2rem 1.4rem;width:min(44rem,90vw)}
+.wren-shop .shop-drop li{padding:.2rem 0}
+.wren-shop .shop-drop a{color:inherit;font-weight:600}
+.wren-shop .shop-drop a:hover,.wren-shop .shop-drop a.on{color:var(--shop-acc)}
+.wren-shop .shop-drop ul{list-style:none;margin:.15rem 0 .2rem;padding:0 0 0 .8rem;border-left:1px solid var(--line,rgba(127,127,127,.3))}
+.wren-shop .shop-drop ul a{font-weight:400}
+.wren-shop .shop-drop-all{grid-column:1/-1;padding-bottom:.4rem!important;margin-bottom:.3rem;border-bottom:1px solid var(--line,rgba(127,127,127,.3))}
+.wren-shop .shop-menu-btn{display:none}
+.wren-shop .shop-search{display:inline-flex;gap:.35rem;align-items:center;margin:0}
+.wren-shop .shop-search input{width:11rem;font:inherit;font-size:.92em;padding:.3rem .55rem;border:1px solid var(--line,rgba(127,127,127,.4));border-radius:6px;background:var(--bg,#fff);color:inherit}
+.wren-shop .shop-search .shop-button{padding:.3rem .7rem;font-size:.92em;margin:0}
+.wren-shop .shop-nav-end{align-items:center;flex-wrap:wrap;justify-content:flex-end;row-gap:.5rem}
+.wren-shop .shop-search-page{margin:0 0 1.2rem}.wren-shop .shop-search-page input{width:min(22rem,60vw)}
+.wren-shop .shop-subcats{display:flex;flex-wrap:wrap;gap:.45rem;list-style:none;margin:0 0 1.2rem;padding:0}
+.wren-shop .shop-subcats a{display:inline-block;padding:.3rem .8rem;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:99px;color:inherit;font-weight:600;font-size:.92em;text-decoration:none}
+.wren-shop .shop-subcats a:hover{border-color:var(--shop-acc);color:var(--shop-acc)}
+@media (max-width:640px){
+  .wren-shop .shop-foldable{flex-wrap:wrap}
+  .wren-shop .shop-nav-end{flex-basis:100%;justify-content:flex-end}
+  .wren-shop .shop-nav-end .shop-search{flex:1 1 100%}
+  .wren-shop .shop-nav-end .shop-search input{flex:1;width:auto;min-width:0}
+  .wren-shop .shop-js .shop-menu-btn{display:inline-flex;align-items:center;gap:.4em;font:inherit;font-weight:600;background:none;color:inherit;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:6px;padding:.3rem .7rem;cursor:pointer}
+  .wren-shop .shop-js .shop-menu-btn::before{content:"";width:1em;height:.7em;border-top:2px solid;border-bottom:2px solid;background:linear-gradient(currentColor,currentColor) center/100% 2px no-repeat}
+  .wren-shop .shop-js.shop-foldable .shop-cats{display:none;order:3;flex-basis:100%}
+  .wren-shop .shop-js.shop-open .shop-cats{display:block}
+  .wren-shop .shop-foldable .shop-cats>li{padding:.45rem 0;border-top:1px solid var(--line,rgba(127,127,127,.2))}
+  .wren-shop .shop-drop{position:static;box-shadow:none;border:0;padding:.3rem 0 0 .9rem;max-height:none;min-width:0;width:auto;background:none;display:block}
+  .wren-shop .shop-drop-all{border:0;margin:0}
+}
 .wren-shop .shop-nav-end{display:flex;gap:1.1rem;white-space:nowrap}
 .wren-shop .shop-account-link{color:inherit;font-weight:600}
 .wren-shop .shop-account-link:hover{color:var(--shop-acc)}
@@ -1146,6 +1282,15 @@ function shop_css(): string
 .wren-shop .shop-crumbs li+li::before{content:"\203A";margin:0 .45em;opacity:.6}
 .wren-shop .shop-crumbs span[aria-current]{opacity:.8}
 .wren-shop .shop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1.5rem;margin:1.5rem 0}
+.wren-shop .shop-listbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem;margin:1rem 0 -.5rem}
+.wren-shop .shop-count{margin:0;font-size:.92em;opacity:.85}
+.wren-shop .shop-sort{margin:0}.wren-shop .shop-sort label{font-size:.92em}
+.wren-shop .shop-sort select{font:inherit;margin-left:.4rem;padding:.25rem .4rem}
+.wren-shop .shop-pager ul{display:flex;flex-wrap:wrap;justify-content:center;gap:.35rem;margin:1.5rem 0;padding:0;list-style:none}
+.wren-shop .shop-pager a,.wren-shop .shop-pager span{display:inline-block;min-width:2.4rem;padding:.4rem .6rem;text-align:center;
+  border:1px solid var(--line,rgba(127,127,127,.3));border-radius:6px;text-decoration:none}
+.wren-shop .shop-pager span[aria-current]{background:var(--shop-acc);border-color:var(--shop-acc);color:#fff;font-weight:600}
+.wren-shop .shop-pager .gap{padding:.4rem .2rem;opacity:.6}.wren-shop .shop-pager .step a{min-width:0}
 .wren-shop .shop-card{display:flex;flex-direction:column;border:1px solid var(--line,rgba(127,127,127,.3));border-radius:8px;overflow:hidden;position:relative}
 .wren-shop .shop-card>a{display:block;text-decoration:none}
 .wren-shop .shop-card img{display:block;width:100%;height:auto;aspect-ratio:1/1;object-fit:cover;border-radius:0}
@@ -1156,6 +1301,12 @@ function shop_css(): string
 .wren-shop .shop-soldout{display:inline-block;font-size:.8em;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;
   padding:.1em .5em;border-radius:4px;background:var(--ink,#333);color:#fff}
 .wren-shop .shop-card .shop-soldout{position:absolute;top:.6rem;left:.6rem}
+.wren-shop .shop-sale{display:inline-block;font-size:.8em;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;
+  padding:.1em .5em;border-radius:4px;background:var(--shop-acc);color:#fff}
+.wren-shop .shop-card .shop-sale{position:absolute;top:.6rem;left:.6rem}
+.wren-shop .shop-sale-tag{font-weight:bold;color:var(--shop-acc)}
+.wren-shop .shop-backorder{font-style:italic}
+.wren-shop small.shop-backorder{display:block;font-style:normal;font-weight:600;color:var(--shop-acc)}
 .wren-shop .shop-product{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:1.75rem;align-items:start}
 .wren-shop .shop-photo{display:block;width:100%;height:auto;border-radius:8px;border:1px solid var(--line,rgba(127,127,127,.3))}
 .wren-shop .shop-thumbs{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.6rem}
@@ -1296,13 +1447,16 @@ function variant_price(array $p, ?array $v): int
     return $v && $v['price_pence'] !== null ? (int)$v['price_pence'] : (int)$p['price_pence'];
 }
 
-function variant_sold_out(array $v): bool
+function variant_sold_out(array $v, ?array $p = null): bool
 {
-    return $v['stock'] !== null && (int)$v['stock'] <= 0;
+    return $v['stock'] !== null && (int)$v['stock'] <= 0 && !($p && backorders_on($p));
 }
 
 function sold_out(array $p, array $vars = []): bool
 {
+    if (backorders_on($p)) {   // keeps selling below zero
+        return false;
+    }
     if ($vars) {
         foreach ($vars as $v) {
             if (!variant_sold_out($v)) {
@@ -1314,13 +1468,14 @@ function sold_out(array $p, array $vars = []): bool
     return $p['stock'] !== null && (int)$p['stock'] <= 0;
 }
 
-/* [lowest, highest] price a customer can pay for this product. */
-function price_range(array $p, array $vars): array
+/* [lowest, highest] price for this product: full prices, or with any sale taken off. */
+function price_range(array $p, array $vars, bool $sale = false): array
 {
     if (!$vars) {
-        return [(int)$p['price_pence'], (int)$p['price_pence']];
+        $one = $sale ? unit_price($p, null) : (int)$p['price_pence'];
+        return [$one, $one];
     }
-    $prices = array_map(fn($v) => variant_price($p, $v), $vars);
+    $prices = array_map(fn($v) => $sale ? unit_price($p, $v) : variant_price($p, $v), $vars);
     return [min($prices), max($prices)];
 }
 
@@ -1333,6 +1488,187 @@ function price_label(array $p, array $vars): string
 function categories(): array
 {
     return db()->query('SELECT * FROM categories ORDER BY position, name COLLATE NOCASE')->fetchAll();
+}
+
+/* --------------------------------------------------------------- paging */
+/* Lists show a page at a time. A small shop never sees any of this: no page
+   links until there's more than a page, and no sort menu until there are a
+   dozen products. */
+
+const SORTS = ['new' => 'Newest', 'price' => 'Price, low to high', 'price-desc' => 'Price, high to low', 'name' => 'Name'];
+const SORT_MENU_FROM = 12;
+
+function per_page(): int
+{
+    return max(6, min(96, (int)setting('per_page', '24')));
+}
+
+/* ?page=N, 1 if missing or nonsense. */
+function list_page(): int
+{
+    $p = str_in($_GET['page'] ?? '');
+    return ctype_digit($p) && (int)$p >= 1 ? min((int)$p, 100000) : 1;
+}
+
+/* ?sort=, from the list's own sort menu (the first one is its default). */
+function list_sort(array $sorts = SORTS): string
+{
+    $s = str_in($_GET['sort'] ?? '');
+    return isset($sorts[$s]) ? $s : (string)array_key_first($sorts);
+}
+
+/* A URL with extra query values, leaving out empty ones and defaults. Works for
+   pretty URLs and for ?q= ones. */
+function url_with(string $url, array $params): string
+{
+    $params = array_filter($params, fn($v, $k) => $v !== '' && $v !== null && !($k === 'page' && (int)$v === 1), ARRAY_FILTER_USE_BOTH);
+    if (!$params) {
+        return $url;
+    }
+    return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($params);
+}
+
+/* The lowest price a product can be bought for, as SQL: the sale price when it's
+   on sale today, and this customer's group price when that's lower (for sorting). */
+function price_sql(): string
+{
+    $today = db()->quote(uk_today());
+    $on = "(p.sale_from <= $today AND (p.sale_to = '' OR p.sale_to >= $today))";
+    $g = customer_group();
+    $rate = '0';
+    if ($g) {
+        // The main category's rate, else the nearest category it sits in, else the group's own.
+        $at = fn($cat) => '(SELECT gr.percent FROM group_rates gr WHERE gr.group_id = ' . (int)$g['id'] . ' AND gr.category_id = ' . $cat . ')';
+        $up = fn($cat) => '(SELECT parent_id FROM categories WHERE id = ' . $cat . ')';
+        $rate = 'COALESCE(' . $at('p.category_id') . ', ' . $at($up('p.category_id')) . ', ' . $at($up($up('p.category_id'))) . ', ' . (int)$g['percent'] . ')';
+    }
+    // One price: the lower of its sale price (if on sale) and the full price less the group rate.
+    $own = fn(string $full, string $sale) => "MIN(CASE WHEN $on AND $sale IS NOT NULL AND $sale < $full THEN $sale ELSE $full END, ROUND($full * (100 - $rate) / 100.0))";
+    return 'COALESCE((SELECT MIN(CASE WHEN v.price_pence IS NULL THEN ' . $own('p.price_pence', 'p.sale_pence') . ' ELSE ' . $own('v.price_pence', 'v.sale_pence') . ' END)'
+         . ' FROM variants v WHERE v.product_id = p.id), ' . $own('p.price_pence', 'p.sale_pence') . ')';
+}
+
+function sort_sql(string $sort): string
+{
+    return match ($sort) {
+        'price'      => price_sql() . ' ASC, p.id DESC',
+        'price-desc' => price_sql() . ' DESC, p.id DESC',
+        'name'       => 'p.name COLLATE NOCASE ASC, p.id ASC',
+        default      => 'p.created DESC, p.id DESC',
+    };
+}
+
+/* One page of visible products matching $where (SQL on alias p, with ?
+   placeholders filled from $args). Returns [rows, total]. */
+function product_page(string $where, array $args, string $order, int $page, int $per): array
+{
+    $st = db()->prepare("SELECT COUNT(*) FROM products p WHERE p.visible = 1 AND ($where)");
+    $st->execute($args);
+    $total = (int)$st->fetchColumn();
+    $st = db()->prepare("SELECT p.* FROM products p WHERE p.visible = 1 AND ($where) ORDER BY " . $order
+                      . ' LIMIT ' . $per . ' OFFSET ' . (($page - 1) * $per));
+    $st->execute($args);
+    return [$st->fetchAll(), $total];
+}
+
+/* Page links: Previous 1 … 4 5 6 … 20 Next. $url makes the link for a page. */
+function pager_html(int $page, int $pages, callable $url, string $class = 'shop-pager'): string
+{
+    if ($pages <= 1) {
+        return '';
+    }
+    $show = array_unique(array_filter([1, $page - 2, $page - 1, $page, $page + 1, $page + 2, $pages],
+                                      fn($n) => $n >= 1 && $n <= $pages));
+    sort($show);
+    $out = '';
+    $last = 0;
+    foreach ($show as $n) {
+        if ($n > $last + 1) {
+            $out .= '<li class="gap" aria-hidden="true">&hellip;</li>';
+        }
+        $out .= $n === $page
+            ? '<li><span aria-current="page">' . $n . '</span></li>'
+            : '<li><a href="' . e($url($n)) . '" aria-label="Page ' . $n . '">' . $n . '</a></li>';
+        $last = $n;
+    }
+    $prev = $page > 1 ? '<li class="step"><a href="' . e($url($page - 1)) . '" rel="prev">&larr; Previous</a></li>' : '';
+    $next = $page < $pages ? '<li class="step"><a href="' . e($url($page + 1)) . '" rel="next">Next &rarr;</a></li>' : '';
+    return '<nav class="' . $class . '" aria-label="Pages"><ul>' . $prev . $out . $next . '</ul></nav>';
+}
+
+/* "Sort by" menu, a plain GET form that keeps ?q= for shops without pretty URLs. */
+function sort_html(string $url, string $sort, array $keep = [], array $sorts = SORTS): string
+{
+    $hidden = '';
+    $qs = parse_url($url, PHP_URL_QUERY);
+    parse_str((string)$qs, $have);
+    foreach (array_merge($have, $keep) as $k => $v) {
+        if (is_string($v) && $v !== '' && !in_array($k, ['sort', 'page'], true)) {
+            $hidden .= '<input type="hidden" name="' . e($k) . '" value="' . e($v) . '">';
+        }
+    }
+    $opts = '';
+    foreach ($sorts as $k => $label) {
+        $opts .= '<option value="' . $k . '"' . ($k === $sort ? ' selected' : '') . '>' . e($label) . '</option>';
+    }
+    return '<form class="shop-sort" method="get" action="' . e(strtok($url, '?')) . '">' . $hidden
+         . '<label>Sort by <select name="sort" onchange="this.form.submit()">' . $opts . '</select></label>'
+         . '<noscript><button class="shop-button shop-quiet">Sort</button></noscript></form>';
+}
+
+/* The product cards for a list of rows. */
+function product_cards(array $rows): string
+{
+    $ids = array_column($rows, 'id');
+    $photos = first_photos($ids);
+    $vars = variants_for($ids);
+    $cards = '';
+    foreach ($rows as $p) {
+        $pv = $vars[(int)$p['id']] ?? [];
+        $link = e(shop_url('p/' . $p['slug']));
+        $ph = $photos[(int)$p['id']] ?? null;
+        $img = $ph ? '<a href="' . $link . '" tabindex="-1" aria-hidden="true"><img src="' . e(media_url($ph['thumb']))
+                   . '" alt="" width="400" height="400" loading="lazy"></a>' : '';
+        $cards .= '<div class="shop-card">' . $img
+                . (sold_out($p, $pv) ? '<span class="shop-soldout">Sold out</span>' : (product_on_sale($p, $pv) ? '<span class="shop-sale">Sale</span>' : ''))
+                . '<div class="shop-card-text"><h2><a href="' . $link . '">' . e($p['name']) . '</a></h2>'
+                . '<p class="shop-price">' . shop_price_html($p, $pv) . '</p></div></div>';
+    }
+    return $cards;
+}
+
+/* A paged, sortable grid: the count line, sort menu, cards and page links.
+   Returns [html, page, pages]; a page past the end is a 404. */
+/* $o: 'sorts' (the sort menu, default first), 'best' (ORDER BY for a 'best' sort),
+   'keep' (query values every link keeps, like the search words), 'noun' ("products"). */
+/* ($o['count']: show how many even for a short list.) */
+function product_grid(string $where, array $args, string $route, string $empty, array $o = []): array
+{
+    $page = list_page();
+    $sorts = $o['sorts'] ?? SORTS;
+    $sort = list_sort($sorts);
+    $def = (string)array_key_first($sorts);
+    $per = per_page();
+    [$rows, $total] = product_page($where, $args, $sort === 'best' ? $o['best'] : sort_sql($sort), $page, $per);
+    $pages = max(1, (int)ceil($total / $per));
+    if ($page > $pages) {
+        view_404();
+    }
+    if (!$rows) {
+        return ['<p>' . $empty . '</p>', 1, 1];
+    }
+    $base = url_with(shop_url($route), $o['keep'] ?? []);
+    $from = ($page - 1) * $per + 1;
+    $to = $from + count($rows) - 1;
+    $bar = '';
+    if ($total >= SORT_MENU_FROM || !empty($o['count'])) {
+        $bar = '<div class="shop-listbar"><p class="shop-count">'
+             . ($pages > 1 ? number_format($from) . '&ndash;' . number_format($to) . ' of ' : '') . number_format($total) . ' ' . ($total === 1 ? ($o['noun1'] ?? 'product') : ($o['noun'] ?? 'products')) . '</p>'
+             . ($total >= SORT_MENU_FROM ? sort_html($base, $sort, [], $sorts) : '') . '</div>';
+    }
+    $html = $bar . '<div class="shop-grid">' . product_cards($rows) . '</div>'
+          . pager_html($page, $pages, fn($n) => url_with($base, ['sort' => $sort === $def ? '' : $sort, 'page' => $n]));
+    return [$html, $page, $pages];
 }
 
 /* ---------------------------------------------------------------- views */
@@ -1348,32 +1684,34 @@ function view_list(?string $catSlug = null): never
             view_404();
         }
     }
-    $sql = 'SELECT * FROM products WHERE visible = 1' . ($cat ? ' AND category_id = ' . (int)$cat['id'] : '')
-         . ' ORDER BY created DESC, id DESC';
-    $rows = db()->query($sql)->fetchAll();
-    $ids = array_column($rows, 'id');
-    $photos = first_photos($ids);
-    $vars = variants_for($ids);
-    $cards = '';
-    foreach ($rows as $p) {
-        $pv = $vars[(int)$p['id']] ?? [];
-        $link = e(shop_url('p/' . $p['slug']));
-        $ph = $photos[(int)$p['id']] ?? null;
-        $img = $ph ? '<a href="' . $link . '" tabindex="-1" aria-hidden="true"><img src="' . e(media_url($ph['thumb']))
-                   . '" alt="" width="400" height="400" loading="lazy"></a>' : '';
-        $cards .= '<div class="shop-card">' . $img
-                . (sold_out($p, $pv) ? '<span class="shop-soldout">Sold out</span>' : '')
-                . '<div class="shop-card-text"><h2><a href="' . $link . '">' . e($p['name']) . '</a></h2>'
-                . '<p class="shop-price">' . shop_price_html($p, $pv) . '</p></div></div>';
+    $route = $cat ? 'c/' . $cat['slug'] : '';
+    [$grid, $page, $pages] = $cat
+        ? product_grid(cat_in_sql(cat_descendants((int)$cat['id'])), [], $route, 'Nothing for sale here yet.')
+        : product_grid('1', [], $route, 'Nothing for sale here yet.');
+    // The categories inside this one, to narrow it down (first page only).
+    $subs = '';
+    if ($cat && $page === 1) {
+        foreach (cat_children((int)$cat['id']) as $c) {
+            if (isset(cat_live()[$c['id']])) {
+                $subs .= '<li><a href="' . e(shop_url('c/' . $c['slug'])) . '">' . e($c['name']) . '</a></li>';
+            }
+        }
+        $subs = $subs !== '' ? '<ul class="shop-subcats" aria-label="In ' . e($cat['name']) . '">' . $subs . '</ul>' : '';
     }
+    $trail = $cat ? cat_trail((int)$cat['id']) : [];
 
     $title = $cat ? $cat['name'] : setting('shop_title', 'Shop');
-    render($title, '<h1 class="post-title">' . e($title) . '</h1><div class="post-body">'
-        . ($cards ? '<div class="shop-grid">' . $cards . '</div>' : '<p>Nothing for sale here yet.</p>') . '</div>',
-        ['description' => ($cat ? $cat['name'] . ' from ' : 'Everything for sale from ') . setting('last_site_title', 'us') . '.',
-         'route' => $cat ? 'c/' . $cat['slug'] : '',
+    // "Spares" alone says little in a search result or a browser tab: "SRX2 Spares".
+    $tab = $cat && count($trail) > 1 ? $trail[count($trail) - 2]['name'] . ' ' . $cat['name'] : $title;
+    render($tab . ($page > 1 ? ' (page ' . $page . ')' : ''),
+        '<h1 class="post-title">' . e($title) . '</h1><div class="post-body">' . $subs . $grid . '</div>',
+        ['description' => ($cat ? $tab . ' from ' : 'Everything for sale from ') . setting('last_site_title', 'us') . '.'
+                        . ($page > 1 ? ' Page ' . $page . ' of ' . $pages . '.' : ''),
+         'route' => $route,
+         'query' => ['page' => $page],
+         'noindex' => list_sort() !== 'new',   // sorted copies of the same list
          'cat' => $cat ? (int)$cat['id'] : 0,
-         'crumbs' => $cat ? [[$cat['name'], null]] : []]);
+         'crumbs' => array_map(fn($c) => [$c['name'], $c['id'] === (int)$cat['id'] ? null : 'c/' . $c['slug']], $trail)]);
 }
 
 function view_product(string $slug): never
@@ -1409,10 +1747,13 @@ function view_product(string $slug): never
         $opts = '<option value="">Choose ' . e(mb_strtolower($label)) . '</option>';
         foreach ($vars as $v) {
             $price = variant_price($p, $v);
-            $gone = variant_sold_out($v);
-            $opts .= '<option value="' . (int)$v['id'] . '" data-price="' . e(group_price_html($p, $price)) . '" data-max="' . qty_max($p, $v) . '"'
+            $gone = variant_sold_out($v, $p);
+            $own = own_price($p, $v)[0];
+            $wait = !$gone && backorder_told($p) && $v['stock'] !== null && (int)$v['stock'] <= 0;
+            $opts .= '<option value="' . (int)$v['id'] . '" data-price="' . e(own_price_html($p, $v)) . '" data-max="' . qty_max($p, $v) . '"'
+                   . ' data-sku="' . e($v['sku'] !== '' ? $v['sku'] : $p['sku']) . '"'
                    . ($gone ? ' disabled' : '') . '>' . e($v['name'])
-                   . ($price !== $base ? ' – ' . money($price - group_unit_saving($p, $price)) : '') . ($gone ? ' – sold out' : '') . '</option>';
+                   . ($price !== $base || $own < $price ? ' – ' . money($own) : '') . ($gone ? ' – sold out' : '') . ($wait ? ' – on backorder' : '') . '</option>';
         }
         $choose = '<label class="shop-qty shop-opt"><span>' . e($label) . '</span> <select name="variant" id="shop-variant" required>'
                 . $opts . '</select></label>';
@@ -1429,7 +1770,8 @@ function view_product(string $slug): never
         // Show the chosen option's price, and let the quantity go only as high as its stock.
         $buy .= '<script>(function(){var s=document.getElementById("shop-variant"),p=document.getElementById("shop-price"),'
               . 'q=document.getElementById("shop-qty"),d=p.innerHTML;s.addEventListener("change",function(){'
-              . 'var o=s.options[s.selectedIndex];p.innerHTML=o.value?o.dataset.price:d;'
+              . 'var o=s.options[s.selectedIndex],k=document.getElementById("shop-sku");p.innerHTML=o.value?o.dataset.price:d;'
+              . 'if(k){k.textContent=o.value&&o.dataset.sku?o.dataset.sku:k.dataset.base;k.parentNode.hidden=!k.textContent;}'
               . 'q.max=o.value?o.dataset.max:"' . QTY_LIMIT . '";if(+q.value>+q.max)q.value=q.max;});})();</script>';
     }
     if (is_digital($p)) {
@@ -1437,17 +1779,28 @@ function view_product(string $slug): never
               . ((int)$p['licensed'] ? '. Licensed for one website, with ' . (int)$p['update_months'] . ' months of updates included.' : '.') . '</p>';
     }
     if (!$out && !$vars && $p['stock'] !== null && (int)$p['stock'] <= 3) {
-        $buy .= '<p><em>Only ' . (int)$p['stock'] . ' left.</em></p>';
+        if (!backorders_on($p)) {
+            $buy .= '<p><em>Only ' . (int)$p['stock'] . ' left.</em></p>';
+        } elseif (backorder_told($p)) {
+            $buy .= '<p class="shop-hint shop-backorder">' . ((int)$p['stock'] > 0
+                ? 'Only ' . (int)$p['stock'] . ' in stock; more can be ordered and will follow when they arrive.'
+                : 'Available on backorder: we\'ll send it as soon as it\'s back in stock.') . '</p>';
+        }
     }
     $summary = plain_summary($p['description'], 500);
+    // Part number: the product's, or the chosen option's once one is picked.
+    $anySku = $p['sku'] !== '' || array_filter($vars, fn($x) => $x['sku'] !== '');
+    $skuHtml = $anySku ? '<p class="shop-hint shop-sku"' . ($p['sku'] === '' ? ' hidden' : '') . '>SKU <span id="shop-sku" data-base="' . e($p['sku']) . '">'
+             . e($p['sku']) . '</span></p>' : '';
     $pc = null;
     if ((int)$p['category_id']) {
         $st = db()->prepare('SELECT * FROM categories WHERE id = ?');
         $st->execute([$p['category_id']]);
         $pc = $st->fetch() ?: null;
     }
-    [$lo, $hi] = price_range($p, $vars);
-    $availability = 'https://schema.org/' . ($out ? 'OutOfStock' : 'InStock');
+    [$lo, $hi] = price_range($p, $vars, true);
+    $none = $vars ? !array_filter($vars, fn($x) => $x['stock'] === null || (int)$x['stock'] > 0) : ($p['stock'] !== null && (int)$p['stock'] <= 0);
+    $availability = 'https://schema.org/' . ($out ? 'OutOfStock' : ($none && backorders_on($p) ? 'BackOrder' : 'InStock'));
     $offers = $vars
         ? ['@type' => 'AggregateOffer', 'lowPrice' => price_input($lo), 'highPrice' => price_input($hi),
            'offerCount' => count($vars), 'priceCurrency' => 'GBP', 'availability' => $availability]
@@ -1457,20 +1810,21 @@ function view_product(string $slug): never
         . ($f ? '<p class="shop-note" role="status">' . e($f) . '</p>' : '')
         . '<div class="post-body' . ($photos ? ' shop-product' : '') . '">' . $gallery
         . '<div><p class="shop-price" id="shop-price">' . shop_price_html($p, $vars) . '</p>'
-        . md_lite($p['description']) . $buy
+        . $skuHtml . md_lite($p['description']) . $buy
         . '<p><a href="' . e(shop_url($pc ? 'c/' . $pc['slug'] : '')) . '">&larr; ' . ($pc ? 'More ' . e($pc['name']) : 'Back to the shop') . '</a></p></div></div>',
         [
             'description' => plain_summary($p['description']),
             'route'       => 'p/' . $p['slug'],
             'type'        => 'product',
             'cat'         => $pc ? (int)$pc['id'] : null,
-            'crumbs'      => array_merge($pc ? [[$pc['name'], 'c/' . $pc['slug']]] : [], [[$p['name'], null]]),
+            'crumbs'      => array_merge(array_map(fn($c) => [$c['name'], 'c/' . $c['slug']], $pc ? cat_trail((int)$pc['id']) : []), [[$p['name'], null]]),
             'image'       => $photos ? origin() . media_url($photos[0]['file']) : null,
             'jsonld'      => [
                 '@context'    => 'https://schema.org',
                 '@type'       => 'Product',
                 'name'        => $p['name'],
                 'description' => $summary,
+            ] + ($p['sku'] !== '' ? ['sku' => $p['sku']] : []) + [
                 'url'         => abs_shop_url('p/' . $p['slug']),
                 'image'       => $photos ? origin() . media_url($photos[0]['file']) : null,
                 'offers'      => $offers,
@@ -1534,7 +1888,7 @@ function qty_max(array $p, ?array $v = null): int
         return isset($p['renew_licence']) || !(int)$p['licensed'] ? 1 : 10;
     }
     $stock = $v ? $v['stock'] : $p['stock'];
-    return $stock === null ? QTY_LIMIT : max(0, min(QTY_LIMIT, (int)$stock));
+    return $stock === null || backorders_on($p) ? QTY_LIMIT : max(0, min(QTY_LIMIT, (int)$stock));
 }
 
 function qty_from(mixed $raw, int $min): int
@@ -1622,7 +1976,7 @@ function basket_update(): never
         $_SESSION['shop_delivery'] = $how;
     }
     $lines = basket_lines();
-    $code = basket_discount_post(array_sum(array_map(fn($l) => $l['qty'] * $l['price'], $lines)));
+    $code = basket_discount_post(array_sum(array_map(fn($l) => $l['qty'] * $l['full'], $lines)));
     if ($code !== null) {
         $notes[] = $code;
     }
@@ -1643,8 +1997,12 @@ function can_collect(): bool
 }
 
 /* Everything checkout needs to know about the money, from the goods total. */
-function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0): array
+/* $subtotal is the goods at the prices on the lines (sale prices where on sale);
+   $saleSaving is what those sale prices take off the full prices. */
+function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0, int $saleSaving = 0): array
 {
+    $saleSub = $subtotal;
+    $fullSub = $subtotal + $saleSaving;
     $method = (string)($_SESSION['shop_delivery'] ?? '');
     if ($method === 'collect' && !can_collect()) {
         $method = '';
@@ -1658,39 +2016,51 @@ function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0):
     if (!basket_physical()) {   // downloads only: nothing to post or collect
         $method = 'none';
     }
-    $postage = null;   // null = not set up yet
-    $toFree = null;
-    if ($method === 'collect' || $method === 'none') {
-        $postage = 0;
-    } elseif (setting('postage_price') !== '') {
-        $postage = (int)setting('postage_price');
-        $over = setting('postage_free_over');
-        if ($over !== '') {
-            if ($subtotal >= (int)$over) {
-                $postage = 0;
-            } else {
-                $toFree = (int)$over - $subtotal;
-            }
+    // Delivery for goods worth $sub: [price or null if not set up yet, how much more for free delivery].
+    $postFor = function (int $sub) use ($method): array {
+        if ($method === 'collect' || $method === 'none') {
+            return [0, null];
         }
-    }
-    // A discount code comes off the goods; free delivery from a code wins over the price.
-    $disc = basket_discount($subtotal, $email);
+        if (setting('postage_price') === '') {
+            return [null, null];
+        }
+        $over = setting('postage_free_over');
+        if ($over !== '' && $sub >= (int)$over) {
+            return [0, null];
+        }
+        return [(int)setting('postage_price'), $over !== '' ? (int)$over - $sub : null];
+    };
+    [$postage, $toFree] = $postFor($saleSub);
+    // A discount code comes off the goods at their full prices; free delivery from a
+    // code wins over the price.
+    $disc = basket_discount($fullSub, $email);
     $d = $disc['d'];
     $note = $disc['note'];
     $freePost = $d && (int)$d['free_postage'] && $method === 'deliver';
-    $codePost = $freePost && $postage !== null ? 0 : $postage;
-    // A customer group's prices and a code never add up: whichever total is lower wins.
+    [$fullPost, $fullToFree] = $postFor($fullSub);
+    $codePost = $freePost && $fullPost !== null ? 0 : $fullPost;
+    // Sale prices, a customer group's prices and a code never add up: whichever total is lower wins.
     $beaten = false;
-    if ($groupSaving > 0 && $d) {
-        if ($subtotal - $groupSaving + ($postage ?? 0) <= $subtotal - $disc['pence'] + ($codePost ?? 0)) {
+    $saleOff = false;
+    if ($d && ($groupSaving > 0 || $saleSaving > 0)) {
+        if ($saleSub - $groupSaving + ($postage ?? 0) <= $fullSub - $disc['pence'] + ($codePost ?? 0)) {
             $g = customer_group();
-            $note = 'Your ' . ($g['name'] ?? 'group') . ' prices save you more than ' . $d['code'] . ', so the code isn\'t used.';
+            $whose = $groupSaving > 0 && $saleSaving > 0 ? 'The sale and your ' . ($g['name'] ?? 'group') . ' prices save'
+                   : ($groupSaving > 0 ? 'Your ' . ($g['name'] ?? 'group') . ' prices save' : 'The sale prices save');
+            $note = $whose . ' you more than ' . $d['code'] . ', so the code isn\'t used.';
             $d = null;
             $disc['pence'] = 0;
             $freePost = false;
             $beaten = true;
         } else {
+            // The code wins: everything at its full price, with the code taken off.
+            if ($saleSaving > 0) {
+                $note = $d['code'] . ' saves you more than the sale prices, so it\'s used instead (sale prices and codes don\'t add up).';
+            }
             $groupSaving = 0;
+            $saleOff = $saleSaving > 0;
+            $subtotal = $fullSub;
+            [$postage, $toFree] = [$fullPost, $fullToFree];
         }
     }
     if ($freePost && $postage !== null) {
@@ -1703,7 +2073,19 @@ function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0):
     return ['subtotal' => $subtotal, 'method' => $method, 'postage' => $postage, 'to_free' => $toFree,
             'total' => $total, 'vat' => $vat, 'discount' => $disc['pence'], 'code' => $d['code'] ?? '',
             'discount_id' => $d ? (int)$d['id'] : null, 'discount_note' => $note, 'free_post' => $freePost,
-            'group' => $groupSaving > 0 ? (customer_group()['name'] ?? '') : '', 'group_pence' => $groupSaving, 'code_beaten' => $beaten];
+            'group' => $groupSaving > 0 ? (customer_group()['name'] ?? '') : '', 'group_pence' => $groupSaving, 'code_beaten' => $beaten,
+            'sale_off' => $saleOff];
+}
+
+/* What a basket line costs each, once the totals are known (full price when a code beat the sale). */
+function line_unit(array $l, array $t): int
+{
+    return !empty($t['sale_off']) ? $l['full'] : $l['price'];
+}
+
+function lines_sale_saving(array $lines): int
+{
+    return array_sum(array_map(fn($l) => $l['qty'] * ($l['full'] - $l['price']), $lines));
 }
 
 function view_basket(): never
@@ -1712,8 +2094,10 @@ function view_basket(): never
     $rows = '';
     $subtotal = 0;
     $gsave = 0;
+    $ssave = 0;
     $notes = [];
     $keep = [];
+    $draw = [];   // rows are drawn once the totals say which prices apply
     if ($items) {
         $ids = array_map(fn($k) => (int)explode(':', (string)$k)[0], array_keys($items));
         $photos = first_photos($ids);
@@ -1735,34 +2119,42 @@ function view_basket(): never
                 continue;
             }
             $keep[$key] = $qty;
-            $price = variant_price($p, $v);
-            $line = $qty * $price;
-            $subtotal += $line;
-            $gsave += $qty * group_unit_saving($p, $price);
-            $ph = $photos[(int)$p['id']] ?? null;
+            $full = variant_price($p, $v);
+            $price = unit_price($p, $v);
+            $subtotal += $qty * $price;
+            $ssave += $qty * ($full - $price);
+            $gsave += lines_group_saving([['p' => $p, 'qty' => $qty, 'price' => $price, 'full' => $full]]);
+            $draw[] = [$key, $p, $v, $qty, $price, $full, $max, $name, $photos[(int)$p['id']] ?? null];
+        }
+    }
+    $_SESSION['shop_basket'] = $keep;
+    $me = accounts_on() ? current_customer() : null;
+    $t = $draw ? basket_totals($subtotal, $me['email'] ?? '', $gsave, $ssave) : null;
+    foreach ($draw as [$key, $p, $v, $qty, $price, $full, $max, $name, $ph]) {
+            $unit = $t['sale_off'] ? $full : $price;
+            $line = $qty * $unit;
+            $bo = backorder_told($p) ? backorder_qty($p, $v, $qty) : 0;
             $link = e(shop_url('p/' . $p['slug']));
             $rows .= '<tr class="shop-line">'
                 . '<td class="shop-item"><div>' . ($ph ? '<a href="' . $link . '" tabindex="-1" aria-hidden="true"><img src="'
                     . e(media_url($ph['thumb'])) . '" alt="" width="64" height="64"></a>' : '')
                 . '<span><a href="' . $link . '">' . e($p['name']) . '</a>'
                 . ($v ? '<small>' . e($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . e($v['name']) . '</small>' : '')
+                . (($sku = $v && $v['sku'] !== '' ? $v['sku'] : $p['sku']) !== '' ? '<small class="shop-sku">' . e($sku) . '</small>' : '')
+                . ($bo ? '<small class="shop-backorder">' . backorder_note($bo, $qty) . '</small>' : '')
                 . '</span></div></td>'
-                . '<td class="shop-num" data-label="Price">' . money($price) . '</td>'
+                . '<td class="shop-num" data-label="Price">' . money($unit) . ($unit < $full ? ' <s class="shop-was">' . money($full) . '</s>' : '') . '</td>'
                 . '<td class="shop-num" data-label="Quantity"><input type="number" name="qty[' . e((string)$key) . ']" value="' . $qty
                 . '" min="0" max="' . $max . '" step="1" inputmode="numeric" aria-label="Quantity of ' . e($name) . '"></td>'
                 . '<td class="shop-num" data-label="Total">' . money($line) . '</td>'
                 . '<td class="shop-num"><button class="shop-remove" name="remove" value="' . e((string)$key)
                 . '" aria-label="Remove ' . e($name) . '">Remove</button></td></tr>';
-        }
     }
-    $_SESSION['shop_basket'] = $keep;
     $f = flash();
     $msg = trim(($f ?? '') . ' ' . implode(' ', $notes));
     $body = '<h1 class="post-title">Basket</h1><div class="post-body">'
           . ($msg !== '' ? '<p class="shop-note" role="status">' . e($msg) . '</p>' : '');
     if ($rows) {
-        $me = accounts_on() ? current_customer() : null;
-        $t = basket_totals($subtotal, $me['email'] ?? '', $gsave);
         if ($t['discount_note'] !== null && !str_contains($msg, $t['discount_note'])) {
             $body .= '<p class="shop-note" role="status">' . e($t['discount_note']) . '</p>';
         }
@@ -1828,7 +2220,7 @@ function view_sitemap(): never
     echo '<?xml version="1.0" encoding="UTF-8"?>' . "\n"
        . '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n"
        . '<url><loc>' . e(abs_shop_url()) . '</loc></url>' . "\n";
-    foreach (db()->query('SELECT DISTINCT c.slug FROM categories c JOIN products p ON p.category_id = c.id WHERE p.visible = 1') as $c) {
+    foreach (array_intersect_key(cat_all(), cat_live()) as $c) {
         echo '<url><loc>' . e(abs_shop_url('c/' . $c['slug'])) . '</loc></url>' . "\n";
     }
     foreach (db()->query('SELECT slug, updated FROM products WHERE visible = 1') as $p) {
@@ -2117,25 +2509,90 @@ function require_admin(): array
 
 /* -------------------------------------------------------------- admin shell */
 
+/* The admin's main sections (the side menu) and each one's pages (the tabs along the top).
+   Tab keys are admin addresses: admin_url($key). */
+function admin_sections(): array
+{
+    return [
+        'orders'    => ['Orders', '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+                        ['orders' => 'All orders', 'export' => 'Export']],
+        'products'  => ['Products', '<path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8.5" r="1.5"/>',
+                        ['' => 'All products', 'new' => 'Add a product', 'categories' => 'Categories', 'import' => 'Import and export']],
+        'customers' => ['Customers', '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>',
+                        ['customers' => 'Customers', 'groups' => 'Groups', 'licences' => 'Downloads and licences', 'privacy' => 'Find a person\'s data']],
+        'discounts' => ['Discounts', '<path d="M19 5 5 19"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/>',
+                        ['discounts' => 'Discount codes', 'discount/new' => 'Add a code']],
+        'settings'  => ['Settings', '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+                        ['ready' => 'Getting ready'] + array_combine(
+                            array_map(fn($t) => $t === 'general' ? 'settings' : 'settings/' . $t, array_keys(SETTINGS_TABS)),
+                            array_values(SETTINGS_TABS))],
+    ];
+}
+
+/* Where this admin page sits: [section, tab key]. Detail pages (one order, one product)
+   sit under the list they came from. */
+function admin_where(): array
+{
+    $seg = $GLOBALS['shop_seg'] ?? [];
+    $sub = $seg[1] ?? '';
+    return match ($sub) {
+        '', 'edit'           => ['products', ''],
+        'new'                => ['products', 'new'],
+        'categories'         => ['products', 'categories'],
+        'import'             => ['products', 'import'],
+        'orders', 'order'    => ['orders', 'orders'],
+        'export'             => ['orders', 'export'],
+        'customers', 'customer' => ['customers', 'customers'],
+        'groups', 'group'    => ['customers', 'groups'],
+        'licences', 'licence' => ['customers', 'licences'],
+        'privacy'            => ['customers', 'privacy'],
+        'discounts'          => ['discounts', 'discounts'],
+        'discount'           => ['discounts', ($seg[2] ?? '') === 'new' ? 'discount/new' : 'discounts'],
+        'ready'              => ['settings', 'ready'],
+        'settings'           => ['settings', isset(SETTINGS_TABS[$seg[2] ?? '']) && $seg[2] !== 'general' ? 'settings/' . $seg[2] : 'settings'],
+        default              => ['', ''],
+    };
+}
+
+function admin_icon(string $paths): string
+{
+    return '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' . $paths . '</svg>';
+}
+
+function admin_menu_html(): array
+{
+    [$here, $tab] = admin_where();
+    $side = '';
+    $tabs = '';
+    foreach (admin_sections() as $key => [$label, $icon, $pages]) {
+        $first = array_key_first($pages);
+        $on = $key === $here;
+        $badge = $key === 'orders' && ($n = orders_todo_count()) ? ' <span class="badge" title="' . $n . ' to do">' . $n . '</span>' : '';
+        $side .= '<li><a href="' . e(admin_url((string)$first)) . '"' . ($on ? ' aria-current="page"' : '') . '>' . admin_icon($icon)
+               . '<span>' . e($label) . '</span>' . $badge . '</a></li>';
+        if ($on && count($pages) > 1) {
+            foreach ($pages as $k => $t) {
+                $tabs .= '<li><a href="' . e(admin_url((string)$k)) . '"' . ((string)$k === $tab ? ' aria-current="page"' : '') . '>' . e($t) . '</a></li>';
+            }
+        }
+    }
+    $util = '<li><a href="' . e(shop_url()) . '">' . admin_icon('<path d="M4 9 5 4h14l1 5M4 9v11h16V9M4 9h16M10 20v-5h4v5"/>') . '<span>View shop</span></a></li>
+      <li><a href="' . e(SHOP_HELP_URL) . '" target="_blank" rel="noopener" title="Help: the owner\'s guide">' . admin_icon('<circle cx="12" cy="12" r="9"/><path d="M9.6 9.4a2.5 2.5 0 1 1 3.4 2.4c-.6.3-1 .8-1 1.5v.4M12 17h.01"/>') . '<span>Help</span></a></li>
+      <li><form method="post" action="' . e(admin_url('logout')) . '" class="navform">' . csrf_field() . '<button>' . admin_icon('<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>') . '<span>Sign out</span></button></form></li>';
+    return [
+        '<aside class="side"><p class="brand"><a href="' . e(admin_url('orders')) . '">Wren Shop</a></p>
+      <nav class="mainnav" aria-label="Admin"><ul>' . $side . '</ul></nav>
+      <nav class="util" aria-label="Shop and account"><ul>' . $util . '</ul></nav></aside>',
+        $tabs !== '' ? '<nav class="tabs" aria-label="' . e(admin_sections()[$here][0]) . '"><ul>' . $tabs . '</ul></nav>' : '',
+    ];
+}
+
 function admin_shell(string $title, string $body, bool $nav = true): never
 {
     admin_headers();
     header('X-Robots-Tag: noindex, nofollow');
     header('Cache-Control: no-store');
-    $menu = '';
-    if ($nav) {
-        $menu = '<nav>
-          <a href="' . e(admin_url('orders')) . '">Orders' . (($n = orders_todo_count()) ? ' <span class="badge">' . $n . '</span>' : '') . '</a>
-          <a href="' . e(admin_url()) . '">Products</a>' . (accounts_on() || (int)db()->query('SELECT COUNT(*) FROM customers')->fetchColumn() ? '
-          <a href="' . e(admin_url('customers')) . '">Customers</a>' : '') . '
-          <a href="' . e(admin_url('discounts')) . '">Discounts</a>
-          <a href="' . e(admin_url('categories')) . '">Categories</a>
-          <a href="' . e(admin_url('settings')) . '">Settings</a>
-          <span class="grow"></span>
-          <a href="' . e(SHOP_HELP_URL) . '" target="_blank" rel="noopener" class="help" title="Help: the owner\'s guide" aria-label="Help">?</a>
-          <a href="' . e(shop_url()) . '">View shop</a>
-          <form method="post" action="' . e(admin_url('logout')) . '" class="navform">' . csrf_field() . '<button>Sign out</button></form></nav>';
-    }
+    [$side, $tabs] = $nav ? admin_menu_html() : ['', ''];
     $f = flash();
     echo '<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -2150,27 +2607,61 @@ body { margin:0; background:var(--paper); color:var(--ink);
        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size:16px; line-height:1.55; }
 .shell { max-width: 46rem; margin: 0 auto; padding: 1.25rem 1rem 4rem; }
 .brand { font-family: Georgia, serif; font-size: 1.3rem; margin: 0 0 .8rem; }
+.brand a { color:inherit; text-decoration:none; }
+.side .brand a { display:inline; width:auto; padding:0; font:inherit; background:none; }
 .brand::after { content:"."; color: var(--moss); }
-nav { display:flex; flex-wrap:wrap; gap:.4rem .55rem; align-items:center; border-top:1px solid var(--line);
-      border-bottom:1px solid var(--line); padding:.6rem 0; margin-bottom:1.5rem;
-      font-size:.76rem; letter-spacing:.025em; text-transform:uppercase; }
-nav a { color:var(--quiet); text-decoration:none; padding:.2rem 0; white-space:nowrap; }
-nav a:hover { color:var(--moss-d); }
-nav .grow { flex:1; }
-nav a.help { display:inline-flex; align-items:center; justify-content:center; width:1.35rem; height:1.35rem; padding:0;
-             border:1px solid var(--line); border-radius:50%; font-weight:700; letter-spacing:0; }
-nav a.help:hover { border-color:var(--moss); }
-nav .navform { margin:0; display:inline; }
-nav .navform button { margin:0; padding:.2rem 0; background:none; border:0; color:var(--quiet); font:inherit; font-weight:400;
-                      letter-spacing:inherit; text-transform:inherit; cursor:pointer; }
-nav .navform button:hover { background:none; color:var(--moss-d); }
+/* Signed in: the side menu on the left, the page using the rest of the width. */
+.admin { display:grid; grid-template-columns: 13rem minmax(0, 1fr); min-height:100vh; }
+.side { background:var(--straw); border-right:1px solid var(--line); padding:1.2rem .75rem; display:flex; flex-direction:column;
+        position:sticky; top:0; height:100vh; overflow-y:auto; }
+.side .brand { padding:0 .6rem; margin-bottom:1.3rem; }
+.side ul { list-style:none; margin:0; padding:0; }
+.side li { margin:0 0 .15rem; }
+.side a, .side button { display:flex; align-items:center; gap:.65rem; width:100%; padding:.5rem .6rem; border-radius:7px; margin:0;
+        color:var(--ink); text-decoration:none; font:inherit; font-size:.95rem; font-weight:500; background:none; border:0; cursor:pointer; text-align:left; }
+.side svg { flex:none; color:var(--quiet); }
+.side a:hover, .side button:hover { background:#E3DED0; color:var(--ink); }
+.side a[aria-current] { background:var(--moss); color:#fff; }
+.side a[aria-current] svg { color:#fff; }
+.side .badge { margin-left:auto; }
+.side a[aria-current] .badge { background:#fff; color:var(--moss-d); }
+.side .util { margin-top:auto; padding-top:1rem; border-top:1px solid var(--line); }
+.side .util a, .side .util button { font-size:.88rem; color:var(--quiet); padding:.4rem .6rem; }
+.navform { margin:0; }
+.page { padding:1.4rem clamp(1rem, 3vw, 2.5rem) 4rem; min-width:0; }
+.tabs { border-bottom:1px solid var(--line); margin:0 0 1.6rem; overflow-x:auto; scrollbar-width:thin; }
+.tabs ul { display:flex; gap:.2rem; list-style:none; margin:0; padding:0; }
+.tabs a { display:block; padding:.55rem .85rem .6rem; white-space:nowrap; color:var(--quiet); text-decoration:none; font-size:.93rem;
+          border-bottom:3px solid transparent; margin-bottom:-1px; }
+.tabs a:hover { color:var(--ink); border-bottom-color:var(--line); }
+.tabs a[aria-current] { color:var(--ink); font-weight:600; border-bottom-color:var(--moss); }
+/* Forms and writing stay a comfortable width; lists and tables use it all. */
+.page form:not(.search):not(.navform), .page .lede, .page > p, .page > .flash, .page > .err, .page details, .narrow { max-width:46rem; }
+.page table form, .page .plist form { max-width:none; }
+@media (max-width: 52rem) {
+  .admin { display:block; }
+  .side { position:static; height:auto; flex-direction:row; flex-wrap:wrap; align-items:center; padding:.6rem .75rem 0; border-right:0; border-bottom:1px solid var(--line); }
+  .side .brand { margin:0; padding:0 .3rem; flex:1; font-size:1.15rem; }
+  .side .util { order:2; margin:0; padding:0; border:0; }
+  .side .util ul { display:flex; }
+  .side .util span { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+  .side .util a, .side .util button { padding:.5rem; }
+  .side .mainnav { order:3; flex-basis:100%; margin-top:.4rem; }
+  .side .mainnav ul { display:grid; grid-template-columns:repeat(5, 1fr); }
+  .side .mainnav li { margin:0; }
+  .side .mainnav a { flex-direction:column; gap:.15rem; font-size:.72rem; padding:.45rem .1rem .5rem; border-radius:7px 7px 0 0; position:relative; text-align:center; }
+  .side .mainnav .badge { position:absolute; top:.15rem; right:calc(50% - 1.6rem); margin:0; }
+  .tabs { margin-left:-1rem; margin-right:-1rem; padding:0 .5rem;
+          -webkit-mask-image:linear-gradient(90deg, transparent 0, #000 1.2rem, #000 calc(100% - 1.6rem), transparent);
+                  mask-image:linear-gradient(90deg, transparent 0, #000 1.2rem, #000 calc(100% - 1.6rem), transparent); }
+}
 h1 { font-family: Georgia, serif; font-weight:400; font-size:1.6rem; margin:0 0 .4rem; }
 h2 { font-family: Georgia, serif; font-weight:400; font-size:1.2rem; margin:2rem 0 .4rem; }
 .lede { color: var(--quiet); margin-top:0; }
 a { color: var(--moss-d); }
 form label { display:block; margin:1rem 0 0; font-weight:600; font-size:.9rem; }
 form .hint { font-weight:400; color:var(--quiet); }
-input[type=text], input[type=password], input[type=number], input[type=email], input[type=tel], input[type=url], input[type=date], input:not([type]), textarea, select {
+input[type=text], input[type=password], input[type=number], input[type=email], input[type=tel], input[type=url], input[type=search], input[type=date], input:not([type]), textarea, select {
   width:100%; margin-top:.25rem; padding:.65rem .7rem; font:inherit; font-size:16px;
   border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); }
 textarea { min-height: 9rem; }
@@ -2194,6 +2685,12 @@ button.small { padding:.3rem .65rem; font-size:.85rem; margin-top:0; }
 .plist button, .actions-row button, .topline .btn, td button, .search button { margin-top:0; }
 .search { display:flex; gap:.5rem; align-items:stretch; margin:0 0 1rem; }
 .search input, .search select { margin-top:0; flex:1; min-width:0; }
+.search { flex-wrap:wrap; } .search input[type=search] { flex:2 1 12rem; } .search select { flex:1 1 9rem; }
+.pager ul { display:flex; flex-wrap:wrap; gap:.3rem; list-style:none; padding:0; margin:1.2rem 0; }
+.pager a, .pager span { display:inline-block; min-width:2.2rem; padding:.35rem .55rem; text-align:center; border:1px solid var(--line);
+  border-radius:6px; text-decoration:none; background:#fff; }
+.pager span[aria-current] { background:var(--moss); border-color:var(--moss); color:#fff; font-weight:700; }
+.pager .gap { border:0; background:none; padding:.35rem .1rem; }
 .price { display:flex; align-items:center; gap:.4rem; }
 .price span { font-size:1.2rem; padding-top:.25rem; }
 .flash { background:var(--straw); border-left:3px solid var(--moss); padding:.6rem .9rem; }
@@ -2209,6 +2706,7 @@ button.small { padding:.3rem .65rem; font-size:.85rem; margin-top:0; }
 .plist .pname { flex:1 1 12rem; min-width:0; }
 .plist .pname a { font-weight:600; text-decoration:none; }
 .plist .pname small { display:block; color:var(--quiet); }
+.sku { font-family:ui-monospace,Menlo,monospace; font-size:.92em; }
 .plist form { display:flex; gap:.35rem; align-items:center; margin:0; }
 .plist input[type=number] { width:4.6rem; margin:0; padding:.35rem .45rem; }
 .pill { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.04em; padding:.05rem .45rem;
@@ -2230,7 +2728,34 @@ details { margin-top:1.2rem; } summary { cursor:pointer; color:var(--moss-d); fo
 .actions-row { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin-top:2rem; padding-top:1rem; border-top:1px solid var(--line); }
 .actions-row form { margin:0; }
 .optrows { margin-top:.6rem; }
-.optrow { display:grid; grid-template-columns:2fr 1fr 1fr; gap:.4rem; margin-top:.4rem; }
+.optrow { display:grid; grid-template-columns:2fr 1fr 1fr 1fr 1.3fr; gap:.4rem; margin-top:.4rem; }
+@media (max-width: 40rem) { .optrows { overflow-x:auto; } .optrow { min-width:34rem; } }
+.saledates { display:flex; gap:.6rem; flex-wrap:wrap; } .saledates label { flex:1 1 10rem; }
+table.cats th { text-align:left; font-size:.78rem; font-weight:600; color:var(--quiet); text-transform:uppercase; letter-spacing:.04em; padding:.3rem; border-bottom:1px solid var(--line); }
+table.cats td.mv form { gap:.25rem; } table.cats .nomove { display:inline-block; width:2.05rem; }
+table.cats td.cname input { min-width:12rem; }
+table.cats tr.d2 td.cname { padding-left:2rem; } table.cats tr.d3 td.cname { padding-left:4rem; }
+table.cats tr.d1 td { border-top:2px solid var(--line); }
+table.cats select { margin:0; padding:.4rem .5rem; min-width:10rem; }
+.addcat { display:flex; flex-wrap:wrap; gap:.4rem 1rem; align-items:flex-end; } .addcat label { flex:1 1 14rem; margin:0; } .addcat button { margin:0; }
+table.cols td, table.errs td, table.changes td { vertical-align:top; } table.cols th, table.changes th { text-align:left; font-size:.85rem; }
+table.cols td:first-child { white-space:nowrap; width:1%; }
+table.errs { margin-top:.6rem; } table.errs td:first-child { white-space:nowrap; font-weight:600; width:1%; }
+table.changes td.was { color:var(--quiet); text-decoration:line-through; text-decoration-color:rgba(0,0,0,.25); }
+.report .flash, .report .err { max-width:none; }
+.vh { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+.page .table-wrap { overflow-x:auto; }
+/* The product form: details on the left, a side panel (save, show, category, stock) that stays in view. */
+.page form#pform { max-width:74rem; } .pgrid details { max-width:none; }
+.pgrid { display:grid; grid-template-columns:minmax(0, 1fr) 19rem; gap:0 2.5rem; align-items:start; }
+.pside { position:sticky; top:1rem; padding-top:.2rem; }
+.pside .pbox { background:var(--straw); border:1px solid var(--line); border-radius:8px; padding:.2rem 1rem 1rem; }
+.pside .pbox button { width:100%; }
+.pside select, .pside input { font-size:15px; }
+@media (max-width: 70rem) { .pgrid { grid-template-columns:minmax(0, 1fr); } .pside { position:static; margin-top:1.5rem; }
+  .pside { display:flex; flex-direction:column; } .pside .pbox { order:9; margin-top:1.5rem; } }
+.catpicks { max-height:18rem; overflow-y:auto; border:1px solid var(--line); border-radius:6px; padding:.2rem .7rem .6rem; background:var(--paper); }
+.catpicks .check { margin-top:.45rem; font-weight:500; }
 .optrow input { margin:0 !important; }
 .opthead span { font-size:.8rem; font-weight:600; }
 details.opts { border:1px solid var(--line); border-radius:8px; padding:.6rem .9rem .8rem; background:#fff; }
@@ -2245,9 +2770,11 @@ details.more { margin-top:.2rem; } details.more form { margin-top:.5rem; }
               background:var(--straw); border:1px solid var(--line); border-radius:5px; padding:.35rem .7rem; }
 table { width:100%; border-collapse:collapse; } td { padding:.5rem .3rem; border-bottom:1px solid var(--line); vertical-align:middle; }
 td form { display:flex; gap:.4rem; margin:0; } td input { margin:0 !important; }
-</style></head><body><div class="shell">
-<p class="brand">Wren Shop</p>' . $menu . ($nav && data_exposed() === true ? data_warning_html() : '') . ($nav && shop_demo() ? '<p class="muted demo-on">Demo mode is on: visitors can\'t check out. <a href="' . e(admin_url('settings#demo')) . '">Change in Settings</a></p>' : '')
-    . ($f ? '<p class="flash">' . e($f) . '</p>' : '') . $body . '</div></body></html>';
+</style></head><body>' . ($nav ? '<div class="admin">' . $side . '<main class="page">' . $tabs : '<div class="shell"><p class="brand">Wren Shop</p>')
+    . ($nav && data_exposed() === true ? data_warning_html() : '') . ($nav && shop_demo() ? '<p class="muted demo-on">Demo mode is on: visitors can\'t check out. <a href="' . e(settings_url('general', 'demo')) . '">Change in Settings</a></p>' : '')
+    . ($f ? '<p class="flash">' . e($f) . '</p>' : '') . $body . ($nav ? '</main>' : '') . '</div>'
+    . ($tabs !== '' ? '<script>(function(){var t=document.querySelector(".tabs [aria-current]");if(t){var n=t.closest(".tabs");n.scrollLeft=t.offsetLeft-(n.clientWidth-t.offsetWidth)/2;}})();</script>' : '')
+    . '</body></html>';
     exit;
 }
 
@@ -2577,13 +3104,82 @@ function stock_low(array $p, array $vars): bool
     return false;
 }
 
+const ADMIN_PER_PAGE = 50;
+const ADMIN_SHOWS = ['' => 'All products', 'visible' => 'In the shop', 'hidden' => 'Hidden', 'low' => 'Low or sold out', 'out' => 'Sold out',
+                     'backorder' => 'On backorder', 'sale' => 'On sale'];
+
+/* The product list's search and filters, from a query string or from the
+   'back' value a quick form sends. Only these keys are ever passed around. */
+function admin_list_params(?array $from = null): array
+{
+    $from ??= $_GET;
+    $find = trim(mb_substr(str_in($from['find'] ?? ''), 0, 100));
+    $cat = str_in($from['cat'] ?? '');
+    $show = str_in($from['show'] ?? '');
+    $page = str_in($from['page'] ?? '');
+    return ['find' => $find,
+            'cat' => ctype_digit($cat) || $cat === 'none' ? $cat : '',
+            'show' => isset(ADMIN_SHOWS[$show]) ? $show : '',
+            'page' => ctype_digit($page) && (int)$page > 1 ? (int)$page : 1];
+}
+
+/* Hidden ?q= for a GET form on a shop without pretty URLs. */
+function get_form_route(): string
+{
+    $q = str_in($_GET['q'] ?? '');
+    return $q !== '' ? '<input type="hidden" name="q" value="' . e($q) . '">' : '';
+}
+
 function view_admin_products(): never
 {
     require_admin();
-    $rows = db()->query('SELECT p.*, c.name AS cat FROM products p LEFT JOIN categories c ON c.id = p.category_id
-                         ORDER BY p.created DESC, p.id DESC')->fetchAll();
+    $f = admin_list_params();
+    $where = ['1'];
+    $args = [];
+    if ($f['find'] !== '') {
+        $like = '%' . strtr($f['find'], ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']) . '%';
+        // Name, address, or part number (the product's or one of its choices').
+        $where[] = "(p.name LIKE ? ESCAPE '\\' OR p.slug LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\'
+                     OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.sku LIKE ? ESCAPE '\\'))";
+        array_push($args, $like, $like, $like, $like);
+    }
+    if ($f['cat'] === 'none') {
+        $where[] = 'p.category_id NOT IN (SELECT id FROM categories)';
+    } elseif ($f['cat'] !== '') {   // the category and those inside it
+        $where[] = cat_in_sql(cat_descendants((int)$f['cat']));
+    }
+    $level = (int)setting('low_stock_level', '3');
+    $hasV = 'EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id)';
+    $where[] = match ($f['show']) {
+        'visible' => 'p.visible = 1',
+        'hidden'  => 'p.visible = 0',
+        'low'     => "p.backorders = 'no' AND ((NOT $hasV AND p.stock IS NOT NULL AND p.stock <= $level)
+                       OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.stock IS NOT NULL AND v.stock <= $level))",
+        'out'     => "p.backorders = 'no' AND ((NOT $hasV AND p.stock IS NOT NULL AND p.stock <= 0)
+                       OR ($hasV AND NOT EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.stock IS NULL OR v.stock > 0))))",
+        // Stock below zero: orders waiting for more to arrive.
+        'backorder' => "((NOT $hasV AND p.stock < 0) OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.stock < 0))",
+        'sale'    => (function () {
+            $today = db()->quote(uk_today());
+            return "(p.sale_from <= $today AND (p.sale_to = '' OR p.sale_to >= $today)) AND ((p.sale_pence IS NOT NULL AND p.sale_pence < p.price_pence)
+                    OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.sale_pence IS NOT NULL AND v.sale_pence < v.price_pence))";
+        })(),
+        default   => '1',
+    };
+    $sqlWhere = implode(' AND ', $where);
+    $st = db()->prepare("SELECT COUNT(*) FROM products p WHERE $sqlWhere");
+    $st->execute($args);
+    $total = (int)$st->fetchColumn();
+    $all = (int)db()->query('SELECT COUNT(*) FROM products')->fetchColumn();
+    $pages = max(1, (int)ceil($total / ADMIN_PER_PAGE));
+    $page = min($f['page'], $pages);
+    $st = db()->prepare("SELECT p.*, c.name AS cat FROM products p LEFT JOIN categories c ON c.id = p.category_id
+                         WHERE $sqlWhere ORDER BY p.created DESC, p.id DESC LIMIT " . ADMIN_PER_PAGE . ' OFFSET ' . (($page - 1) * ADMIN_PER_PAGE));
+    $st->execute($args);
+    $rows = $st->fetchAll();
     $photos = first_photos(array_column($rows, 'id'));
     $vars = variants_for(array_column($rows, 'id'));
+    $back = '<input type="hidden" name="back" value="' . e(http_build_query(array_merge($f, ['page' => $page]))) . '">';
     $list = '';
     foreach ($rows as $p) {
         $ph = $photos[(int)$p['id']] ?? null;
@@ -2591,20 +3187,24 @@ function view_admin_products(): never
         $edit = e(admin_url('edit/' . $p['id']));
         $stockForm = $pv
             ? '<span class="muted">' . count($pv) . ' ' . e(mb_strtolower($p['option_name'] ?: 'option')) . ' choices · <a href="' . $edit . '">stock per choice</a></span>'
-            : '<form method="post" action="' . e(admin_url('quick')) . '">' . csrf_field()
+            : '<form method="post" action="' . e(admin_url('quick')) . '">' . csrf_field() . $back
               . '<input type="hidden" name="id" value="' . (int)$p['id'] . '">'
               . '<label class="muted" style="margin:0">Stock <input type="number" name="stock" min="0" inputmode="numeric" placeholder="—" value="'
               . ($p['stock'] === null ? '' : (int)$p['stock']) . '" aria-label="Stock for ' . e($p['name']) . '"></label>'
               . '<button class="quiet small" name="do" value="stock">Update</button></form>';
         $list .= '<li>'
-            . ($ph ? '<img src="' . e(media_url($ph['thumb'])) . '" alt="">' : '<span class="noimg"></span>')
+            . ($ph ? '<img src="' . e(media_url($ph['thumb'])) . '" alt="" loading="lazy">' : '<span class="noimg"></span>')
             . '<div class="pname"><a href="' . $edit . '">' . e($p['name']) . '</a>'
             . (!$p['visible'] ? '<span class="pill">Hidden</span>' : '')
             . (is_digital($p) ? '<span class="pill">' . ((int)$p['licensed'] ? 'Theme' : 'Download') . '</span>' : '')
-            . (sold_out($p, $pv) ? '<span class="pill out">Sold out</span>' : (stock_low($p, $pv) ? '<span class="pill wait">Low stock</span>' : ''))
-            . '<small>' . price_label($p, $pv) . ($p['cat'] ? ' · ' . e($p['cat']) : '') . '</small></div>'
+            . (sold_out($p, $pv) ? '<span class="pill out">Sold out</span>'
+                : (backorders_on($p) ? (array_filter($pv ?: [$p], fn($x) => $x['stock'] !== null && (int)$x['stock'] < 0) ? '<span class="pill wait">On backorder</span>' : '')
+                : (stock_low($p, $pv) ? '<span class="pill wait">Low stock</span>' : '')))
+            . (product_on_sale($p, $pv) ? '<span class="pill ok">Sale</span>' : '')
+            . '<small>' . price_label($p, $pv) . ($p['sku'] !== '' ? ' · <span class="sku">' . e($p['sku']) . '</span>' : '')
+            . ($p['cat'] ? ' · ' . e(cat_path_name((int)$p['category_id'])) : '') . '</small></div>'
             . $stockForm
-            . '<form method="post" action="' . e(admin_url('quick')) . '">' . csrf_field()
+            . '<form method="post" action="' . e(admin_url('quick')) . '">' . csrf_field() . $back
             . '<input type="hidden" name="id" value="' . (int)$p['id'] . '">'
             . '<button class="quiet small" name="do" value="' . ($p['visible'] ? 'hide' : 'show') . '">'
             . ($p['visible'] ? 'Hide' : 'Show') . '</button></form>'
@@ -2612,11 +3212,34 @@ function view_admin_products(): never
     }
     $setup = can_deliver() && setting('postage_price') === ''
         ? '<p class="flash">Postage isn\'t set up yet, so the basket says "added at checkout". <a href="'
-          . e(admin_url('settings')) . '#postage">Set postage in Settings</a>.</p>' : '';
+          . e(settings_url('delivery')) . '">Set postage in Settings</a>.</p>' : '';
+    $filtering = $f['find'] !== '' || $f['cat'] !== '' || $f['show'] !== '';
+    $tools = '';
+    if ($all > 10 || $filtering) {   // a handful of products needs no search
+        $cats = '<option value="">Any category</option>' . cat_options_html(ctype_digit($f['cat']) ? (int)$f['cat'] : -1, '');
+        $cats .= '<option value="none"' . ($f['cat'] === 'none' ? ' selected' : '') . '>No category</option>';
+        $shows = '';
+        foreach (ADMIN_SHOWS as $k => $label) {
+            $shows .= '<option value="' . $k . '"' . ($f['show'] === $k ? ' selected' : '') . '>' . e($label) . '</option>';
+        }
+        $tools = '<form method="get" class="search">' . get_form_route()
+            . '<input type="search" name="find" value="' . e($f['find']) . '" placeholder="Search by name or SKU" aria-label="Search products">'
+            . '<select name="cat" aria-label="Category">' . $cats . '</select>'
+            . '<select name="show" aria-label="Show">' . $shows . '</select>'
+            . '<button class="quiet">Search</button></form>'
+            . '<p class="muted">' . ($filtering
+                ? number_format($total) . ' of ' . number_format($all) . ' products match. <a href="' . e(admin_url()) . '">Show all</a>'
+                : number_format($all) . ' products')
+            . ($pages > 1 ? ' · page ' . $page . ' of ' . $pages : '') . '</p>';
+    }
+    $link = fn($n) => url_with(admin_url(), ['find' => $f['find'], 'cat' => $f['cat'], 'show' => $f['show'], 'page' => $n]);
+    $body = $list
+        ? '<p class="muted">Leave stock empty if you don\'t want it counted.</p><ul class="plist">' . $list . '</ul>'
+          . pager_html($page, $pages, $link, 'pager')
+        : ($filtering ? '<p class="lede">No products match.</p>'
+                      : '<p class="lede">No products yet. Add your first one: all it needs is a name, a price and a photo.</p>');
     admin_shell('Products', ready_reminder(current_admin()) . $setup . '<div class="topline"><h1>Products</h1><a class="btn" style="margin:0" href="'
-        . e(admin_url('new')) . '">+ Add product</a></div>'
-        . ($list ? '<p class="muted">Leave stock empty if you don\'t want it counted.</p><ul class="plist">' . $list . '</ul>'
-                 : '<p class="lede">No products yet. Add your first one: all it needs is a name, a price and a photo.</p>'));
+        . e(admin_url('new')) . '">+ Add product</a></div>' . $tools . $body);
 }
 
 function admin_quick(): never
@@ -2630,7 +3253,7 @@ function admin_quick(): never
             flash($p['name'] . ' has options, so its stock is set for each choice on its page.');
         } elseif ($do === 'stock') {
             $raw = post('stock');
-            if ($raw === '' || ctype_digit($raw)) {
+            if ($raw === '' || ctype_digit($raw) || (backorders_on($p) && preg_match('/^-\d+$/', $raw))) {
                 db()->prepare('UPDATE products SET stock = ?, updated = ? WHERE id = ?')
                     ->execute([$raw === '' ? null : (int)$raw, now(), $p['id']]);
                 flash($p['name'] . ': stock ' . ($raw === '' ? 'not counted' : 'set to ' . (int)$raw) . '.');
@@ -2643,7 +3266,9 @@ function admin_quick(): never
             flash($p['name'] . ($do === 'show' ? ' is in the shop.' : ' is hidden from the shop.'));
         }
     }
-    redirect(admin_url());
+    parse_str(post('back'), $back);
+    $f = admin_list_params($back);
+    redirect(url_with(admin_url(), $f));
 }
 
 function view_product_form(?array $p, array $v = [], array $errors = []): never
@@ -2653,8 +3278,11 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
     $v += $p ? [
         'name' => $p['name'], 'price' => price_input((int)$p['price_pence']), 'description' => $p['description'],
         'category_id' => (string)$p['category_id'], 'stock' => $p['stock'] === null ? '' : (string)$p['stock'],
-        'visible' => (bool)$p['visible'], 'slug' => $p['slug'],
-    ] : ['name' => '', 'price' => '', 'description' => '', 'category_id' => '0', 'stock' => '', 'visible' => true, 'slug' => ''];
+        'visible' => (bool)$p['visible'], 'slug' => $p['slug'], 'sku' => $p['sku'],
+        'extra_cats' => product_extra_cats((int)$p['id']), 'backorders' => $p['backorders'],
+        'sale' => $p['sale_pence'] === null ? '' : price_input((int)$p['sale_pence']), 'sale_from' => $p['sale_from'], 'sale_to' => $p['sale_to'],
+    ] : ['name' => '', 'price' => '', 'description' => '', 'category_id' => '0', 'stock' => '', 'visible' => true, 'slug' => '',
+         'sku' => '', 'extra_cats' => [], 'backorders' => 'no', 'sale' => '', 'sale_from' => '', 'sale_to' => ''];
     $v += ['new_category' => ''];
     if (!isset($v['opts'])) {   // from the database, unless a failed save is being shown again
         $v['opt_name'] = $p['option_name'] ?? '';
@@ -2662,17 +3290,20 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         foreach ($p ? product_variants((int)$p['id']) : [] as $x) {
             $v['opts'][] = ['id' => (string)$x['id'], 'name' => $x['name'],
                             'price' => $x['price_pence'] === null ? '' : price_input((int)$x['price_pence']),
-                            'stock' => $x['stock'] === null ? '' : (string)$x['stock']];
+                            'stock' => $x['stock'] === null ? '' : (string)$x['stock'], 'sku' => $x['sku'],
+                            'sale' => $x['sale_pence'] === null ? '' : price_input((int)$x['sale_pence'])];
         }
     }
     $hasOpts = (bool)array_filter($v['opts'], fn($r) => $r['name'] !== '');
     $optRows = '';
-    foreach (array_merge($v['opts'], array_fill(0, 3, ['id' => '', 'name' => '', 'price' => '', 'stock' => ''])) as $n => $r) {
+    foreach (array_merge($v['opts'], array_fill(0, 3, ['id' => '', 'name' => '', 'price' => '', 'stock' => '', 'sku' => '', 'sale' => ''])) as $n => $r) {
         $k = $n + 1;
         $optRows .= '<div class="optrow"><input type="hidden" name="opt_id[]" value="' . e($r['id']) . '">'
             . '<input name="opt_val[]" value="' . e($r['name']) . '" maxlength="60" placeholder="' . ($n === 0 ? 'e.g. Small' : '') . '" aria-label="Choice ' . $k . '">'
             . '<input name="opt_price[]" value="' . e($r['price']) . '" inputmode="decimal" placeholder="same" aria-label="Price for choice ' . $k . '">'
-            . '<input type="number" name="opt_stock[]" value="' . e($r['stock']) . '" min="0" inputmode="numeric" placeholder="—" aria-label="Stock for choice ' . $k . '"></div>';
+            . '<input name="opt_sale[]" value="' . e($r['sale'] ?? '') . '" inputmode="decimal" placeholder="—" aria-label="Sale price for choice ' . $k . '">'
+            . '<input type="number" name="opt_stock[]" value="' . e($r['stock']) . '" min="0" inputmode="numeric" placeholder="—" aria-label="Stock for choice ' . $k . '">'
+            . '<input name="opt_sku[]" value="' . e($r['sku'] ?? '') . '" maxlength="40" autocapitalize="characters" placeholder="—" aria-label="SKU for choice ' . $k . '"></div>';
     }
     $optionsHtml = '<details class="opts" id="opts"' . ($hasOpts || $v['opt_name'] !== '' ? ' open' : '') . '>'
         . '<summary>Options <span class="hint">(optional, e.g. sizes or colours)</span></summary>'
@@ -2680,7 +3311,8 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         . 'and its own stock. To remove a choice, clear its name.</p>'
         . '<label>Option name <input name="opt_name" value="' . e($v['opt_name']) . '" maxlength="40" placeholder="e.g. Size"></label>'
         . '<div class="optrows"><div class="optrow opthead"><span>Choice</span><span>Price <span class="hint">(blank: same)</span></span>'
-        . '<span>Stock <span class="hint">(blank: not counted)</span></span></div>' . $optRows . '</div>'
+        . '<span>Sale price <span class="hint">(if it has its own price)</span></span>'
+        . '<span>Stock <span class="hint">(blank: not counted)</span></span><span>SKU <span class="hint">(optional)</span></span></div>' . $optRows . '</div>'
         . '<p class="muted">Need more rows? Save, and three more empty ones appear.</p></details>';
 
     $photos = $p ? product_photos((int)$p['id']) : [];
@@ -2696,10 +3328,12 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
              . '<button class="rm" name="op" value="remove:' . (int)$x['id'] . '"'
              . ' onclick="return confirm(\'Remove this photo?\')">Remove</button></div></div>';
     }
-    $cats = '<option value="0">None</option>';
-    foreach (categories() as $c) {
-        $cats .= '<option value="' . (int)$c['id'] . '"' . ((string)$c['id'] === (string)$v['category_id'] ? ' selected' : '')
-               . '>' . e($c['name']) . '</option>';
+    $cats = cat_options_html((int)$v['category_id']);
+    $extra = array_flip(array_map('intval', $v['extra_cats']));
+    $also = '';
+    foreach (cat_tree() as $c) {
+        $also .= '<label class="check catpick" style="padding-left:' . (($c['depth'] - 1) * 1.4) . 'rem"><input type="checkbox" name="extra_cats[]" value="' . $c['id'] . '"'
+               . (isset($extra[$c['id']]) ? ' checked' : '') . '> ' . e($c['name']) . '</label>';
     }
     $action = e(admin_url('save'));
     $title = $isNew ? 'Add product' : 'Edit ' . $p['name'];
@@ -2711,9 +3345,17 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         . errors_html($errors)
         . '<form method="post" action="' . $action . '" enctype="multipart/form-data" id="pform">' . csrf_field()
         . '<input type="hidden" name="id" value="' . ($p ? (int)$p['id'] : 0) . '">'
+        . '<div class="pgrid"><div class="pmain">'
         . '<label>Name <input name="name" value="' . e($v['name']) . '" required maxlength="120"></label>'
         . '<label>Price <div class="price"><span>£</span><input name="price" value="' . e($v['price']) . '" inputmode="decimal"'
         . ' placeholder="12.50" required pattern="£?[0-9,]+(\.[0-9]{1,2})?" title="A price like 12 or 12.50"></div></label>'
+        . '<details class="opts" id="sale"' . ($v['sale'] !== '' ? ' open' : '') . '><summary>Sale price <span class="hint">(optional'
+        . ($p && $v['sale'] !== '' ? (sale_on($p) ? ': on sale now' : ': not on sale today') : '') . ')</span></summary>'
+        . '<p class="muted">Customers see the sale price with the full price crossed out. Leave the dates empty to start now and run until you clear the price. '
+        . 'A sale doesn\'t add up with group prices or discount codes: the customer gets whichever is cheapest.</p>'
+        . '<label>Sale price <div class="price" style="max-width:14rem"><span>£</span><input name="sale" value="' . e($v['sale']) . '" inputmode="decimal" placeholder="9.99"></div></label>'
+        . '<div class="saledates"><label>From <span class="hint">(first day)</span><input type="date" name="sale_from" value="' . e($v['sale_from']) . '"></label>'
+        . '<label>Until <span class="hint">(last day)</span><input type="date" name="sale_to" value="' . e($v['sale_to']) . '"></label></div></details>'
         . '<label>Photos ' . ($isNew ? '' : '<span class="hint">(the first one is the main photo)</span>') . '</label>'
         . ($ph ? '<div class="photos">' . $ph . '</div>' : '')
         . '<div class="drop"><input type="file" name="photos[]" id="photos" accept="image/*" multiple'
@@ -2722,18 +3364,30 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
                                                                : 'Add more photos.') . '</p></div>'
         . '<label>Description <span class="hint">(optional)</span><textarea name="description" maxlength="5000">' . e($v['description']) . '</textarea></label>'
         . '<p class="muted" style="margin:.3rem 0 0">Leave a blank line between paragraphs. **bold**, *italic*, and lines starting "- " make a list.</p>'
-        . '<label>Category <span class="hint">(optional)</span><select name="category_id">' . $cats . '</select></label>'
-        . '<label><span class="hint">or a new category:</span><input name="new_category" value="' . e($v['new_category']) . '" maxlength="60" placeholder="e.g. Mugs"></label>'
-        . '<label id="stockrow"' . ($hasOpts ? ' hidden' : '') . '>Stock <span class="hint">(optional: leave empty if you don\'t want it counted)</span>'
-        . '<input type="number" name="stock" min="0" inputmode="numeric" value="' . e($v['stock']) . '"></label>'
-        . '<p class="muted" id="stocknote"' . ($hasOpts ? '' : ' hidden') . '>Stock is counted for each choice in Options below.</p>'
         . $optionsHtml
         . digital_fields_html($p, $v)
+        . '</div><aside class="pside"><div class="pbox">'
         . '<label class="check"><input type="checkbox" name="visible" value="1"' . ($v['visible'] ? ' checked' : '') . '> Show in the shop</label>'
+        . '<button id="savebtn">' . ($isNew ? 'Add product' : 'Save changes') . '</button>'
+        . '</div>'
+        . '<label>Category <span class="hint">(optional; its menu and breadcrumb)</span><select name="category_id">' . $cats . '</select></label>'
+        . '<label><span class="hint">or a new category:</span><input name="new_category" value="' . e($v['new_category']) . '" maxlength="60" placeholder="e.g. Mugs"></label>'
+        . ($also !== '' ? '<details class="opts" id="alsoin"' . ($extra ? ' open' : '') . '><summary>Also show in <span class="hint">(optional: other categories'
+            . ($extra ? ', ' . count($extra) . ' chosen' : '') . ')</span></summary>'
+            . '<p class="muted">For a part that fits several cars, say. It shows in each category you tick as well as its main one.</p>'
+            . '<div class="catpicks">' . $also . '</div></details>' : '')
+        . '<label>SKU <span class="hint">(optional: your part number or code, shown on orders and packing slips)</span>'
+        . '<input name="sku" value="' . e($v['sku']) . '" maxlength="40" autocapitalize="characters"></label>'
+        . '<label id="stockrow"' . ($hasOpts ? ' hidden' : '') . '>Stock <span class="hint">(optional: leave empty if you don\'t want it counted)</span>'
+        . '<input type="number" name="stock" inputmode="numeric" value="' . e($v['stock']) . '"></label>'
+        . '<p class="muted" id="stocknote"' . ($hasOpts ? '' : ' hidden') . '>Stock is counted for each choice in Options.</p>'
+        . '<label>When counted stock runs out <select name="backorders">'
+        . implode('', array_map(fn($k, $l) => '<option value="' . $k . '"' . ($v['backorders'] === $k ? ' selected' : '') . '>' . e($l) . '</option>', array_keys(BACKORDER_CHOICES), BACKORDER_CHOICES))
+        . '</select></label><p class="muted" style="margin:.3rem 0 0">Keep selling for things you can get more of: stock goes below zero and orders show how many were on backorder.</p>'
         . (!$isNew ? '<details' . ($errors && $v['slug'] !== $p['slug'] ? ' open' : '') . '><summary>More</summary>'
             . '<label>Web address <span class="hint">(' . e(abs_shop_url('p/')) . '…) Changing it breaks old links.</span>'
             . '<input name="slug" value="' . e($v['slug']) . '" maxlength="80" autocapitalize="none"></label></details>' : '')
-        . '<button id="savebtn">' . ($isNew ? 'Add product' : 'Save changes') . '</button>'
+        . '</aside></div>'
         . '</form>';
     if (!$isNew) {
         $body .= '<div class="actions-row">'
@@ -2814,8 +3468,17 @@ function admin_save(): never
         'name' => post('name'), 'price' => post('price'), 'description' => post('description'),
         'category_id' => post('category_id'), 'new_category' => post('new_category'),
         'stock' => post('stock'), 'visible' => !empty($_POST['visible']), 'slug' => post('slug'),
+        'sku' => sku_clean(post('sku')),
+        'backorders' => isset(BACKORDER_CHOICES[post('backorders')]) ? post('backorders') : 'no',
+        'sale' => post('sale'), 'sale_from' => post('sale_from'), 'sale_to' => post('sale_to'),
+        'extra_cats' => array_map('intval', array_filter(is_array($_POST['extra_cats'] ?? null) ? $_POST['extra_cats'] : [], 'is_string')),
     ];
     $errors = [];
+    if (!sku_valid($v['sku'])) {
+        $errors[] = 'A SKU can have letters, numbers, spaces and . _ / - in it.';
+    } elseif (($who = sku_taken($v['sku'], (int)($p['id'] ?? 0))) !== null) {
+        $errors[] = 'The SKU ' . $v['sku'] . ' is already used by ' . $who . '.';
+    }
     if ($v['name'] === '') {
         $errors[] = 'Give the product a name.';
     }
@@ -2823,26 +3486,65 @@ function admin_save(): never
     if ($pence === null) {
         $errors[] = 'Type the price as a number, like 12 or 12.50.';
     }
-    if ($v['stock'] !== '' && !ctype_digit($v['stock'])) {
+    if ($v['stock'] !== '' && !preg_match('/^-?\d+$/', $v['stock'])) {
         $errors[] = 'Stock must be a whole number, or left empty.';
+    } elseif ((int)$v['stock'] < 0 && $v['backorders'] === 'no') {
+        $errors[] = 'Stock can only go below zero for a product that keeps selling when it runs out.';
+    }
+    $salePence = $v['sale'] === '' ? null : parse_price($v['sale']);
+    if ($v['sale'] !== '' && $salePence === null) {
+        $errors[] = 'Type the sale price as a number, like 9.99.';
+    } elseif ($salePence !== null && $pence !== null && $salePence >= $pence) {
+        $errors[] = 'The sale price should be less than the price (' . money($pence) . ').';
+    }
+    [$sf, $stTo] = [sale_date($v['sale_from']), sale_date($v['sale_to'])];
+    if ($sf === null || $stTo === null) {
+        $errors[] = 'Sale dates are days, like 2026-12-01.';
+    } elseif ($sf !== '' && $stTo !== '' && $stTo < $sf) {
+        $errors[] = 'The sale ends before it starts. Check the dates.';
     }
     // Options: rows of choice / price / stock. Empty names are dropped.
     $v['opt_name'] = post('opt_name');
     $v['opts'] = [];
     $col = fn($k) => is_array($_POST[$k] ?? null) ? array_values($_POST[$k]) : [];
-    [$oid, $oval, $oprice, $ostock] = [$col('opt_id'), $col('opt_val'), $col('opt_price'), $col('opt_stock')];
+    [$oid, $oval, $oprice, $ostock, $osku, $osale] = [$col('opt_id'), $col('opt_val'), $col('opt_price'), $col('opt_stock'), $col('opt_sku'), $col('opt_sale')];
     $seen = [];
+    $skus = $v['sku'] !== '' ? [mb_strtolower($v['sku']) => true] : [];
     foreach ($oval as $i => $name) {
         $r = ['id' => is_string($oid[$i] ?? null) ? $oid[$i] : '', 'name' => is_string($name) ? trim($name) : '',
-              'price' => is_string($oprice[$i] ?? null) ? trim($oprice[$i]) : '', 'stock' => is_string($ostock[$i] ?? null) ? trim($ostock[$i]) : ''];
+              'price' => is_string($oprice[$i] ?? null) ? trim($oprice[$i]) : '', 'stock' => is_string($ostock[$i] ?? null) ? trim($ostock[$i]) : '',
+              'sku' => is_string($osku[$i] ?? null) ? sku_clean($osku[$i]) : '', 'sale' => is_string($osale[$i] ?? null) ? trim($osale[$i]) : ''];
         if ($r['name'] === '') {
             continue;
+        }
+        if (!sku_valid($r['sku'])) {
+            $errors[] = 'The SKU for ' . $r['name'] . ' can have letters, numbers, spaces and . _ / - in it.';
+        } elseif ($r['sku'] !== '' && isset($skus[mb_strtolower($r['sku'])])) {
+            $errors[] = 'The SKU ' . $r['sku'] . ' is used twice on this product.';
+        } elseif (($who = sku_taken($r['sku'], (int)($p['id'] ?? 0))) !== null) {
+            $errors[] = 'The SKU ' . $r['sku'] . ' (for ' . $r['name'] . ') is already used by ' . $who . '.';
+        }
+        if ($r['sku'] !== '') {
+            $skus[mb_strtolower($r['sku'])] = true;
         }
         if ($r['price'] !== '' && parse_price($r['price']) === null) {
             $errors[] = 'The price for ' . $r['name'] . ' isn\'t a price. Leave it blank to use the product\'s price.';
         }
-        if ($r['stock'] !== '' && !ctype_digit($r['stock'])) {
+        if ($r['stock'] !== '' && !preg_match('/^-?\d+$/', $r['stock'])) {
             $errors[] = 'Stock for ' . $r['name'] . ' must be a whole number, or left empty.';
+        } elseif ((int)$r['stock'] < 0 && $v['backorders'] === 'no') {
+            $errors[] = 'Stock for ' . $r['name'] . ' can only go below zero if the product keeps selling when it runs out.';
+        }
+        if ($r['sale'] !== '') {
+            $sp = parse_price($r['sale']);
+            $own = $r['price'] === '' ? null : parse_price($r['price']);
+            if ($sp === null) {
+                $errors[] = 'The sale price for ' . $r['name'] . ' isn\'t a price.';
+            } elseif ($own === null) {
+                $errors[] = $r['name'] . ' has a sale price but no price of its own. Give it a price, or use the product\'s sale price.';
+            } elseif ($sp >= $own) {
+                $errors[] = 'The sale price for ' . $r['name'] . ' should be less than its price.';
+            }
         }
         if (isset($seen[mb_strtolower($r['name'])])) {
             $errors[] = 'There are two choices called ' . $r['name'] . '.';
@@ -2877,24 +3579,31 @@ function admin_save(): never
         $catId = (int)($st->fetchColumn() ?: 0);
         if (!$catId) {
             $pdo->prepare('INSERT INTO categories (name, slug, position) VALUES (?, ?, ?)')
-                ->execute([$v['new_category'], unique_slug('categories', slugify($v['new_category'])), next_cat_position()]);
+                ->execute([$v['new_category'], unique_slug('categories', slugify($v['new_category'])), cat_next_position(0)]);
             $catId = (int)$pdo->lastInsertId();
+            cat_all(true);
         }
+    }
+    if ($catId && !cat_by_id($catId)) {
+        $catId = 0;
     }
     $stock = $v['stock'] === '' ? null : (int)$v['stock'];
     if ($p) {
         $slug = $v['slug'] !== '' ? unique_slug('products', slugify($v['slug']), (int)$p['id']) : $p['slug'];
         $pdo->prepare('UPDATE products SET name = ?, slug = ?, price_pence = ?, description = ?, category_id = ?,
-                       stock = ?, visible = ?, updated = ? WHERE id = ?')
-            ->execute([$v['name'], $slug, $pence, $v['description'], $catId, $stock, $v['visible'] ? 1 : 0, now(), $p['id']]);
+                       stock = ?, visible = ?, sku = ?, updated = ? WHERE id = ?')
+            ->execute([$v['name'], $slug, $pence, $v['description'], $catId, $stock, $v['visible'] ? 1 : 0, $v['sku'], now(), $p['id']]);
         $pid = (int)$p['id'];
     } else {
-        $pdo->prepare('INSERT INTO products (slug, name, price_pence, description, category_id, stock, visible, created, updated)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        $pdo->prepare('INSERT INTO products (slug, name, price_pence, description, category_id, stock, visible, sku, created, updated)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
             ->execute([unique_slug('products', slugify($v['name'])), $v['name'], $pence, $v['description'],
-                       $catId, $stock, $v['visible'] ? 1 : 0, now(), now()]);
+                       $catId, $stock, $v['visible'] ? 1 : 0, $v['sku'], now(), now()]);
         $pid = (int)$pdo->lastInsertId();
     }
+    product_set_extra_cats($pid, $v['extra_cats'], $catId);
+    $pdo->prepare('UPDATE products SET backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ? WHERE id = ?')
+        ->execute([$v['backorders'], $salePence, $sf, $stTo, $pid]);
 
     // Choices: update the ones kept (by id), add new ones, delete the rest.
     $old = [];
@@ -2905,14 +3614,15 @@ function admin_save(): never
     foreach ($v['opts'] as $n => $r) {
         $vp = $r['price'] === '' ? null : parse_price($r['price']);
         $vs = $r['stock'] === '' ? null : (int)$r['stock'];
+        $vsale = $r['sale'] === '' || $vp === null ? null : parse_price($r['sale']);
         $xid = (int)$r['id'];
         if ($xid && isset($old[$xid])) {
-            $pdo->prepare('UPDATE variants SET name = ?, price_pence = ?, stock = ?, position = ? WHERE id = ?')
-                ->execute([$r['name'], $vp, $vs, $n, $xid]);
+            $pdo->prepare('UPDATE variants SET name = ?, price_pence = ?, stock = ?, position = ?, sku = ?, sale_pence = ? WHERE id = ?')
+                ->execute([$r['name'], $vp, $vs, $n, $r['sku'], $vsale, $xid]);
             $kept[$xid] = true;
         } else {
-            $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position) VALUES (?, ?, ?, ?, ?)')
-                ->execute([$pid, $r['name'], $vp, $vs, $n]);
+            $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sku, sale_pence) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$pid, $r['name'], $vp, $vs, $n, $r['sku'], $vsale]);
         }
     }
     foreach ($old as $xid => $x) {
@@ -3008,11 +3718,14 @@ function admin_duplicate(): never
         ->execute([unique_slug('products', slugify($name)), $name, $p['price_pence'], $p['description'],
                    $p['category_id'], $p['stock'], $p['option_name'], now(), now()]);
     $nid = (int)$pdo->lastInsertId();
-    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, renew_pence = ?, update_months = ? WHERE id = ?')
-        ->execute([$p['kind'], $p['licensed'], $p['renew_pence'], $p['update_months'], $nid]);
+    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, renew_pence = ?, update_months = ?, backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ? WHERE id = ?')
+        ->execute([$p['kind'], $p['licensed'], $p['renew_pence'], $p['update_months'], $p['backorders'], $p['sale_pence'], $p['sale_from'], $p['sale_to'], $nid]);
+    // Same categories; not the SKUs, which have to be different (the copy is usually the next size or colour).
+    $pdo->prepare('INSERT INTO product_categories (product_id, category_id) SELECT ?, category_id FROM product_categories WHERE product_id = ?')
+        ->execute([$nid, $p['id']]);
     foreach (product_variants((int)$p['id']) as $x) {
-        $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position) VALUES (?, ?, ?, ?, ?)')
-            ->execute([$nid, $x['name'], $x['price_pence'], $x['stock'], $x['position']]);
+        $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sale_pence) VALUES (?, ?, ?, ?, ?, ?)')
+            ->execute([$nid, $x['name'], $x['price_pence'], $x['stock'], $x['position'], $x['sale_pence']]);
     }
     foreach (product_photos((int)$p['id']) as $ph) {
         $file = $ph['file'];
@@ -3068,76 +3781,133 @@ function view_admin_categories(): never
     if (is_post()) {
         csrf_check();
         $do = post('do');
-        $name = post('name');
+        $name = mb_substr(post('name'), 0, 60);
         $id = (int)($_POST['id'] ?? 0);
+        $c = $id ? cat_by_id($id) : null;
+        $parent = (int)($_POST['parent'] ?? 0);
+        $parentOk = fn($pid, $height) => $pid === 0 || (cat_by_id($pid) && cat_depth($pid) + $height <= CAT_DEPTH);
         if ($do === 'add' && $name !== '') {
-            $st = db()->prepare('SELECT id FROM categories WHERE name = ? COLLATE NOCASE');
-            $st->execute([$name]);
-            if (!$st->fetch()) {
-                db()->prepare('INSERT INTO categories (name, slug, position) VALUES (?, ?, ?)')
-                    ->execute([$name, unique_slug('categories', slugify($name)), next_cat_position()]);
+            if (!$parentOk($parent, 1)) {
+                flash('Categories go ' . CAT_DEPTH . ' levels deep at most, so it can\'t go there.');
+            } else {
+                $st = db()->prepare('SELECT id FROM categories WHERE name = ? COLLATE NOCASE AND parent_id = ?');
+                $st->execute([$name, $parent]);
+                if ($st->fetch()) {
+                    flash('There\'s already a ' . $name . ' there.');
+                } else {
+                    db()->prepare('INSERT INTO categories (name, slug, position, parent_id) VALUES (?, ?, ?, ?)')
+                        ->execute([$name, unique_slug('categories', slugify($parent ? cat_path_name($parent) . ' ' . $name : $name)), cat_next_position($parent), $parent]);
+                    flash($name . ' added' . ($parent ? ' inside ' . cat_path_name($parent) : '') . '.');
+                }
             }
-            flash($name . ' added.');
-        } elseif ($do === 'rename' && $id && $name !== '') {
-            db()->prepare('UPDATE categories SET name = ? WHERE id = ?')->execute([$name, $id]);
-            flash('Renamed to ' . $name . '.');
-        } elseif (($do === 'up' || $do === 'down') && $id) {
-            $ids = array_map('intval', array_column(categories(), 'id'));
-            $i = array_search($id, $ids, true);
+        } elseif ($do === 'save' && $c && $name !== '') {
+            if ($parent === $c['id'] || in_array($parent, cat_descendants($c['id']), true) || !$parentOk($parent, cat_height($c['id']))) {
+                flash($c['name'] . ' can\'t go there: categories go ' . CAT_DEPTH . ' levels deep at most, and one can\'t go inside itself.');
+            } else {
+                $moved = $parent !== $c['parent_id'];
+                db()->prepare('UPDATE categories SET name = ?, parent_id = ?' . ($moved ? ', position = ' . cat_next_position($parent) : '') . ' WHERE id = ?')
+                    ->execute([$name, $parent, $c['id']]);
+                flash($moved ? $name . ' moved' . ($parent ? ' into ' . cat_path_name($parent) : ' to the top level') . '.' : 'Saved.');
+            }
+        } elseif (($do === 'up' || $do === 'down') && $c) {
+            $ids = array_column(cat_children($c['parent_id']), 'id');
+            $i = array_search($c['id'], $ids, true);
             $j = $do === 'up' ? $i - 1 : $i + 1;
             if ($i !== false && isset($ids[$j])) {
                 [$ids[$i], $ids[$j]] = [$ids[$j], $ids[$i]];
             }
-            foreach ($ids as $n => $cid) {
-                db()->prepare('UPDATE categories SET position = ? WHERE id = ?')->execute([$n, $cid]);
-            }
-            redirect(admin_url('categories'));
-        } elseif ($do === 'delete' && $id) {
-            db()->prepare('UPDATE products SET category_id = 0 WHERE category_id = ?')->execute([$id]);
-            db()->prepare('DELETE FROM categories WHERE id = ?')->execute([$id]);
-            flash('Category deleted. Its products are still in the shop, just without a category.');
+            cat_renumber($ids);
+            redirect(admin_url('categories') . '#cat-' . $c['id']);
+        } elseif ($do === 'delete' && $c) {
+            $inside = count(cat_children($c['id']));
+            cat_delete($c['id']);
+            flash($c['name'] . ' deleted. ' . ($inside ? 'The categories inside it moved up a level, and its' : 'Its')
+                . ' products are still in the shop' . ($c['parent_id'] ? ', in ' . cat_path_name($c['parent_id']) : '') . '.');
         }
         redirect(admin_url('categories'));
     }
-    $counts = db()->query('SELECT category_id, COUNT(*) n FROM products GROUP BY category_id')->fetchAll(PDO::FETCH_KEY_PAIR);
+    // Products in each category: its own (main or extra), and with everything inside it.
+    $own = [];
+    foreach (db()->query('SELECT category_id c, COUNT(*) n FROM (SELECT category_id FROM products WHERE category_id > 0
+                          UNION ALL SELECT category_id FROM product_categories) GROUP BY category_id') as $r) {
+        $own[(int)$r['c']] = (int)$r['n'];
+    }
+    $tree = cat_tree();
     $rows = '';
-    $all = categories();
-    foreach ($all as $k => $c) {
-        $move = '<form method="post">' . csrf_field() . '<input type="hidden" name="id" value="' . (int)$c['id'] . '">'
-              . ($k > 0 ? '<button class="quiet small" name="do" value="up" aria-label="Move ' . e($c['name']) . ' up">&uarr;</button>' : '')
-              . ($k < count($all) - 1 ? '<button class="quiet small" name="do" value="down" aria-label="Move ' . e($c['name']) . ' down">&darr;</button>' : '')
+    foreach ($tree as $c) {
+        $sib = array_column(cat_children($c['parent_id']), 'id');
+        $k = array_search($c['id'], $sib, true);
+        $total = array_sum(array_map(fn($i) => $own[$i] ?? 0, cat_descendants($c['id'])));
+        $n = $own[$c['id']] ?? 0;
+        $height = cat_height($c['id']);
+        $f = 'cf' . $c['id'];
+        $move = '<form method="post">' . csrf_field() . '<input type="hidden" name="id" value="' . $c['id'] . '">'
+              . ($k > 0 ? '<button class="quiet small" name="do" value="up" aria-label="Move ' . e($c['name']) . ' up">&uarr;</button>' : '<span class="nomove"></span>')
+              . ($k < count($sib) - 1 ? '<button class="quiet small" name="do" value="down" aria-label="Move ' . e($c['name']) . ' down">&darr;</button>' : '')
               . '</form>';
-        $rows .= '<tr><td>' . $move . '</td><td><form method="post">' . csrf_field() . '<input type="hidden" name="id" value="' . (int)$c['id'] . '">'
-            . '<input name="name" value="' . e($c['name']) . '" aria-label="Category name" required>'
-            . '<button class="quiet small" name="do" value="rename">Rename</button></form></td>'
-            . '<td class="muted">' . (int)($counts[$c['id']] ?? 0) . ' products</td>'
-            . '<td><form method="post" onsubmit="return confirm(\'Delete this category? Its products stay in the shop.\')">' . csrf_field()
-            . '<input type="hidden" name="id" value="' . (int)$c['id'] . '"><button class="danger small" name="do" value="delete">Delete</button></form></td></tr>';
+        $rows .= '<tr id="cat-' . $c['id'] . '" class="d' . $c['depth'] . '"><td class="mv">' . $move . '</td>'
+            . '<td class="cname"><form method="post" id="' . $f . '">' . csrf_field() . '<input type="hidden" name="id" value="' . $c['id'] . '"><input type="hidden" name="do" value="save"></form>'
+            . '<input form="' . $f . '" name="name" value="' . e($c['name']) . '" maxlength="60" aria-label="Name of ' . e($c['name']) . '" required></td>'
+            . '<td><select form="' . $f . '" name="parent" aria-label="Where ' . e($c['name']) . ' goes">'
+            . cat_options_html($c['parent_id'], 'Top level', CAT_DEPTH - $height, $c['id']) . '</select></td>'
+            . '<td><button form="' . $f . '" class="quiet small">Save</button></td>'
+            . '<td class="muted"><a href="' . e(url_with(admin_url(), ['cat' => $c['id']])) . '">' . number_format($total) . ' product' . ($total === 1 ? '' : 's') . '</a>'
+            . ($total !== $n ? ' <span title="' . $n . ' directly in it">(' . $n . ' here)</span>' : '') . '</td>'
+            . '<td><a href="' . e(shop_url('c/' . $c['slug'])) . '" target="_blank" rel="noopener" class="muted">View</a></td>'
+            . '<td><form method="post" onsubmit="return confirm(\'Delete ' . e(addslashes($c['name'])) . '? '
+            . (cat_children($c['id']) ? 'The categories inside it move up a level. ' : '') . 'Its products stay in the shop.\')">' . csrf_field()
+            . '<input type="hidden" name="id" value="' . $c['id'] . '"><button class="danger small" name="do" value="delete">Delete</button></form></td></tr>';
     }
     admin_shell('Categories', '<h1>Categories</h1>
-      <p class="lede">Optional. Categories make the shop menu, in this order. A category only shows once it has something for sale.</p>'
-      . ($rows ? '<table>' . $rows . '</table>' : '') . '
-      <form method="post">' . csrf_field() . '<input type="hidden" name="do" value="add">
-        <label>New category <input name="name" required maxlength="60" placeholder="e.g. Mugs"></label>
+      <p class="lede">Categories make the shop menu, in this order. They can go inside each other, up to ' . CAT_DEPTH . ' levels
+      (for example Cars › SRX2 › Spares). A category only shows in the shop once it has something for sale.</p>'
+      . ($rows ? '<div class="table-wrap"><table class="cats"><thead><tr><th><span class="vh">Order</span></th><th>Name</th><th>Goes in</th><th></th><th>Products</th><th></th><th></th></tr></thead>' . $rows . '</table></div>' : '') . '
+      <h2>Add a category</h2>
+      <form method="post" class="addcat">' . csrf_field() . '<input type="hidden" name="do" value="add">
+        <label>Name <input name="name" required maxlength="60" placeholder="e.g. Mugs"></label>
+        <label>Goes in <select name="parent">' . cat_options_html(0, 'Top level', CAT_DEPTH - 1) . '</select></label>
         <button>Add category</button></form>');
 }
 
-function next_cat_position(): int
-{
-    return (int)db()->query('SELECT COALESCE(MAX(position), -1) + 1 FROM categories')->fetchColumn();
-}
 
 /* ---------------------------------------------------------------- settings */
 
-function view_admin_settings(): never
+/* Settings tabs, and which tab each form lives on (so a save comes back to it). */
+const SETTINGS_TABS = ['general' => 'Shop', 'delivery' => 'Delivery', 'payments' => 'Payments', 'email' => 'Email',
+                       'business' => 'Business and VAT', 'account' => 'Your sign-in', 'advanced' => 'Advanced'];
+const SETTINGS_FORMS = ['shop' => 'general', 'search' => 'general', 'accounts' => 'general', 'stock' => 'general', 'demo' => 'general',
+                        'postage' => 'delivery', 'payments' => 'payments', 'email' => 'email', 'email_test' => 'email',
+                        'business' => 'business', 'vat' => 'business', 'legal' => 'business',
+                        'password' => 'account', 'signout_all' => 'account', '2fa_start' => 'account', '2fa_confirm' => 'account', '2fa_off' => 'account',
+                        'site_url' => 'advanced', 'proxy' => 'advanced', 'version' => 'advanced', 'refresh' => 'advanced'];
+
+/* The settings page for a tab, with an optional #section: settings_url('payments'). */
+function settings_url(string $tab = 'general', string $anchor = ''): string
 {
+    return admin_url($tab === 'general' ? 'settings' : 'settings/' . $tab) . ($anchor !== '' ? '#' . $anchor : '');
+}
+
+function view_admin_settings(string $tab = 'general'): never
+{
+    $tab = isset(SETTINGS_TABS[$tab]) ? $tab : 'general';
     $u = require_admin();
     if (is_post()) {
         csrf_check();
         switch (post('form')) {
             case 'shop':
                 set_setting('shop_title', post('shop_title') ?: 'Shop');
-                flash('Saved.');
+                $per = post('per_page');
+                if (ctype_digit($per) && (int)$per >= 6 && (int)$per <= 96) {
+                    set_setting('per_page', (string)(int)$per);
+                    flash('Saved.');
+                } else {
+                    flash('Products per page must be a whole number from 6 to 96. The heading was saved.');
+                }
+                break;
+            case 'search':
+                $lines = array_filter(array_map('trim', preg_split('/\R/', mb_substr(str_in($_POST['search_synonyms'] ?? ''), 0, 5000))), fn($l) => $l !== '');
+                set_setting('search_synonyms', implode("\n", $lines));
+                flash($lines ? 'Saved. Searches now treat ' . count($lines) . ' group' . (count($lines) === 1 ? '' : 's') . ' of words as the same.' : 'Saved: no synonyms.');
                 break;
             case 'postage':
                 $deliver = !empty($_POST['deliver']);
@@ -3302,7 +4072,7 @@ function view_admin_settings(): never
                 set_setting('low_stock_level', (string)(int)$lvl);
                 flash(setting('low_stock_on') === '1'
                     ? 'Saved. You\'ll get an email when an order takes anything down to ' . (int)$lvl . ' or fewer.'
-                      . (mail_ready() ? '' : ' Set up email above first, or the emails can\'t go.')
+                      . (mail_ready() ? '' : ' Set up email in the Email tab first, or the emails can\'t go.')
                     : 'Low-stock emails are off.');
                 break;
             case 'demo':
@@ -3390,17 +4160,18 @@ function view_admin_settings(): never
                 }
                 break;
         }
-        redirect(admin_url('settings'));
+        redirect(settings_url(SETTINGS_FORMS[post('form')] ?? $tab));
     }
     $u = user_by_id((int)$u['id']);
-    admin_shell('Settings', '<h1>Settings</h1>
-      <p class="lede">Opening the shop, or handing it over? Work through the <a href="' . e(admin_url('ready')) . '">Getting ready checklist</a>.</p>
+    $s = array_fill_keys(array_keys(SETTINGS_TABS), '');
+    $s['general'] .= '<h2 id="shop">Shop</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="shop">
         <label>Shop heading <span class="hint">(the title on the main shop page)</span>
           <input name="shop_title" value="' . e(setting('shop_title', 'Shop')) . '" maxlength="80"></label>
-        <button>Save</button></form>
-
-      <h2 id="postage">Postage and collection</h2>
+        <label>Products per page <span class="hint">(6 to 96; the shop and each category show this many at a time)</span>
+          <input type="number" name="per_page" min="6" max="96" inputmode="numeric" value="' . per_page() . '" style="max-width:7rem;display:block"></label>
+        <button>Save</button></form>';
+    $s['delivery'] .= '<h2 id="postage">Postage and collection</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="postage">
         <label class="check"><input type="checkbox" name="deliver" value="1"' . (can_deliver() ? ' checked' : '') . '> Offer UK delivery</label>
         <label>Delivery price <div class="price"><span>£</span><input name="postage_price" inputmode="decimal" placeholder="3.95" value="'
@@ -3410,9 +4181,8 @@ function view_admin_settings(): never
         <label class="check"><input type="checkbox" name="collect" value="1"' . (can_collect() ? ' checked' : '') . '> Offer free collection</label>
         <label>Collection details <span class="hint">(where and when, shown to customers who choose collection)</span>
           <textarea name="postage_collect_note" maxlength="500" style="min-height:5rem">' . e(setting('postage_collect_note')) . '</textarea></label>
-        <button>Save postage</button></form>
-
-      <h2 id="payments">Payments</h2>
+        <button>Save postage</button></form>';
+    $s['payments'] .= '<h2 id="payments">Payments</h2>
       <p class="muted">Switch on the ways customers can pay. Each is offered at checkout once it\'s set up.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="payments">
         <label class="check"><input type="checkbox" name="pay_paypal" value="1"' . (setting('pay_paypal') === '1' ? ' checked' : '') . '> PayPal</label>
@@ -3436,9 +4206,8 @@ function view_admin_settings(): never
         <p class="muted">Only offered to customers who choose collection.</p>
         <label>Cancel unpaid bank transfers after <span class="hint">(days; customers are told the date when they order, the stock goes back on sale, and you can restore an order if money arrives late; 0 = never)</span>
           <input type="number" name="unpaid_days" min="0" max="365" inputmode="numeric" value="' . e(setting('unpaid_days', '14')) . '" style="max-width:7rem;display:block"></label>
-        <button>Save payments</button></form>
-
-      <h2 id="email">Email</h2>
+        <button>Save payments</button></form>';
+    $s['email'] .= '<h2 id="email">Email</h2>
       <p class="muted">The shop emails customers when they order, when you mark a bank transfer paid, when you send their order,
       and if you cancel or refund it. It emails you about each new order. Use the details from your email provider or host.</p>' . ((($f = mail_failed_count()) > 0) ? '<p class="flash">' . $f . ' email' . ($f === 1 ? '' : 's') . ' couldn\'t be sent. Check the details below, then use Try now on the order.</p>' : '') . '
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="email">
@@ -3459,40 +4228,42 @@ function view_admin_settings(): never
         <button>Save email</button></form>'
         . (mail_ready() ? '<form method="post" style="margin-top:1rem">' . csrf_field() . '<input type="hidden" name="form" value="email_test">
         <div class="row"><label>Send a test email to <input type="email" name="test_to" value="' . e(mail_shop_address()) . '"></label></div>
-        <button class="quiet">Send test email</button></form>' : '') . '
-
-      <h2 id="accounts">Customer accounts</h2>
+        <button class="quiet">Send test email</button></form>' : '') . '';
+    $s['general'] .= '<h2 id="search">Search</h2>
+      <p class="muted">The shop\'s search box appears once it has ' . SEARCH_BOX_FROM . ' or more products. It finds names, SKUs, categories and descriptions,
+      and the start of a word is enough ("wish" finds "wishbone"). If customers use other words for the same thing, list them here, one group a line.</p>
+      <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="search">
+        <label>Words that mean the same <span class="hint">(e.g. <code>alloy = aluminium = alu</code>)</span>
+          <textarea name="search_synonyms" style="min-height:6rem" placeholder="alloy = aluminium = alu&#10;fr = front&#10;diff = differential">' . e(setting('search_synonyms')) . '</textarea></label>
+        <button>Save</button></form>';
+    $s['general'] .= '<h2 id="accounts">Customer accounts</h2>
       <p class="muted">Customers can create an account to save their addresses and see their orders. Checking out as a guest always works too.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="accounts">
         <label class="check"><input type="checkbox" name="accounts_on" value="1"' . (accounts_on() ? ' checked' : '') . '> Let customers create accounts and sign in</label>
-        ' . (accounts_on() && !mail_ready() ? '<p class="muted">Set up email above too, so customers can confirm their address and reset a forgotten password.</p>' : '') . '
-        <button>Save</button></form>
-
-      <h2 id="stock">Low stock</h2>
+        ' . (accounts_on() && !mail_ready() ? '<p class="muted">Set up email too (<a href="' . e(settings_url('email')) . '">Email tab</a>), so customers can confirm their address and reset a forgotten password.</p>' : '') . '
+        <button>Save</button></form>';
+    $s['general'] .= '<h2 id="stock">Low stock</h2>
       <p class="muted">For products where you count stock. When an order takes something down to this level or below,
-      the shop emails you at the new-order address in Email above.</p>
+      the shop emails you at the new-order address in the <a href="' . e(settings_url('email')) . '">Email tab</a>.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="stock">
         <label class="check"><input type="checkbox" name="low_stock_on" value="1"' . (setting('low_stock_on', '1') === '1' ? ' checked' : '') . '> Email me when stock runs low</label>
         <label>Low means <span class="hint">(this many left, or fewer)</span>
           <input type="number" name="low_stock_level" min="0" max="9999" inputmode="numeric" value="' . e(setting('low_stock_level', '3')) . '" style="max-width:7rem;display:block"></label>
-        <button>Save</button></form>
-
-      <h2 id="business">Your business</h2>
+        <button>Save</button></form>';
+    $s['business'] .= '<h2 id="business">Your business</h2>
       <p class="muted">Shown at checkout and on order pages. UK law expects online sellers to give their name, address and email.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="business">
         <label>Business name <input name="business_name" value="' . e(setting('business_name')) . '" maxlength="120"></label>
         <label>Email for customers <input type="email" name="business_email" value="' . e(setting('business_email')) . '" maxlength="200"></label>
         <label>Address <textarea name="business_address" maxlength="300" style="min-height:4rem">' . e(setting('business_address')) . '</textarea></label>
-        <button>Save business details</button></form>
-
-      <h2 id="site">Web address</h2>
+        <button>Save business details</button></form>';
+    $s['advanced'] .= '<h2 id="site">Web address</h2>
       <p class="muted">The address used in links in emails (order pages, password resets) and to fetch your site\'s look. It\'s taken from your
       own visits here, so it only needs changing if the site moves, for example to https or to a new domain.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="site_url">
         <label>Site address <input type="url" name="site_url" value="' . e(setting('site_url')) . '" placeholder="https://www.example.com" autocapitalize="none"></label>
-        <button>Save address</button></form>
-
-      <h2 id="proxy">Proxy or CDN</h2>
+        <button>Save address</button></form>';
+    $s['advanced'] .= '<h2 id="proxy">Proxy or CDN</h2>
       <p class="muted">Only if your site sits behind Cloudflare or another proxy. The shop limits how often each visitor can try passwords
       or place orders; behind a proxy every visitor looks the same unless the shop knows to trust the proxy\'s note of their real address.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="proxy">
@@ -3503,25 +4274,22 @@ function view_admin_settings(): never
         <label>Its addresses <span class="hint">(only for "another proxy": one per line, ranges like 10.0.0.0/24 are fine)</span>
           <textarea name="proxy_ips" style="min-height:4rem" autocapitalize="none">' . e(setting('proxy_ips')) . '</textarea></label>
         <p class="muted">The shop sees you as ' . e(real_ip()) . ' (the server sees ' . e((string)($_SERVER['REMOTE_ADDR'] ?? '')) . ').</p>
-        <button>Save</button></form>
-
-      <h2 id="legal">Terms, returns and privacy</h2>
+        <button>Save</button></form>';
+    $s['business'] .= '<h2 id="legal">Terms, returns and privacy</h2>
       <p class="muted">Links to your pages for these (usually Wren pages, like /terms). When set, customers tick to say they\'ve read them before paying.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="legal">
         <label>Terms of sale <input name="terms_url" value="' . e(setting('terms_url')) . '" placeholder="/terms-of-sale" autocapitalize="none"></label>
         <label>Delivery and returns <input name="returns_url" value="' . e(setting('returns_url')) . '" placeholder="/delivery-and-returns" autocapitalize="none"></label>
         <label>Privacy <input name="privacy_url" value="' . e(setting('privacy_url')) . '" placeholder="/privacy-policy" autocapitalize="none"></label>
-        <button>Save links</button></form>
-
-      <h2>VAT</h2>
+        <button>Save links</button></form>';
+    $s['business'] .= '<h2>VAT</h2>
       <p class="muted">Prices you type in are what customers pay. If you\'re VAT-registered, the basket, emails and packing slips
       show how much of that is VAT (20%) and your VAT number.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="vat">
         <label class="check"><input type="checkbox" name="vat_registered" value="1"' . (setting('vat_registered') === '1' ? ' checked' : '') . '> We are VAT-registered</label>
         <label>VAT number <input name="vat_number" value="' . e(setting('vat_number')) . '" placeholder="GB123456789" autocapitalize="characters"></label>
-        <button>Save VAT</button></form>
-
-      <h2>Look of the shop</h2>
+        <button>Save VAT</button></form>';
+    $s['advanced'] .= '<h2>Look of the shop</h2>
       <p class="muted">The shop copies your site\'s menu and theme automatically every 10 minutes.
       Changed them just now? Refresh to see it straight away.</p>'
       . (($sn = setting('shell_note')) !== '' && !is_file(SHELL_FILE) ? '<p class="flash">The shop is using a plain copy of your theme for now. ' . e($sn) . '</p>' : '') . '
@@ -3529,19 +4297,16 @@ function view_admin_settings(): never
         <button class="quiet">Refresh look</button></form>
       <form method="post" style="margin-top:1rem">' . csrf_field() . '<input type="hidden" name="form" value="version">
         <label class="check"><input type="checkbox" name="show_version" value="1"' . (setting('show_version', '1') === '1' ? ' checked' : '') . '> Show the Wren Shop version in the footer, after Wren\'s</label>
-        <button class="quiet">Save</button></form>
-
-      ' . licence_settings_html() . '
-
-      <h2 id="demo">Demo mode</h2>
+        <button class="quiet">Save</button></form>';
+    $s['advanced'] .= licence_settings_html() . '';
+    $s['general'] .= '<h2 id="demo">Demo mode</h2>
       <p class="muted">For showing the shop off rather than selling. Every page has a banner saying it\'s a demo, search engines are asked
       not to list it, and visitors can\'t check out or create accounts. While you\'re signed in here you still can, so you can test.
       Make sure this is off before a shop goes live.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="demo">
         <label class="check"><input type="checkbox" name="demo_mode" value="1"' . (shop_demo() ? ' checked' : '') . '> This shop is a demo</label>
-        <button class="quiet" style="margin-top:1rem">Save</button></form>
-
-      <h2 id="twofactor">Two-factor sign-in</h2>' . twofactor_panel($u) . '
+        <button class="quiet" style="margin-top:1rem">Save</button></form>';
+    $s['account'] .= '<h2 id="twofactor">Two-factor sign-in</h2>' . twofactor_panel($u) . '
 
       <h2>Password</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="password">
@@ -3553,7 +4318,11 @@ function view_admin_settings(): never
       <p class="muted">Lost a phone, or signed in somewhere you shouldn\'t have stayed signed in?</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="signout_all">
         <button class="quiet">Sign out all other devices</button></form>
-      <p class="muted" style="margin-top:2.5rem">Wren Shop ' . SHOP_VERSION . (shop_demo() ? ' (demo mode)' : '') . '</p>');
+      ';
+    $s['advanced'] .= '<p class="muted" style="margin-top:2.5rem">Wren Shop ' . SHOP_VERSION . (shop_demo() ? ' (demo mode)' : '') . '</p>';
+    // A section named like its tab doesn't need its own heading under the page's.
+    $body = preg_replace('#^<h2[^>]*>' . preg_quote(e(SETTINGS_TABS[$tab]), '#') . '</h2>\s*#', '', $s[$tab]);
+    admin_shell('Settings: ' . SETTINGS_TABS[$tab], '<h1>' . e(SETTINGS_TABS[$tab]) . '</h1>' . $body);
 }
 
 function twofactor_panel(array $u): string
@@ -4032,7 +4801,9 @@ function basket_lines(): array
         [$p, $v] = $item;
         $qty = min((int)$qty, qty_max($p, $v));
         if ($qty > 0) {
-            $lines[] = ['key' => (string)$key, 'p' => $p, 'v' => $v, 'qty' => $qty, 'price' => variant_price($p, $v),
+            // price: what one costs before any group price or code (the sale price if on sale)
+            $lines[] = ['key' => (string)$key, 'p' => $p, 'v' => $v, 'qty' => $qty, 'price' => unit_price($p, $v), 'full' => variant_price($p, $v),
+                        'backorder' => backorder_qty($p, $v, $qty),
                         'option' => $v ? ($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . $v['name'] : ''];
         }
     }
@@ -4114,7 +4885,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
     }
     $sub = array_sum(array_map(fn($l) => $l['qty'] * $l['price'], $lines));
     $me = current_customer();
-    $t = basket_totals($sub, (string)($v['email'] ?? ($me['email'] ?? '')), lines_group_saving($lines));
+    $t = basket_totals($sub, (string)($v['email'] ?? ($me['email'] ?? '')), lines_group_saving($lines), lines_sale_saving($lines));
     if ($why = checkout_blocked($t)) {
         flash($why);
         redirect(shop_url('basket'));
@@ -4156,8 +4927,9 @@ function view_checkout(array $errors = [], ?array $v = null): never
 
     $rows = '';
     foreach ($lines as $l) {
-        $rows .= '<tr><td>' . e($l['p']['name']) . ($l['option'] !== '' ? '<small> ' . e($l['option']) . '</small>' : '') . '</td>'
-               . '<td class="shop-num">× ' . $l['qty'] . '</td><td class="shop-num">' . money($l['qty'] * $l['price']) . '</td></tr>';
+        $rows .= '<tr><td>' . e($l['p']['name']) . ($l['option'] !== '' ? '<small> ' . e($l['option']) . '</small>' : '')
+               . ($l['backorder'] && backorder_told($l['p']) ? '<small class="shop-backorder">' . backorder_note($l['backorder'], $l['qty']) . '</small>' : '') . '</td>'
+               . '<td class="shop-num">× ' . $l['qty'] . '</td><td class="shop-num">' . money($l['qty'] * line_unit($l, $t)) . '</td></tr>';
     }
     $payDesc = [
         'paypal'     => 'Pay with your PayPal account, or by card through PayPal.',
@@ -4252,7 +5024,8 @@ function checkout_post(): never
     $sub = array_sum(array_map(fn($l) => $l['qty'] * $l['price'], $lines));
     $hadCode = (string)($_SESSION['shop_discount'] ?? '');
     $gsave = lines_group_saving($lines);
-    $t = basket_totals($sub, '', $gsave);
+    $ssave = lines_sale_saving($lines);
+    $t = basket_totals($sub, '', $gsave, $ssave);
     if ($why = checkout_blocked($t)) {
         flash($why);
         redirect(shop_url('basket'));
@@ -4316,7 +5089,7 @@ function checkout_post(): never
     if ($hadCode !== '' && !$errors) {
         $note = $t['discount_note'];
         if ($t['code'] !== '') {
-            $t = basket_totals($sub, $v['email'], $gsave);
+            $t = basket_totals($sub, $v['email'], $gsave, $ssave);
             $note = $t['discount_note'];
         }
         if ($t['discount_id'] === null && !$t['code_beaten'] && empty($_SESSION['shop_discount'])) {
@@ -4359,10 +5132,14 @@ function checkout_post(): never
     // Place the order and hold its stock in one step, so two people can't buy the last one.
     $pdo = db();
     $pdo->exec('BEGIN IMMEDIATE');
-    foreach ($lines as $l) {
+    foreach ($lines as $i => $l) {
         $st = $l['v'] ? $pdo->prepare('SELECT stock FROM variants WHERE id = ?') : $pdo->prepare('SELECT stock FROM products WHERE id = ?');
         $st->execute([$l['v'] ? $l['v']['id'] : $l['p']['id']]);
         $stock = $st->fetchColumn();
+        if (backorders_on($l['p'])) {   // keeps selling: count what's beyond the stock right now
+            $lines[$i]['backorder'] = $stock === null ? 0 : max(0, $l['qty'] - max(0, (int)$stock));
+            continue;
+        }
         if ($stock !== null && (int)$stock < $l['qty']) {
             $pdo->exec('ROLLBACK');
             $name = item_name($l['p'], $l['v']);
@@ -4372,7 +5149,7 @@ function checkout_post(): never
     }
     if ($t['discount_id'] !== null) {   // another order may have used it up a moment ago
         $d = discount_by_id($t['discount_id']);
-        $why = $d ? discount_problem($d, $sub, $v['email']) : ['That discount code has been withdrawn.', false];
+        $why = $d ? discount_problem($d, $t['subtotal'], $v['email']) : ['That discount code has been withdrawn.', false];
         if ($why) {
             $pdo->exec('ROLLBACK');
             unset($_SESSION['shop_discount']);
@@ -4397,8 +5174,11 @@ function checkout_post(): never
                    $t['discount_id'], $t['code'], $t['discount'], $t['group'], $t['group_pence'], $digital ? now() : '']);
     $oid = (int)$pdo->lastInsertId();
     foreach ($lines as $l) {
-        $pdo->prepare('INSERT INTO order_items (order_id, product_id, variant_id, name, option_label, unit_pence, qty, licence_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-            ->execute([$oid, $l['p']['id'], $l['v'] ? $l['v']['id'] : null, $l['p']['name'], $l['option'], $l['price'], $l['qty'], $l['p']['renew_licence'] ?? null]);
+        // The part number as it was: the choice's own, else the product's.
+        $sku = $l['v'] && ($l['v']['sku'] ?? '') !== '' ? $l['v']['sku'] : ($l['p']['sku'] ?? '');
+        // The price actually charged (sale or full), and how many weren't in stock.
+        $pdo->prepare('INSERT INTO order_items (order_id, product_id, variant_id, name, option_label, unit_pence, qty, licence_id, sku, backorder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$oid, $l['p']['id'], $l['v'] ? $l['v']['id'] : null, $l['p']['name'], $l['option'], line_unit($l, $t), $l['qty'], $l['p']['renew_licence'] ?? null, $sku, $l['backorder']]);
         if ($l['v']) {
             $pdo->prepare('UPDATE variants SET stock = stock - ? WHERE id = ? AND stock IS NOT NULL')->execute([$l['qty'], $l['v']['id']]);
         } else {
@@ -4500,6 +5280,8 @@ function order_rows(array $o): string
     $rows = '';
     foreach (order_items((int)$o['id']) as $it) {
         $rows .= '<tr><td>' . e($it['name']) . ($it['option_label'] !== '' ? '<small> ' . e($it['option_label']) . '</small>' : '')
+               . (($it['sku'] ?? '') !== '' ? '<small class="shop-sku"> · ' . e($it['sku']) . '</small>' : '')
+               . (((int)($it['backorder'] ?? 0) > 0 && product_tells_backorders((int)$it['product_id'])) ? '<small class="shop-backorder">' . backorder_note((int)$it['backorder'], (int)$it['qty']) . '</small>' : '')
                . '</td><td class="shop-num">× ' . (int)$it['qty'] . '</td><td class="shop-num">' . money((int)$it['unit_pence'] * (int)$it['qty']) . '</td></tr>';
     }
     return $rows;
@@ -4560,6 +5342,8 @@ function view_order(string $token): never
         . '<p class="shop-hint">' . (in_array($o['status'], ['paid', 'refunded'], true) ? 'Paid by: ' : 'Paying by: ') . method_label($o['payment_method'])
         . ' · Placed ' . e(gmdate('j F Y, H:i', strtotime($o['created'] . ' UTC'))) . ' UTC'
         . ($o['vat_number'] !== '' ? ' · VAT number ' . e($o['vat_number']) : '') . '</p>'
+        . (invoice_ready($o) ? '<p><a href="' . e(shop_url('order/' . $o['token'] . '/invoice')) . '" target="_blank" rel="noopener">'
+            . ($o['vat_pence'] !== null ? 'Print a VAT invoice' : 'Print a receipt') . '</a></p>' : '')
         . $where
         . '<h2 class="shop-h2">Billing address</h2><p>' . address_html('bill_', $o) . '</p>'
         . order_account_box($o)
@@ -4673,10 +5457,12 @@ function view_admin_order(int $id): never
                 . ($m['status'] === 'sent' ? 'Send again' : 'Try now') . '</button></form>' : '') . '</td></tr>';
     }
     $mails = '<h2>Emails</h2>' . ($mails !== '' ? '<table>' . $mails . '</table>'
-        : '<p class="muted">' . (mail_ready() ? 'None yet.' : 'None: email isn\'t set up. <a href="' . e(admin_url('settings#email')) . '">Set it up in Settings</a>.') . '</p>');
+        : '<p class="muted">' . (mail_ready() ? 'None yet.' : 'None: email isn\'t set up. <a href="' . e(settings_url('email')) . '">Set it up in Settings</a>.') . '</p>');
     $items = '';
     foreach (order_items((int)$o['id']) as $it) {
         $items .= '<tr><td>' . e($it['name']) . ($it['option_label'] !== '' ? '<br><span class="muted">' . e($it['option_label']) . '</span>' : '')
+               . (($it['sku'] ?? '') !== '' ? '<br><span class="muted sku">' . e($it['sku']) . '</span>' : '')
+               . ((int)$it['backorder'] > 0 ? ' <span class="pill wait">' . (int)$it['backorder'] . ' on backorder</span>' : '')
                . '</td><td>× ' . (int)$it['qty'] . '</td><td style="text-align:right">' . money((int)$it['unit_pence'] * (int)$it['qty']) . '</td></tr>';
     }
     $items .= '<tr><td colspan="2">Subtotal</td><td style="text-align:right">' . money((int)$o['subtotal_pence']) . '</td></tr>'
@@ -4690,7 +5476,9 @@ function view_admin_order(int $id): never
     $f = fn($t) => e(gmdate('j M Y H:i', strtotime($t . ' UTC')));
     admin_shell('Order #' . $o['number'], '<p class="muted"><a href="' . e(admin_url('orders')) . '">&larr; Orders</a></p>'
         . '<h1>Order #' . (int)$o['number'] . '</h1><p>' . status_pill($o) . '</p>'
-        . '<p class="muted"><a href="' . e(admin_url('order/' . $o['id'] . '/slip')) . '" target="_blank" rel="noopener">Print packing slip</a></p>'
+        . '<p class="muted"><a href="' . e(admin_url('order/' . $o['id'] . '/slip')) . '" target="_blank" rel="noopener">Print packing slip</a>'
+        . (invoice_ready($o) ? ' · <a href="' . e(admin_url('order/' . $o['id'] . '/invoice')) . '" target="_blank" rel="noopener">'
+            . ($o['vat_pence'] !== null ? 'VAT invoice' : 'Receipt') . '</a>' : '') . '</p>'
         . '<p class="muted">' . method_label($o['payment_method']) . ' · placed ' . $f($o['created'])
         . ($o['paid_at'] !== '' ? ' · paid ' . $f($o['paid_at']) : '')
         . ($o['fulfilled_at'] !== '' ? ' · ' . $o['fulfilled'] . ' ' . $f($o['fulfilled_at']) : '')
@@ -5170,8 +5958,12 @@ function mail_order_table(array $o): array
     $td = 'padding:8px 0;border-bottom:1px solid #e5e7eb;vertical-align:top';
     foreach (order_items((int)$o['id']) as $it) {
         $line = (int)$it['unit_pence'] * (int)$it['qty'];
-        $name = $it['name'] . ($it['option_label'] !== '' ? ' (' . $it['option_label'] . ')' : '');
+        $bo = ((int)($it['backorder'] ?? 0) > 0 && product_tells_backorders((int)$it['product_id'])) ? backorder_note((int)$it['backorder'], (int)$it['qty']) : '';
+        $name = $it['name'] . ($it['option_label'] !== '' ? ' (' . $it['option_label'] . ')' : '') . (($it['sku'] ?? '') !== '' ? ' [' . $it['sku'] . ']' : '')
+              . ($bo !== '' ? ' - ' . $bo : '');
         $rows .= '<tr><td style="' . $td . '">' . e($it['name']) . ($it['option_label'] !== '' ? '<br><span style="color:#6b7280;font-size:14px">' . e($it['option_label']) . '</span>' : '')
+               . (($it['sku'] ?? '') !== '' ? '<br><span style="color:#6b7280;font-size:13px">' . e($it['sku']) . '</span>' : '')
+               . ($bo !== '' ? '<br><span style="color:#8a5d10;font-size:14px;font-weight:600">' . e($bo) . ': we\'ll send ' . ((int)$it['backorder'] >= (int)$it['qty'] ? 'it' : 'the rest') . ' when it\'s back in stock</span>' : '')
                . '</td><td style="' . $td . ';text-align:right;white-space:nowrap;padding-left:12px">× ' . (int)$it['qty']
                . '</td><td style="' . $td . ';text-align:right;white-space:nowrap;padding-left:12px">' . money($line) . '</td></tr>';
         $text .= (int)$it['qty'] . ' × ' . $name . '  ' . money($line) . "\n";
@@ -5344,9 +6136,12 @@ function view_packing_slip(int $id): never
     header('X-Robots-Tag: noindex, nofollow');
     header('Cache-Control: no-store');
     $rows = '';
-    foreach (order_items((int)$o['id']) as $it) {
+    $items = order_items((int)$o['id']);
+    $skus = (bool)array_filter($items, fn($it) => ($it['sku'] ?? '') !== '');   // no SKU column in a shop without SKUs
+    foreach ($items as $it) {
         $rows .= '<tr><td class="tick"></td><td class="qty">' . (int)$it['qty'] . '</td><td>' . e($it['name'])
-               . ($it['option_label'] !== '' ? '<br><span class="muted">' . e($it['option_label']) . '</span>' : '') . '</td></tr>';
+               . ($it['option_label'] !== '' ? '<br><span class="muted">' . e($it['option_label']) . '</span>' : '')
+               . ((int)($it['backorder'] ?? 0) > 0 ? '<br><b>' . (int)$it['backorder'] . ' on backorder when ordered</b>' : '') . '</td>' . ($skus ? '<td class="sku">' . e($it['sku'] ?? '') . '</td>' : '') . '</tr>';
     }
     $to = $o['delivery'] === 'collect' ? array_merge([$o['bill_name']], ['(collecting)']) : mail_address_lines('ship_', $o);
     $biz = array_filter(array_merge([setting('business_name') ?: setting('shop_title', 'Shop')], explode("\n", str_replace("\r", '', trim(setting('business_address')))),
@@ -5361,6 +6156,7 @@ h1{font-size:24px;margin:0 0 4px}.muted{color:#666;font-size:13px}
 table{width:100%;border-collapse:collapse;margin:28px 0}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #ccc;vertical-align:top}
 th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#666}.qty{width:3em;font-weight:700;font-size:17px}
 .tick{width:22px}.tick::before{content:"";display:inline-block;width:14px;height:14px;border:1.5px solid #111;border-radius:2px}
+.sku{font-family:ui-monospace,Menlo,monospace;font-size:13px;white-space:nowrap}
 .note{background:#f4f4f4;padding:12px 16px;border-radius:6px}.bar{max-width:720px;margin:0 auto 12px;text-align:right}
 button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;background:#111;color:#fff;cursor:pointer}
 @media print{body{background:#fff;padding:0}.page{padding:0;max-width:none}.bar{display:none}}
@@ -5368,7 +6164,7 @@ button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;bac
 <div class="top"><div><h1>Order #' . (int)$o['number'] . '</h1><div class="muted">Placed ' . e(gmdate('j F Y', strtotime($o['created'] . ' UTC')))
         . ' · ' . ($o['delivery'] === 'collect' ? 'Collection' : 'Delivery') . '</div></div>
 <div class="to">' . implode('<br>', array_map('e', $to)) . '</div></div>
-<table><thead><tr><th></th><th>Qty</th><th>Item</th></tr></thead><tbody>' . $rows . '</tbody></table>'
+<table><thead><tr><th></th><th>Qty</th><th>Item</th>' . ($skus ? '<th>SKU</th>' : '') . '</tr></thead><tbody>' . $rows . '</tbody></table>'
         . ($o['customer_note'] !== '' ? '<p class="note"><strong>Customer\'s note:</strong> ' . nl2br(e($o['customer_note'])) . '</p>' : '')
         . '<p class="muted" style="margin-top:36px">' . implode(' · ', array_map('e', $biz)) . '</p>
 <p class="muted">Thank you for your order.</p></div></body></html>';
@@ -6311,7 +7107,7 @@ function view_admin_customers(): never
                . '</td><td class="muted">joined ' . e(gmdate('j M Y', strtotime($c['created'] . ' UTC'))) . '</td></tr>';
     }
     $total = (int)db()->query('SELECT COUNT(*) FROM customers')->fetchColumn();
-    admin_shell('Customers', '<div class="topline"><h1>Customers</h1><span><a class="btn quiet" href="' . e(admin_url('licences')) . '">Licences</a> <a class="btn quiet" href="' . e(admin_url('groups')) . '">Customer groups</a></span></div>'
+    admin_shell('Customers', '<h1>Customers</h1>'
         . '<p class="muted"><a href="' . e(admin_url('privacy')) . '">Find a person\'s data</a> (for requests to see or remove their details)</p>'
         . (!accounts_on() ? '<p class="flash">Customer accounts are switched off in Settings, so customers can\'t sign in.</p>' : '')
         . '<form method="get" class="search"><input name="find" value="' . e($q) . '" placeholder="Name, email or postcode" aria-label="Search customers"><button class="quiet">Search</button></form>'
@@ -6780,14 +7576,14 @@ function low_stock_check(int $oid): void
     $hit = [];
     foreach (order_items($oid) as $it) {
         if ($it['variant_id'] !== null) {
-            $st = db()->prepare('SELECT v.stock, v.name AS vname, p.name, p.option_name, p.id AS pid FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = ?');
+            $st = db()->prepare('SELECT v.stock, v.name AS vname, p.name, p.option_name, p.id AS pid, p.backorders FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = ?');
             $st->execute([$it['variant_id']]);
         } else {
-            $st = db()->prepare('SELECT stock, name, id AS pid FROM products WHERE id = ?');
+            $st = db()->prepare('SELECT stock, name, id AS pid, backorders FROM products WHERE id = ?');
             $st->execute([$it['product_id']]);
         }
         $r = $st->fetch();
-        if (!$r || $r['stock'] === null) {
+        if (!$r || $r['stock'] === null || $r['backorders'] !== 'no') {   // products that allow backorders never run out
             continue;
         }
         $now = (int)$r['stock'];
@@ -6871,7 +7667,13 @@ function group_rate(?array $g, array $p): int
     if (!$g) {
         return 0;
     }
-    return $g['rates'][(int)$p['category_id']] ?? (int)$g['percent'];
+    // The main category's own rate, else the nearest category it sits in that has one.
+    foreach (array_reverse(cat_trail((int)$p['category_id'])) as $c) {
+        if (isset($g['rates'][$c['id']])) {
+            return $g['rates'][$c['id']];
+        }
+    }
+    return (int)$g['percent'];
 }
 
 /* What the group takes off one of these, at this price. */
@@ -6881,11 +7683,14 @@ function group_unit_saving(array $p, int $unit): int
     return $rate > 0 ? (int)round($unit * $rate / 100) : 0;
 }
 
+/* What the group takes off these lines. On a line already on sale, only what the
+   group price beats the sale price by (the two never add up). */
 function lines_group_saving(array $lines): int
 {
     $s = 0;
     foreach ($lines as $l) {
-        $s += $l['qty'] * group_unit_saving($l['p'], $l['price']);
+        $full = $l['full'] ?? $l['price'];
+        $s += $l['qty'] * max(0, $l['price'] - ($full - group_unit_saving($l['p'], $full)));
     }
     return $s;
 }
@@ -6904,8 +7709,20 @@ function group_price_html(array $p, int $full, ?string $prefix = null): string
 /* The price on product cards and pages: the customer's own price when it differs. */
 function shop_price_html(array $p, array $vars): string
 {
-    [$lo, $hi] = price_range($p, $vars);
-    return group_price_html($p, $lo, $lo === $hi ? '' : 'From ');
+    if (!$vars) {
+        return own_price_html($p, null);
+    }
+    // The cheapest choice for this customer (sale or group price), "From" when choices differ.
+    $best = null;
+    $prices = [];
+    foreach ($vars as $v) {
+        $own = own_price($p, $v)[0];
+        $prices[$own] = true;
+        if ($best === null || $own < $best[0]) {
+            $best = [$own, $v];
+        }
+    }
+    return own_price_html($p, $best[1], count($prices) > 1 ? 'From ' : '');
 }
 
 function group_offer(array $g): string
@@ -6916,9 +7733,9 @@ function group_offer(array $g): string
     }
     if (!empty($g['rates'])) {
         $names = [];
-        foreach (categories() as $c) {
+        foreach (cat_tree() as $c) {
             if (isset($g['rates'][(int)$c['id']])) {
-                $names[] = $c['name'] . ' ' . $g['rates'][(int)$c['id']] . '%';
+                $names[] = cat_path_name($c['id']) . ' ' . $g['rates'][(int)$c['id']] . '%';
             }
         }
         if ($names) {
@@ -6940,7 +7757,7 @@ function view_admin_groups(): never
         $list .= '<li><div class="pname"><a href="' . e(admin_url('group/' . $g['id'])) . '">' . e($g['name']) . '</a>'
             . '<small>' . e(group_offer($g)) . '</small><small>' . $n . ' customer' . ($n === 1 ? '' : 's') . '</small></div></li>';
     }
-    admin_shell('Customer groups', '<p class="muted"><a href="' . e(admin_url('customers')) . '">&larr; Customers</a></p>'
+    admin_shell('Customer groups', ''
         . '<div class="topline"><h1>Customer groups</h1><a class="btn quiet" href="' . e(admin_url('group/new')) . '">Add a group</a></div>'
         . '<p class="lede">Give a group of customers, like resellers or trade, their own discount. They see their prices whenever they\'re signed in.</p>'
         . (!accounts_on() ? '<p class="flash">Customer accounts are switched off in Settings, so nobody can sign in to get group prices.</p>' : '')
@@ -6955,7 +7772,7 @@ function view_admin_group(string $which): never
     if ($which !== 'new' && !$g) {
         redirect(admin_url('groups'));
     }
-    $cats = categories();
+    $cats = cat_tree();
     $errors = [];
     $v = ['name' => $g['name'] ?? '', 'percent' => $g ? (string)(int)$g['percent'] : '', 'rates' => []];
     foreach ($cats as $c) {
@@ -7011,7 +7828,8 @@ function view_admin_group(string $which): never
             $pdo->prepare('DELETE FROM group_rates WHERE group_id = ?')->execute([$gid]);
             foreach ($cats as $c) {
                 $r = $v['rates'][(int)$c['id']];
-                if ($r !== '' && (int)$r !== (int)$v['percent']) {
+                // A category inside another can need the main rate set explicitly, to undo its parent's.
+                if ($r !== '' && ((int)$r !== (int)$v['percent'] || $c['depth'] > 1)) {
                     $pdo->prepare('INSERT INTO group_rates (group_id, category_id, percent) VALUES (?, ?, ?)')->execute([$gid, $c['id'], (int)$r]);
                 }
             }
@@ -7022,7 +7840,7 @@ function view_admin_group(string $which): never
     }
     $rows = '';
     foreach ($cats as $c) {
-        $rows .= '<tr><td>' . e($c['name']) . '</td><td><div class="price" style="max-width:8rem"><input name="rate[' . (int)$c['id'] . ']" inputmode="numeric" value="'
+        $rows .= '<tr><td style="padding-left:' . (.3 + ($c['depth'] - 1) * 1.5) . 'rem">' . ($c['depth'] > 1 ? '<span class="muted">&rsaquo;</span> ' : '') . e($c['name']) . '</td><td><div class="price" style="max-width:8rem"><input name="rate[' . (int)$c['id'] . ']" inputmode="numeric" value="'
                . e($v['rates'][(int)$c['id']]) . '" placeholder="' . e($v['percent'] === '' ? '0' : $v['percent']) . '" aria-label="Discount on ' . e($c['name']) . '"><span>%</span></div></td></tr>';
     }
     $members = '';
@@ -7034,14 +7852,14 @@ function view_admin_group(string $which): never
                       . '</span></td><td>' . ($c['verified_at'] === '' ? '<span class="pill wait">Email not confirmed yet</span>' : '') . '</td></tr>';
         }
     }
-    admin_shell($g ? $g['name'] : 'New group', '<p class="muted"><a href="' . e(admin_url('groups')) . '">&larr; Customer groups</a></p>'
+    admin_shell($g ? $g['name'] : 'New group', ($g ? '<p class="muted"><a href="' . e(admin_url('groups')) . '">&larr; Customer groups</a></p>' : '')
         . '<h1>' . ($g ? e($g['name']) : 'New customer group') . '</h1>'
         . ($errors ? '<div class="err"><strong>Please check:</strong><ul>' . implode('', array_map(fn($x) => '<li>' . e($x) . '</li>', $errors)) . '</ul></div>' : '')
         . '<form method="post">' . csrf_field()
         . '<label>Name <span class="hint">(customers in the group see it, e.g. "Reseller price")</span><input name="name" value="' . e($v['name']) . '" maxlength="40" required placeholder="Reseller"></label>'
         . '<label>Discount on everything <div class="price" style="max-width:8rem"><input name="percent" inputmode="numeric" value="' . e($v['percent']) . '" placeholder="25"><span>%</span></div></label>'
         . ($cats ? '<h2>Different rates for some categories <span class="hint" style="font-family:inherit;font-size:.85rem">(optional)</span></h2>'
-            . '<p class="muted">Leave a category empty to use the rate above. Put 0 to keep a category at full price. To discount only certain categories, set the rate above to 0 and fill in just those.</p>'
+            . '<p class="muted">Leave a category empty to use the rate above (or the rate of the category it sits in). Put 0 to keep a category at full price. To discount only certain categories, set the rate above to 0 and fill in just those.</p>'
             . '<table>' . $rows . '</table>' : '')
         . '<p class="muted">The discount comes off the goods, not delivery. If a customer also has a discount code, they get whichever saves them more, never both.</p>'
         . '<button>' . ($g ? 'Save group' : 'Add group') . '</button></form>'
@@ -7128,32 +7946,32 @@ function ready_items(array $u): array
         $items[] = compact('title', 'state', 'todo', 'link', 'required');
     };
     $add('Business name, email and address', setting('business_name') !== '' && setting('business_email') !== '' && trim(setting('business_address')) !== '',
-         'UK law expects online sellers to show these. They appear at checkout, on orders and in emails.', admin_url('settings#business'), true);
+         'UK law expects online sellers to show these. They appear at checkout, on orders and in emails.', settings_url('business', 'business'), true);
     $visible = (int)db()->query('SELECT COUNT(*) FROM products WHERE visible = 1')->fetchColumn();
     $add('At least one product in the shop', $visible > 0, 'Add a product with a name, a price and a photo.', admin_url('new'), true);
     $add('Delivery or collection set up', !(can_deliver() && setting('postage_price') === '') && (can_deliver() || can_collect()),
-         'Set a delivery price (0 for free) or offer collection.', admin_url('settings#postage'), true);
+         'Set a delivery price (0 for free) or offer collection.', settings_url('delivery'), true);
     $any = pay_enabled('paypal') || pay_enabled('bank') || pay_enabled('collection');
-    $add('A way to pay', $any, 'Switch on PayPal, bank transfer or pay on collection, and fill in its details.', admin_url('settings#payments'), true);
+    $add('A way to pay', $any, 'Switch on PayPal, bank transfer or pay on collection, and fill in its details.', settings_url('payments'), true);
     if (setting('pay_paypal') === '1') {
         $add('PayPal taking real payments', setting('paypal_mode') === 'live',
-             'PayPal is in Sandbox mode, so payments are pretend. Switch to Live with your live Client ID and Secret.', admin_url('settings#payments'), true);
+             'PayPal is in Sandbox mode, so payments are pretend. Switch to Live with your live Client ID and Secret.', settings_url('payments'), true);
     }
     $sent = (int)db()->query("SELECT COUNT(*) FROM emails WHERE status = 'sent'")->fetchColumn();
     $add('Emails sending', mail_ready() && $sent > 0,
-         mail_ready() ? 'Send yourself a test email to check it arrives.' : 'Fill in your mail server so customers get order confirmations.', admin_url('settings#email'), true);
+         mail_ready() ? 'Send yourself a test email to check it arrives.' : 'Fill in your mail server so customers get order confirmations.', settings_url('email'), true);
     $exposed = data_exposed();
     $add('Private data folder protected', $exposed === null ? null : !$exposed,
          $exposed === null ? 'The shop couldn\'t check this by itself. Open ' . origin() . shop_base() . '/data/shop.db in a browser: it should say Forbidden or Not found, never download.'
                            : 'Anyone can download the shop\'s database. See the red box above for the fix.', admin_url('ready'), true);
-    $add('Demo mode off', !shop_demo(), 'Demo mode stops customers checking out.', admin_url('settings#demo'), true);
+    $add('Demo mode off', !shop_demo(), 'Demo mode stops customers checking out.', settings_url('general', 'demo'), true);
     $add('Secure address (https)', str_starts_with(origin(), 'https:'),
-         'Customers\' details and passwords should only travel encrypted. Turn on SSL with your host (it\'s usually free), then visit the admin over https:// once.', admin_url('settings#site'), true);
+         'Customers\' details and passwords should only travel encrypted. Turn on SSL with your host (it\'s usually free), then visit the admin over https:// once.', settings_url('advanced', 'site'), true);
     $add('Privacy notice linked', setting('privacy_url') !== '',
-         'UK law expects you to tell customers what you do with their details. Link to your privacy page (usually a Wren page).', admin_url('settings#legal'), true);
+         'UK law expects you to tell customers what you do with their details. Link to your privacy page (usually a Wren page).', settings_url('business', 'legal'), true);
     $add('Terms of sale linked', setting('terms_url') !== '',
-         'Link to your terms of sale. Customers tick to say they\'ve read them.', admin_url('settings#legal'), false);
-    $add('Two-factor sign-in for you', $u['totp_secret'] !== '', 'Protects the admin even if your password leaks.', admin_url('settings') . '#twofactor', false);
+         'Link to your terms of sale. Customers tick to say they\'ve read them.', settings_url('business', 'legal'), false);
+    $add('Two-factor sign-in for you', $u['totp_secret'] !== '', 'Protects the admin even if your password leaks.', settings_url('account', 'twofactor'), false);
     $orders = (int)db()->query('SELECT COUNT(*) FROM orders')->fetchColumn();
     $add('A test order placed', $orders > 0, 'Place an order yourself, check the emails, then cancel or refund it.', shop_url(), false);
     return $items;
@@ -7334,7 +8152,7 @@ function view_admin_export(): never
     $ok = fn($d) => $d === '' || DateTimeImmutable::createFromFormat('!Y-m-d', $d);
     if ($what === '' || !$ok($from) || !$ok($to)) {
         $month = (new DateTimeImmutable('first day of last month', new DateTimeZone('Europe/London')));
-        admin_shell('Export orders', '<p class="muted"><a href="' . e(admin_url('orders')) . '">&larr; Orders</a></p><h1>Export orders</h1>'
+        admin_shell('Export orders', '<h1>Export orders</h1>'
             . '<p class="lede">Download orders as a CSV file for a spreadsheet or your bookkeeping. Amounts include VAT, as charged.</p>'
             . ($what !== '' ? '<p class="err">Those dates don\'t look right.</p>' : '')
             . '<form method="get">'
@@ -7359,11 +8177,11 @@ function view_admin_export(): never
     $local = fn(string $t) => $t === '' ? '' : (new DateTimeImmutable($t, new DateTimeZone('UTC')))->setTimezone($tz)->format('Y-m-d H:i');
     $rows = [];
     if ($what === 'lines') {
-        $rows[] = ['Order', 'Date', 'Status', 'Product', 'Option', 'Quantity', 'Unit price', 'Line total'];
+        $rows[] = ['Order', 'Date', 'Status', 'Product', 'Option', 'Quantity', 'Unit price', 'Line total', 'SKU'];
         foreach ($orders as $o) {
             foreach (order_items((int)$o['id']) as $it) {
                 $rows[] = [$o['number'], $local($o['created']), status_label($o['status']), $it['name'], $it['option_label'],
-                           $it['qty'], csv_money((int)$it['unit_pence']), csv_money((int)$it['unit_pence'] * (int)$it['qty'])];
+                           $it['qty'], csv_money((int)$it['unit_pence']), csv_money((int)$it['unit_pence'] * (int)$it['qty']), $it['sku'] ?? ''];
             }
         }
     } else {
@@ -7434,7 +8252,7 @@ function view_admin_privacy(): never
                 'orders' => array_map(fn($o) => array_intersect_key($o, array_flip(['number', 'status', 'payment_method', 'delivery', 'email', 'phone',
                     'bill_name', 'bill_line1', 'bill_line2', 'bill_town', 'bill_postcode', 'ship_name', 'ship_line1', 'ship_line2', 'ship_town', 'ship_postcode',
                     'customer_note', 'total_pence', 'discount_code', 'created', 'paid_at', 'fulfilled', 'fulfilled_at', 'tracking']))
-                    + ['items' => array_map(fn($it) => ['name' => $it['name'], 'option' => $it['option_label'], 'qty' => (int)$it['qty'], 'unit_pence' => (int)$it['unit_pence']], order_items((int)$o['id']))],
+                    + ['items' => array_map(fn($it) => ['name' => $it['name'], 'option' => $it['option_label'], 'sku' => $it['sku'] ?? '', 'qty' => (int)$it['qty'], 'unit_pence' => (int)$it['unit_pence']], order_items((int)$o['id']))],
                     $orders),
                 'emails_sent' => array_map(fn($m) => ['subject' => $m['subject'], 'status' => $m['status'], 'created' => $m['created']], person_emails($email, $orders)),
             ];
@@ -8062,7 +8880,7 @@ function view_admin_licences(): never
                . '<td>' . e($l['cname'] ?: ($l['email'] ?? '(account deleted)')) . '<br><span class="muted">' . e($l['domain']) . '</span></td>'
                . '<td>' . ($l['status'] === 'active' ? '<span class="pill ok">Active</span>' : '<span class="pill">Cancelled</span>') . '</td></tr>';
     }
-    admin_shell('Licences', '<p class="muted"><a href="' . e(admin_url('customers')) . '">&larr; Customers</a></p><h1>Downloads and licences</h1>'
+    admin_shell('Licences', '<h1>Downloads and licences</h1>'
         . '<form method="get" class="search"><input name="find" value="' . e($q) . '" placeholder="Key, website, email or product" aria-label="Search licences"><button class="quiet">Search</button></form>'
         . ($rows !== '' ? '<table>' . $rows . '</table>' : '<p class="muted">' . ($q !== '' ? 'Nothing matches that.' : 'None yet. They appear when someone pays for a download.') . '</p>'));
 }
@@ -8156,6 +8974,1395 @@ function order_licences_html(int $oid): string
     }
     return $rows !== '' ? '<h2>Downloads and licences</h2><table>' . $rows . '</table>' : '';
 }
+/* --------------------------------------------------------- category tree */
+/* 1.2.0: categories can sit inside categories, three levels deep (Cars › SRX2 ›
+   Spares). A product has one main category (products.category_id: its breadcrumb
+   and group rate) and can also show in others (product_categories). A category
+   page shows everything in it and in the categories inside it. */
+
+const CAT_DEPTH = 3;
+
+/* Every category, id => row, in menu order, with parent_id as an int. A parent
+   that has gone (or a loop) makes a category top-level. */
+function cat_all(bool $fresh = false): array
+{
+    static $all = null;
+    if ($all === null || $fresh) {
+        $all = [];
+        foreach (db()->query('SELECT * FROM categories ORDER BY position, name COLLATE NOCASE') as $r) {
+            $r['id'] = (int)$r['id'];
+            $r['parent_id'] = (int)$r['parent_id'];
+            $all[$r['id']] = $r;
+        }
+        foreach ($all as $id => $r) {
+            $seen = [$id => true];
+            for ($p = $r['parent_id']; $p; $p = $all[$p]['parent_id'] ?? 0) {
+                if (!isset($all[$p]) || isset($seen[$p]) || count($seen) > CAT_DEPTH + 2) {
+                    $all[$id]['parent_id'] = 0;
+                    break;
+                }
+                $seen[$p] = true;
+            }
+        }
+    }
+    return $all;
+}
+
+function cat_by_id(int $id): ?array
+{
+    return cat_all()[$id] ?? null;
+}
+
+function cat_children(int $parent): array
+{
+    return array_values(array_filter(cat_all(), fn($c) => $c['parent_id'] === $parent));
+}
+
+/* The category and the ones it sits in, outermost first. */
+function cat_trail(int $id): array
+{
+    $all = cat_all();
+    $trail = [];
+    for ($c = $all[$id] ?? null; $c && count($trail) <= CAT_DEPTH + 2; $c = $all[$c['parent_id']] ?? null) {
+        array_unshift($trail, $c);
+    }
+    return $trail;
+}
+
+function cat_depth(int $id): int
+{
+    return count(cat_trail($id));
+}
+
+/* The category's id and the ids of every category inside it. */
+function cat_descendants(int $id): array
+{
+    $ids = [$id];
+    for ($i = 0; $i < count($ids); $i++) {
+        foreach (cat_children($ids[$i]) as $c) {
+            $ids[] = $c['id'];
+        }
+    }
+    return $ids;
+}
+
+/* How many levels the category and the ones inside it take up: 1 for one with none inside. */
+function cat_height(int $id): int
+{
+    $h = 1;
+    foreach (cat_children($id) as $c) {
+        $h = max($h, 1 + cat_height($c['id']));
+    }
+    return $h;
+}
+
+/* Every category in tree order (each followed by the ones inside it), with 'depth' from 1. */
+function cat_tree(int $parent = 0, int $depth = 1): array
+{
+    $out = [];
+    if ($depth > CAT_DEPTH + 2) {
+        return $out;
+    }
+    foreach (cat_children($parent) as $c) {
+        $c['depth'] = $depth;
+        $out[] = $c;
+        array_push($out, ...cat_tree($c['id'], $depth + 1));
+    }
+    return $out;
+}
+
+/* SQL: product p is in any of these categories, as its main one or an extra one. */
+function cat_in_sql(array $ids, string $p = 'p'): string
+{
+    $list = implode(',', array_map('intval', $ids ?: [0]));
+    return "($p.category_id IN ($list) OR EXISTS (SELECT 1 FROM product_categories pc WHERE pc.product_id = $p.id AND pc.category_id IN ($list)))";
+}
+
+/* Categories with something for sale in them or inside them: id => true. Only
+   these show in the shop's menu. */
+function cat_live(): array
+{
+    static $live = null;
+    if ($live === null) {
+        $live = [];
+        $ids = db()->query('SELECT category_id FROM products WHERE visible = 1 AND category_id > 0
+                            UNION SELECT pc.category_id FROM product_categories pc JOIN products p ON p.id = pc.product_id WHERE p.visible = 1')
+                   ->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($ids as $id) {
+            foreach (cat_trail((int)$id) as $c) {
+                $live[$c['id']] = true;
+            }
+        }
+    }
+    return $live;
+}
+
+/* <option>s for a category menu, in tree order, each named with its full path. $maxDepth leaves out
+   categories too deep to hold what's being placed; $skip leaves out a category and
+   everything inside it (a category can't go inside itself). */
+function cat_options_html(int $selected, string $none = 'None', int $maxDepth = CAT_DEPTH, int $skip = 0): string
+{
+    $out = $none !== '' ? '<option value="0">' . e($none) . '</option>' : '';
+    $skipIds = $skip ? array_flip(cat_descendants($skip)) : [];
+    foreach (cat_tree() as $c) {
+        if ($c['depth'] > $maxDepth || isset($skipIds[$c['id']])) {
+            continue;
+        }
+        // The full path, so a closed menu still says which "Spares" it is.
+        $out .= '<option value="' . $c['id'] . '"' . ($c['id'] === $selected ? ' selected' : '') . '>' . e(cat_path_name($c['id'])) . '</option>';
+    }
+    return $out;
+}
+
+/* A category's name with the ones it sits in: "Cars › SRX2 › Spares". */
+function cat_path_name(int $id): string
+{
+    return implode(' › ', array_column(cat_trail($id), 'name'));
+}
+
+function product_extra_cats(int $pid): array
+{
+    $st = db()->prepare('SELECT category_id FROM product_categories WHERE product_id = ?');
+    $st->execute([$pid]);
+    return array_map('intval', $st->fetchAll(PDO::FETCH_COLUMN));
+}
+
+/* The other categories a product shows in (not its main one, and only ones that exist). */
+function product_set_extra_cats(int $pid, array $ids, int $main): void
+{
+    $all = cat_all();
+    $ids = array_unique(array_filter(array_map('intval', $ids), fn($i) => isset($all[$i]) && $i !== $main));
+    db()->prepare('DELETE FROM product_categories WHERE product_id = ?')->execute([$pid]);
+    $ins = db()->prepare('INSERT INTO product_categories (product_id, category_id) VALUES (?, ?)');
+    foreach ($ids as $i) {
+        $ins->execute([$pid, $i]);
+    }
+}
+
+/* Deleting a category moves what was inside it up a level: its categories, and its
+   products (as their main category, or simply dropped if it was an extra one). */
+function cat_delete(int $id): void
+{
+    $c = cat_by_id($id);
+    if (!$c) {
+        return;
+    }
+    $pdo = db();
+    $pdo->beginTransaction();
+    $pdo->prepare('UPDATE categories SET parent_id = ? WHERE parent_id = ?')->execute([$c['parent_id'], $id]);
+    $pdo->prepare('UPDATE products SET category_id = ? WHERE category_id = ?')->execute([$c['parent_id'], $id]);
+    $pdo->prepare('DELETE FROM product_categories WHERE category_id = ?')->execute([$id]);
+    $pdo->prepare('DELETE FROM product_categories WHERE category_id = ? AND product_id IN (SELECT id FROM products WHERE category_id = ?)')
+        ->execute([$c['parent_id'], $c['parent_id']]);
+    $pdo->prepare('DELETE FROM group_rates WHERE category_id = ?')->execute([$id]);
+    $pdo->prepare('DELETE FROM categories WHERE id = ?')->execute([$id]);
+    $pdo->commit();
+    cat_all(true);
+}
+
+/* Number the categories inside one parent 0, 1, 2… in the order given. */
+function cat_renumber(array $ids): void
+{
+    $st = db()->prepare('UPDATE categories SET position = ? WHERE id = ?');
+    foreach (array_values($ids) as $n => $id) {
+        $st->execute([$n, (int)$id]);
+    }
+}
+
+function cat_next_position(int $parent): int
+{
+    $st = db()->prepare('SELECT COALESCE(MAX(position), -1) + 1 FROM categories WHERE parent_id = ?');
+    $st->execute([$parent]);
+    return (int)$st->fetchColumn();
+}
+
+/* ------------------------------------------------------------------ SKUs */
+
+/* Part numbers are optional, but two products can't share one. Returns the name of
+   another product (or another product's choice) that already has this SKU, or null.
+   Repeats within one product are checked by its form. */
+function sku_taken(string $sku, int $productId = 0): ?string
+{
+    if ($sku === '') {
+        return null;
+    }
+    $st = db()->prepare("SELECT name FROM products WHERE sku = ? COLLATE NOCASE AND id != ?
+                         UNION ALL SELECT p.name || ' (' || v.name || ')' FROM variants v JOIN products p ON p.id = v.product_id
+                         WHERE v.sku = ? COLLATE NOCASE AND v.product_id != ? LIMIT 1");
+    $st->execute([$sku, $productId, $sku, $productId]);
+    $n = $st->fetchColumn();
+    return $n === false ? null : (string)$n;
+}
+
+/* SKUs are letters, numbers and - _ . / and up to 40 long. */
+function sku_clean(string $s): string
+{
+    return mb_substr(trim(preg_replace('/\s+/', ' ', $s)), 0, 40);
+}
+
+function sku_valid(string $s): bool
+{
+    return $s === '' || preg_match('#^[A-Za-z0-9][A-Za-z0-9 ._/\-]*$#', $s) === 1;
+}
+
+/* ------------------------------------------------------------ sale prices */
+/* A product can have a sale price, and so can each choice with a price of its
+   own (a choice at the product's price follows the product's sale price). The
+   optional dates are UK days, first and last day included, so a sale starts and
+   ends by itself. A sale, a customer group's price and a discount code never add
+   up: the customer gets whichever is cheapest (see basket_totals). */
+
+function sale_on(array $p): bool
+{
+    $today = uk_today();
+    return ($p['sale_from'] ?? '') <= $today && (($p['sale_to'] ?? '') === '' || $today <= $p['sale_to']);
+}
+
+/* The sale price of one of these, or null if it isn't on sale today. */
+function sale_unit(array $p, ?array $v): ?int
+{
+    if (!sale_on($p)) {
+        return null;
+    }
+    $full = variant_price($p, $v);
+    $sale = $v && $v['price_pence'] !== null ? ($v['sale_pence'] ?? null) : ($p['sale_pence'] ?? null);
+    return $sale !== null && (int)$sale < $full ? (int)$sale : null;
+}
+
+/* What one costs before any group price or code: the sale price, if on sale. */
+function unit_price(array $p, ?array $v): int
+{
+    return sale_unit($p, $v) ?? variant_price($p, $v);
+}
+
+/* This customer's price for one: [price, full price, why], why being '', 'sale' or 'group'. */
+function own_price(array $p, ?array $v): array
+{
+    $full = variant_price($p, $v);
+    $sale = sale_unit($p, $v);
+    $grp = $full - group_unit_saving($p, $full);
+    if ($sale !== null && $sale <= $grp) {
+        return [$sale, $full, 'sale'];
+    }
+    return [$grp, $full, $grp < $full ? 'group' : ''];
+}
+
+function own_price_html(array $p, ?array $v, string $prefix = ''): string
+{
+    [$own, $full, $why] = own_price($p, $v);
+    if ($why === '') {
+        return $prefix . money($full);
+    }
+    return $prefix . money($own) . ' <s class="shop-was">' . money($full) . '</s> '
+         . ($why === 'group' ? '<small class="shop-yours">' . e(customer_group()['name'] ?? '') . ' price</small>' : '<small class="shop-sale-tag">Sale</small>');
+}
+
+/* Is anything about this product on sale today? */
+function product_on_sale(array $p, array $vars): bool
+{
+    foreach ($vars ?: [null] as $v) {
+        if (sale_unit($p, $v) !== null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* What a day like 2026-12-01 typed into the admin means, or null if it isn't one. */
+function sale_date(string $s): ?string
+{
+    $s = trim($s);
+    if ($s === '') {
+        return '';
+    }
+    $d = DateTimeImmutable::createFromFormat('!Y-m-d', $s);
+    return $d && $d->format('Y-m-d') === $s ? $s : null;
+}
+
+/* ------------------------------------------------------------- backorders */
+/* A product can keep selling when its counted stock runs out: stock goes below
+   zero and the product is never shown as sold out. "notify" also tells the
+   customer which items are on backorder. */
+
+const BACKORDER_CHOICES = ['no' => 'Stop selling (show Sold out)', 'yes' => 'Keep selling', 'notify' => 'Keep selling, and tell customers it\'s on backorder'];
+
+function backorders_on(array $p): bool
+{
+    return ($p['backorders'] ?? 'no') !== 'no' && (($p['kind'] ?? 'physical') === 'physical');
+}
+
+function backorder_told(array $p): bool
+{
+    return ($p['backorders'] ?? 'no') === 'notify' && backorders_on($p);
+}
+
+/* How many of $qty are beyond the stock in hand (0 if stock isn't counted). */
+function backorder_qty(array $p, ?array $v, int $qty): int
+{
+    if (!backorders_on($p)) {
+        return 0;
+    }
+    $s = $v ? $v['stock'] : $p['stock'];
+    return $s === null ? 0 : max(0, $qty - max(0, (int)$s));
+}
+
+/* "On backorder" or "2 on backorder", for a line the customer is told about. */
+function backorder_note(int $n, int $qty): string
+{
+    return $n >= $qty ? 'On backorder' : $n . ' on backorder';
+}
+
+/* Whether customers are told about backorders for a product (old orders look the product up). */
+function product_tells_backorders(int $pid): bool
+{
+    static $cache = [];
+    if (!isset($cache[$pid])) {
+        $st = db()->prepare('SELECT * FROM products WHERE id = ?');
+        $st->execute([$pid]);
+        $p = $st->fetch();
+        $cache[$pid] = $p ? backorder_told($p) : false;
+    }
+    return $cache[$pid];
+}
+/* ================================================ product import and export */
+/* 1.2.0. A spreadsheet of products, for bulk price and stock changes from a
+   supplier's list, or for moving in from another shop. Export writes one row per
+   product, or one row per choice for a product with options. Import matches each
+   row to a product by SKU, then by web address (slug), and otherwise adds a new,
+   hidden product. A blank cell leaves that value as it is, so a file with just
+   sku and price columns is a price update; a cell holding only "-" clears it.
+   Every import is checked first: the same code runs inside a transaction that is
+   rolled back, so the preview shows exactly what applying it will do. Applying
+   is one transaction too, so it all goes in or none of it does. */
+
+const PRODUCT_CSV_COLUMNS = ['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'stock', 'backorders', 'visible',
+                             'main_category', 'categories', 'option_name', 'choice', 'choice_sku', 'choice_price', 'choice_sale_price', 'description'];
+const IMPORT_MAX_ROWS = 20000;
+const IMPORT_SHOW_CHANGES = 50;
+
+/* "Cars > SRX2 > Spares" for a category id. */
+function cat_csv_path(int $id): string
+{
+    return implode(' > ', array_column(cat_trail($id), 'name'));
+}
+
+/* --------------------------------------------------------------- export */
+
+function admin_export_products(): never
+{
+    require_admin();
+    $cats = fn(array $ids) => implode(' | ', array_map('cat_csv_path', array_filter($ids, fn($i) => cat_by_id($i))));
+    $extra = [];
+    foreach (db()->query('SELECT product_id, category_id FROM product_categories ORDER BY product_id, category_id') as $r) {
+        $extra[(int)$r['product_id']][] = (int)$r['category_id'];
+    }
+    $vars = [];
+    foreach (db()->query('SELECT * FROM variants ORDER BY product_id, position, id') as $v) {
+        $vars[(int)$v['product_id']][] = $v;
+    }
+    $num = fn($x) => $x === null ? '' : (string)(int)$x;
+    $money = fn($x) => $x === null ? '' : price_input((int)$x);
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="products-' . gmdate('Y-m-d') . '.csv"');
+    header('Cache-Control: no-store');
+    echo "\xEF\xBB\xBF", implode(',', array_map('csv_cell', PRODUCT_CSV_COLUMNS)), "\r\n";
+    foreach (db()->query('SELECT * FROM products ORDER BY id') as $p) {
+        $base = [$p['sku'], $p['slug'], $p['name'], price_input((int)$p['price_pence']), $money($p['sale_pence']), $p['sale_from'], $p['sale_to'],
+                 $num($p['stock']), $p['backorders'], (int)$p['visible'], (int)$p['category_id'] && cat_by_id((int)$p['category_id']) ? cat_csv_path((int)$p['category_id']) : '',
+                 $cats(array_diff($extra[(int)$p['id']] ?? [], [(int)$p['category_id']])), $p['option_name']];
+        $rows = [];
+        foreach ($vars[(int)$p['id']] ?? [] as $v) {   // a row per choice; stock is the choice's own
+            $r = $base;
+            $r[7] = $num($v['stock']);
+            $rows[] = array_merge($r, [$v['name'], $v['sku'], $money($v['price_pence']), $money($v['sale_pence']), $p['description']]);
+        }
+        $rows = $rows ?: [array_merge($base, ['', '', '', '', $p['description']])];
+        foreach ($rows as $r) {
+            echo implode(',', array_map('csv_cell', $r)), "\r\n";
+        }
+    }
+    exit;
+}
+
+/* --------------------------------------------------------------- reading */
+
+/* The file as rows of column => text, keyed by spreadsheet row number (the
+   header is row 1). Problems with the file as a whole go in $errors. */
+function import_read(string $path, array &$errors, array &$warnings): array
+{
+    $raw = (string)@file_get_contents($path);
+    if (str_starts_with($raw, "\xEF\xBB\xBF")) {
+        $raw = substr($raw, 3);
+    }
+    if (trim($raw) === '') {
+        $errors[] = [0, 'The file is empty.'];
+        return [];
+    }
+    if (!mb_check_encoding($raw, 'UTF-8')) {   // saved by older Excel: Windows-1252
+        $raw = mb_convert_encoding($raw, 'UTF-8', 'Windows-1252');
+    }
+    $first = strtok($raw, "\n");
+    $sep = substr_count($first, ';') > substr_count($first, ',') ? ';' : (substr_count($first, "\t") > substr_count($first, ',') ? "\t" : ',');
+    $fh = fopen('php://temp', 'r+');
+    fwrite($fh, $raw);
+    rewind($fh);
+    $head = fgetcsv($fh, null, $sep, '"', '');
+    $cols = array_map(fn($h) => strtolower(str_replace([' ', '-'], '_', trim((string)$h))), $head ?: []);
+    $known = array_flip(PRODUCT_CSV_COLUMNS);
+    if (!array_intersect($cols, ['sku', 'slug', 'name'])) {
+        $errors[] = [1, 'The first row should name the columns, with at least one of sku, slug or name. See the list of columns below.'];
+        return [];
+    }
+    if ($odd = array_diff(array_filter($cols, fn($c) => $c !== ''), PRODUCT_CSV_COLUMNS)) {
+        $warnings[] = 'These columns aren\'t ones the shop knows, so they were left out: ' . implode(', ', $odd) . '.';
+    }
+    if (count($cols) !== count(array_unique($cols))) {
+        $errors[] = [1, 'A column name appears twice.'];
+        return [];
+    }
+    $rows = [];
+    $n = 1;
+    while (($r = fgetcsv($fh, null, $sep, '"', '')) !== false) {
+        $n++;
+        if ($r === [null] || !array_filter($r, fn($x) => trim((string)$x) !== '')) {
+            continue;   // a blank row
+        }
+        if (count($rows) >= IMPORT_MAX_ROWS) {
+            $errors[] = [$n, 'The file has more than ' . number_format(IMPORT_MAX_ROWS) . ' rows. Split it into smaller files.'];
+            break;
+        }
+        $row = [];
+        foreach ($cols as $i => $c) {
+            if (isset($known[$c])) {
+                $v = (string)($r[$i] ?? '');
+                // csv_cell() puts ' before text a spreadsheet would read as a formula; take it off again.
+                if (strlen($v) > 1 && $v[0] === "'" && strpbrk($v[1], "=+-@\t\r") !== false) {
+                    $v = substr($v, 1);
+                }
+                $row[$c] = $c === 'description' ? trim(str_replace("\r\n", "\n", $v)) : trim($v);
+            }
+        }
+        $rows[$n] = $row;
+    }
+    fclose($fh);
+    if (!$rows && !$errors) {
+        $errors[] = [0, 'The file has a header row but no products.'];
+    }
+    return $rows;
+}
+
+/* A day typed into a spreadsheet: 2026-12-01, or 01/12/2026 as Excel shows it in the UK. */
+function import_date(string $s): ?string
+{
+    if (preg_match('#^(\d{1,2})/(\d{1,2})/(\d{4})$#', $s, $m)) {
+        $s = sprintf('%04d-%02d-%02d', $m[3], $m[2], $m[1]);
+    }
+    return sale_date($s);
+}
+
+function import_bool(string $s): ?int
+{
+    $s = strtolower($s);
+    return in_array($s, ['1', 'yes', 'y', 'true'], true) ? 1 : (in_array($s, ['0', 'no', 'n', 'false'], true) ? 0 : null);
+}
+
+/* A category path like "Cars > SRX2 > Spares": its id, made if it doesn't exist yet. */
+function import_cat(string $path, array &$made, ?string &$err): int
+{
+    $names = array_values(array_filter(array_map('trim', explode('>', $path)), fn($x) => $x !== ''));
+    if (!$names) {
+        return 0;
+    }
+    if (count($names) > CAT_DEPTH) {
+        $err = 'The category ' . $path . ' is more than ' . CAT_DEPTH . ' levels deep.';
+        return 0;
+    }
+    $parent = 0;
+    foreach ($names as $i => $name) {
+        if (mb_strlen($name) > 60) {
+            $err = 'The category name ' . $name . ' is longer than 60 characters.';
+            return 0;
+        }
+        $found = 0;
+        foreach (cat_children($parent) as $c) {
+            if (mb_strtolower($c['name']) === mb_strtolower($name)) {
+                $found = $c['id'];
+                break;
+            }
+        }
+        if (!$found) {
+            db()->prepare('INSERT INTO categories (name, slug, position, parent_id) VALUES (?, ?, ?, ?)')
+                ->execute([$name, unique_slug('categories', slugify(implode(' ', array_slice($names, 0, $i + 1)))), cat_next_position($parent), $parent]);
+            $found = (int)db()->lastInsertId();
+            cat_all(true);
+            $made[] = implode(' > ', array_slice($names, 0, $i + 1));
+        }
+        $parent = $found;
+    }
+    return $parent;
+}
+
+/* --------------------------------------------------------------- importing */
+
+/* Runs the import. With $apply false it's undone afterwards: a preview. Returns a
+   report: counts, the changes (product label => [[field, before, after]...]), errors
+   ([row, message]) and warnings. Nothing is kept if there are any errors. */
+function import_run(array $rows, bool $apply): array
+{
+    $pdo = db();
+    $rep = ['new' => 0, 'changed' => 0, 'same' => 0, 'choices' => 0, 'cats' => [], 'changes' => [], 'errors' => [], 'warnings' => [], 'hidden' => 0];
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $touched = [];   // product id => 'new' | 'changed' | 'same'
+        $firstRow = [];  // product id => [field => [value, row]] (rows for one product must agree)
+        $byName = [];    // new products with no sku or slug, by name, so their choice rows find them
+        $err = function (int $row, string $msg) use (&$rep) {
+            $rep['errors'][] = [$row, $msg];
+        };
+        $note = function (int $pid, string $label, string $field, string $before, string $after) use (&$rep) {
+            if ($before !== $after) {
+                $rep['changes'][$pid]['label'] = $label;
+                $rep['changes'][$pid]['diff'][] = [$field, $before, $after];
+            }
+        };
+        $money = fn($x) => $x === null ? '' : price_input((int)$x);
+        $findBy = function (string $col, string $val): ?array {
+            $st = db()->prepare("SELECT * FROM products WHERE $col = ?" . ($col === 'sku' ? ' COLLATE NOCASE' : '') . ' LIMIT 1');
+            $st->execute([$val]);
+            return $st->fetch() ?: null;
+        };
+        foreach ($rows as $n => $r) {
+            $g = fn(string $k) => $r[$k] ?? '';   // '' = column missing or cell blank: leave as it is
+            $before = count($rep['errors']);
+            $sku = sku_clean($g('sku'));
+            $slug = $g('slug');
+            // ---- which product
+            $bySku = $sku !== '' && $sku !== '-' ? $findBy('sku', $sku) : null;
+            $bySlug = $slug !== '' ? $findBy('slug', $slug) : null;
+            if ($bySku && $bySlug && (int)$bySku['id'] !== (int)$bySlug['id']) {
+                $err($n, 'SKU ' . $sku . ' belongs to ' . $bySku['name'] . ', but the web address ' . $slug . ' belongs to ' . $bySlug['name'] . '.');
+                continue;
+            }
+            $p = $bySku ?? $bySlug;
+            if (!$p && $sku === '' && $slug === '' && $g('name') !== '' && isset($byName[mb_strtolower($g('name'))])) {
+                $p = product_by_id($byName[mb_strtolower($g('name'))]);
+            }
+            $isNew = false;
+            if (!$p) {
+                $price = parse_price($g('price'));
+                if ($g('name') === '' || $price === null) {
+                    $err($n, 'No product has ' . ($sku !== '' ? 'SKU ' . $sku : ($slug !== '' ? 'the web address ' . $slug : 'this name'))
+                        . '. To add it as a new product, give it a name and a price.');
+                    continue;
+                }
+                if ($sku !== '' && !sku_valid($sku)) {
+                    $err($n, 'The SKU ' . $sku . ' can only have letters, numbers, spaces and . _ / - in it.');
+                    continue;
+                }
+                if ($sku !== '' && ($who = sku_taken($sku, 0)) !== null) {
+                    $err($n, 'The SKU ' . $sku . ' is already used by ' . $who . '.');
+                    continue;
+                }
+                $pdo->prepare('INSERT INTO products (slug, name, price_pence, description, visible, sku, created, updated) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
+                    ->execute([unique_slug('products', slugify($slug !== '' ? $slug : $g('name'))), mb_substr($g('name'), 0, 120), $price,
+                               $g('description'), $sku === '-' ? '' : $sku, now(), now()]);
+                $p = product_by_id((int)$pdo->lastInsertId());
+                $isNew = true;
+                if ($sku === '' && $slug === '') {
+                    $byName[mb_strtolower($g('name'))] = (int)$p['id'];
+                }
+            }
+            $pid = (int)$p['id'];
+            $label = $p['name'] . ($p['sku'] !== '' ? ' (' . $p['sku'] . ')' : '');
+            $touched[$pid] ??= $isNew ? 'new' : 'same';
+            // ---- the product's own fields (every row for a product must agree on these)
+            $set = [];
+            foreach (['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'backorders', 'visible', 'main_category', 'categories', 'option_name', 'description'] as $f) {
+                if ($g($f) === '') {
+                    continue;
+                }
+                if (isset($firstRow[$pid][$f]) && $firstRow[$pid][$f][0] !== $g($f)) {
+                    $err($n, 'The ' . $f . ' differs from row ' . $firstRow[$pid][$f][1] . ', which is the same product.');
+                    continue;
+                }
+                $firstRow[$pid][$f] ??= [$g($f), $n];
+                if (!($isNew && in_array($f, ['name', 'price', 'description'], true))) {   // already saved when it was added
+                    $set[$f] = $g($f);
+                }
+            }
+            $isChoice = $g('choice') !== '';
+            if (!$isChoice && $g('stock') !== '') {
+                $set['stock'] = $g('stock');
+            }
+            $upd = [];
+            if (isset($set['sku']) && !$isNew) {
+                $v = $set['sku'] === '-' ? '' : sku_clean($set['sku']);
+                if (!sku_valid($v)) {
+                    $err($n, 'The SKU ' . $v . ' can only have letters, numbers, spaces and . _ / - in it.');
+                } elseif (($who = sku_taken($v, $pid)) !== null) {
+                    $err($n, 'The SKU ' . $v . ' is already used by ' . $who . '.');
+                } else {
+                    $upd['sku'] = [$p['sku'], $v, 'SKU'];
+                }
+            }
+            if (isset($set['slug']) && !$isNew && $set['slug'] !== $p['slug']) {
+                $v = slugify($set['slug']);
+                if ($v !== $set['slug'] || unique_slug('products', $v, $pid) !== $v) {
+                    $err($n, 'The web address ' . $set['slug'] . ' isn\'t free or isn\'t made of lower-case letters, numbers and dashes.');
+                } else {
+                    $upd['slug'] = [$p['slug'], $v, 'web address'];
+                }
+            }
+            if (isset($set['name'])) {
+                $upd['name'] = [$p['name'], mb_substr($set['name'], 0, 120), 'name'];
+            }
+            $price = (int)$p['price_pence'];
+            if (isset($set['price'])) {
+                $v = parse_price($set['price']);
+                if ($v === null) {
+                    $err($n, 'The price ' . $set['price'] . ' isn\'t a price like 12.50.');
+                } else {
+                    $upd['price_pence'] = [$p['price_pence'], $v, 'price'];
+                    $price = $v;
+                }
+            }
+            if (isset($set['sale_price'])) {
+                $v = $set['sale_price'] === '-' ? null : parse_price($set['sale_price']);
+                if ($set['sale_price'] !== '-' && $v === null) {
+                    $err($n, 'The sale price ' . $set['sale_price'] . ' isn\'t a price like 9.99.');
+                } else {
+                    $upd['sale_pence'] = [$p['sale_pence'], $v, 'sale price'];
+                }
+            }
+            $sale = array_key_exists('sale_pence', $upd) ? $upd['sale_pence'][1] : $p['sale_pence'];
+            if ($sale !== null && (int)$sale >= $price && count($rep['errors']) === $before) {
+                $err($n, 'The sale price (' . money((int)$sale) . ') should be less than the price (' . money($price) . ').');
+            }
+            foreach (['sale_from' => 'sale starts', 'sale_to' => 'sale ends'] as $f => $what) {
+                if (isset($set[$f])) {
+                    $v = $set[$f] === '-' ? '' : import_date($set[$f]);
+                    if ($v === null) {
+                        $err($n, 'The ' . $f . ' date ' . $set[$f] . ' isn\'t a day like 2026-12-01 or 01/12/2026.');
+                    } else {
+                        $upd[$f] = [$p[$f], $v, $what];
+                    }
+                }
+            }
+            $sf = $upd['sale_from'][1] ?? $p['sale_from'];
+            $st = $upd['sale_to'][1] ?? $p['sale_to'];
+            if ($sf !== '' && $st !== '' && $st < $sf) {
+                $err($n, 'The sale ends before it starts.');
+            }
+            if (isset($set['backorders'])) {
+                $v = strtolower($set['backorders']);
+                if (!isset(BACKORDER_CHOICES[$v])) {
+                    $err($n, 'backorders should be no, yes or notify, not ' . $set['backorders'] . '.');
+                } else {
+                    $upd['backorders'] = [$p['backorders'], $v, 'when stock runs out'];
+                }
+            }
+            $bo = $upd['backorders'][1] ?? $p['backorders'];
+            $stockOk = fn(string $s) => $s === '-' || (preg_match('/^-?\d{1,6}$/', $s) && ((int)$s >= 0 || $bo !== 'no'));
+            if (isset($set['stock'])) {
+                if (!$stockOk($set['stock'])) {
+                    $err($n, 'Stock should be a whole number (below zero only for a product that keeps selling), or - to stop counting.');
+                } else {
+                    $upd['stock'] = [$p['stock'], $set['stock'] === '-' ? null : (int)$set['stock'], 'stock'];
+                }
+            }
+            if (isset($set['visible'])) {
+                $v = import_bool($set['visible']);
+                if ($v === null) {
+                    $err($n, 'visible should be 1 or 0 (or yes or no).');
+                } else {
+                    $upd['visible'] = [$p['visible'], $v, 'in the shop'];
+                }
+            }
+            if (isset($set['option_name'])) {
+                $upd['option_name'] = [$p['option_name'], $set['option_name'] === '-' ? '' : mb_substr($set['option_name'], 0, 40), 'option name'];
+            }
+            if (isset($set['description'])) {
+                $upd['description'] = [$p['description'], $set['description'] === '-' ? '' : $set['description'], 'description'];
+            }
+            $main = (int)$p['category_id'];
+            if (isset($set['main_category'])) {
+                $e = null;
+                $v = $set['main_category'] === '-' ? 0 : import_cat($set['main_category'], $rep['cats'], $e);
+                if ($e !== null) {
+                    $err($n, $e);
+                } else {
+                    $upd['category_id'] = [$main, $v, 'category'];
+                    $main = $v;
+                }
+            }
+            $extraNow = array_values(array_diff(product_extra_cats($pid), [$main]));   // the main one never counts twice
+            $extraNew = null;
+            if (isset($set['categories'])) {
+                $extraNew = [];
+                foreach ($set['categories'] === '-' ? [] : array_filter(array_map('trim', explode('|', $set['categories']))) as $path) {
+                    $e = null;
+                    $id = import_cat($path, $rep['cats'], $e);
+                    if ($e !== null) {
+                        $err($n, $e);
+                    } elseif ($id && $id !== $main) {
+                        $extraNew[] = $id;
+                    }
+                }
+                $extraNew = array_values(array_unique($extraNew));
+            }
+            // ---- a choice
+            $vrow = null;
+            $vupd = [];
+            if ($isChoice) {
+                $cname = mb_substr($g('choice'), 0, 60);
+                $csku = sku_clean($g('choice_sku'));
+                $vars = product_variants($pid);
+                foreach ($vars as $x) {
+                    if ($csku !== '' && $csku !== '-' && strcasecmp($x['sku'], $csku) === 0) {
+                        $vrow = $x;
+                    }
+                }
+                foreach ($vrow ? [] : $vars as $x) {
+                    if (mb_strtolower($x['name']) === mb_strtolower($cname)) {
+                        $vrow = $x;
+                    }
+                }
+                if ($csku !== '' && $csku !== '-') {
+                    if (!sku_valid($csku)) {
+                        $err($n, 'The choice SKU ' . $csku . ' can only have letters, numbers, spaces and . _ / - in it.');
+                    } elseif (($who = sku_taken($csku, $pid)) !== null) {
+                        $err($n, 'The choice SKU ' . $csku . ' is already used by ' . $who . '.');
+                    } elseif (strcasecmp($upd['sku'][1] ?? $p['sku'], $csku) === 0
+                              || array_filter($vars, fn($x) => strcasecmp($x['sku'], $csku) === 0 && (!$vrow || $x['id'] !== $vrow['id']))) {
+                        $err($n, 'The choice SKU ' . $csku . ' is used twice on ' . $p['name'] . '.');
+                    }
+                }
+                $cprice = null;
+                $cp = $g('choice_price');
+                if ($cp !== '' && $cp !== '-' && ($cprice = parse_price($cp)) === null) {
+                    $err($n, 'The choice price ' . $cp . ' isn\'t a price.');
+                }
+                $own = $cp === '' ? ($vrow['price_pence'] ?? null) : ($cp === '-' ? null : $cprice);
+                $cs = $g('choice_sale_price');
+                $csale = $cs === '' ? ($vrow['sale_pence'] ?? null) : ($cs === '-' ? null : parse_price($cs));
+                if ($cs !== '' && $cs !== '-' && $csale === null) {
+                    $err($n, 'The choice sale price ' . $cs . ' isn\'t a price.');
+                } elseif ($csale !== null && $own === null) {
+                    $err($n, 'The choice ' . $cname . ' has a sale price but no price of its own.');
+                } elseif ($csale !== null && (int)$csale >= (int)$own) {
+                    $err($n, 'The sale price for ' . $cname . ' should be less than its price.');
+                }
+                if ($g('stock') !== '' && !$stockOk($g('stock'))) {
+                    $err($n, 'Stock for ' . $cname . ' should be a whole number (below zero only for a product that keeps selling), or - to stop counting.');
+                }
+                if (count($rep['errors']) === $before) {
+                    $vals = ['name' => $cname, 'sku' => $csku === '' ? ($vrow['sku'] ?? '') : ($csku === '-' ? '' : $csku),
+                             'price_pence' => $own, 'sale_pence' => $csale,
+                             'stock' => $g('stock') === '' ? ($vrow['stock'] ?? null) : ($g('stock') === '-' ? null : (int)$g('stock'))];
+                    if (!$vrow) {
+                        $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), -1) + 1 FROM variants WHERE product_id = ' . $pid)->fetchColumn();
+                        $pdo->prepare('INSERT INTO variants (product_id, name, sku, price_pence, sale_pence, stock, position) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                            ->execute([$pid, $vals['name'], $vals['sku'], $vals['price_pence'], $vals['sale_pence'], $vals['stock'], $pos]);
+                        $rep['choices']++;
+                        $note($pid, $label, 'choice ' . $cname, '', 'added');
+                        if (!$vars) {   // its first choice: stock is counted per choice from now on
+                            $upd['stock'] = [$p['stock'], null, 'stock'];
+                            if (($upd['option_name'][1] ?? $p['option_name']) === '') {
+                                $upd['option_name'] = [$p['option_name'], 'Option', 'option name'];
+                            }
+                        }
+                    } else {
+                        foreach ($vals as $k => $x) {
+                            $was = $vrow[$k];
+                            $fmt = in_array($k, ['price_pence', 'sale_pence'], true) ? $money : fn($y) => $y === null ? '' : (string)$y;
+                            if ($fmt($was) !== $fmt($x)) {
+                                $vupd[$k] = $x;
+                                $note($pid, $label, $cname . ' ' . ['name' => 'name', 'sku' => 'SKU', 'price_pence' => 'price', 'sale_pence' => 'sale price', 'stock' => 'stock'][$k], $fmt($was), $fmt($x));
+                            }
+                        }
+                        if ($vupd) {
+                            $pdo->prepare('UPDATE variants SET ' . implode(', ', array_map(fn($k) => "$k = ?", array_keys($vupd))) . ' WHERE id = ?')
+                                ->execute([...array_values($vupd), $vrow['id']]);
+                        }
+                    }
+                }
+            }
+            if (count($rep['errors']) !== $before) {
+                continue;
+            }
+            // ---- save the product's changes
+            $fmt = fn($k, $x) => $x === null ? '' : (in_array($k, ['price_pence', 'sale_pence'], true) ? $money($x)
+                 : ($k === 'category_id' ? ((int)$x ? cat_csv_path((int)$x) : '') : ($k === 'visible' ? ((int)$x ? 'yes' : 'no') : (string)$x)));
+            $changes = [];
+            if (isset($upd['visible']) && (int)$upd['visible'][1] === 1 && !(int)$p['visible'] && !product_photos($pid)) {
+                unset($upd['visible']);   // never on sale without a photo
+                $rep['hidden']++;
+            }
+            foreach ($upd as $k => [$was, $now, $what]) {
+                if ($fmt($k, $was) !== $fmt($k, $now)) {
+                    $changes[$k] = $now;
+                    $note($pid, $label, $what, $k === 'description' ? mb_strimwidth((string)$was, 0, 60, '…') : $fmt($k, $was),
+                          $k === 'description' ? mb_strimwidth((string)$now, 0, 60, '…') : $fmt($k, $now));
+                }
+            }
+            if ($changes) {
+                $changes['updated'] = now();
+                $pdo->prepare('UPDATE products SET ' . implode(', ', array_map(fn($k) => "$k = ?", array_keys($changes))) . ' WHERE id = ?')
+                    ->execute([...array_values($changes), $pid]);
+            }
+            if ($extraNew !== null && (array_diff($extraNew, $extraNow) || array_diff($extraNow, $extraNew))) {
+                $note($pid, $label, 'also in', implode(' | ', array_map('cat_csv_path', $extraNow)), implode(' | ', array_map('cat_csv_path', $extraNew)));
+                product_set_extra_cats($pid, $extraNew, $main);
+            }
+            if ($touched[$pid] === 'same' && isset($rep['changes'][$pid])) {
+                $touched[$pid] = 'changed';
+            }
+        }
+        foreach ($touched as $pid => $how) {
+            $rep[$how]++;
+            if ($how === 'new') {
+                $rep['changes'][$pid]['new'] = true;
+                $rep['changes'][$pid]['label'] ??= (string)product_by_id($pid)['name'];
+            }
+        }
+        $rep['cats'] = array_values(array_unique($rep['cats']));
+        if ($apply && !$rep['errors']) {
+            $pdo->exec('COMMIT');
+        } else {
+            $pdo->exec('ROLLBACK');
+        }
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+        throw $e;
+    }
+    cat_all(true);
+    return $rep;
+}
+
+/* ------------------------------------------------------------------- page */
+
+function import_file(string $token): string
+{
+    return data_dir() . '/import-' . $token . '.csv';
+}
+
+function view_admin_import(): never
+{
+    require_admin();
+    if (($_GET['export'] ?? '') === 'products') {
+        admin_export_products();
+    }
+    foreach (glob(data_dir() . '/import-*.csv') ?: [] as $old) {   // checked but never applied
+        if (filemtime($old) < time() - 86400) {
+            @unlink($old);
+        }
+    }
+    $report = '';
+    if (is_post()) {
+        csrf_check();
+        if (post('do') === 'apply') {
+            $token = (string)($_SESSION['shop_import'] ?? '');
+            if ($token === '' || !hash_equals($token, post('token')) || !is_file(import_file($token))) {
+                flash('That check has expired. Please upload the file again.');
+                redirect(admin_url('import'));
+            }
+            $errors = $warnings = [];
+            $rows = import_read(import_file($token), $errors, $warnings);
+            $rep = $errors ? null : import_run($rows, true);
+            @unlink(import_file($token));
+            unset($_SESSION['shop_import']);
+            if ($errors || $rep['errors']) {
+                flash('The file has problems now, so nothing was imported. Please check it again.');
+                redirect(admin_url('import'));
+            }
+            flash('Imported: ' . import_counts($rep) . '.' . ($rep['new'] ? ' New products are hidden until you add photos and show them.' : ''));
+            redirect(url_with(admin_url(), $rep['new'] ? ['show' => 'hidden'] : []));
+        }
+        $f = $_FILES['file'] ?? null;
+        if (!is_array($f) || ($f['error'] ?? 1) !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {
+            flash(($f['error'] ?? 0) === UPLOAD_ERR_INI_SIZE ? 'That file is bigger than this server accepts. ' . upload_limit_text() : 'Choose a CSV file to check.');
+            redirect(admin_url('import'));
+        }
+        $token = bin2hex(random_bytes(12));
+        move_uploaded_file($f['tmp_name'], import_file($token));
+        @chmod(import_file($token), 0600);
+        $errors = $warnings = [];
+        $started = microtime(true);
+        $rows = import_read(import_file($token), $errors, $warnings);
+        $rep = $errors ? ['errors' => $errors, 'warnings' => [], 'changes' => [], 'new' => 0, 'changed' => 0, 'same' => 0, 'choices' => 0, 'cats' => [], 'hidden' => 0]
+                       : import_run($rows, false);
+        $rep['warnings'] = array_merge($warnings, $rep['warnings']);
+        $_SESSION['shop_import'] = $token;
+        $report = import_report_html($rep, count($rows), (string)$f['name'], $token, microtime(true) - $started);
+    }
+    $cols = '<table class="cols"><tr><th>Column</th><th>What goes in it</th></tr>'
+        . '<tr><td><code>sku</code></td><td>Your part number. Rows are matched to products by SKU first.</td></tr>'
+        . '<tr><td><code>slug</code></td><td>The product\'s web address, the part after /shop/p/. Matched next.</td></tr>'
+        . '<tr><td><code>name</code>, <code>price</code></td><td>Needed for a new product. Prices like 12.50.</td></tr>'
+        . '<tr><td><code>sale_price</code>, <code>sale_from</code>, <code>sale_to</code></td><td>A sale, with optional first and last days (2026-12-01 or 01/12/2026).</td></tr>'
+        . '<tr><td><code>stock</code></td><td>How many you have. On a choice\'s row, that choice\'s stock.</td></tr>'
+        . '<tr><td><code>backorders</code></td><td><code>no</code>, <code>yes</code> or <code>notify</code>: what happens when stock runs out.</td></tr>'
+        . '<tr><td><code>visible</code></td><td>1 to show in the shop, 0 to hide. A product without a photo stays hidden.</td></tr>'
+        . '<tr><td><code>main_category</code></td><td>A path like <code>Cars &gt; SRX2 &gt; Spares</code>. Categories that don\'t exist yet are made.</td></tr>'
+        . '<tr><td><code>categories</code></td><td>Other categories it shows in, separated by <code>|</code>.</td></tr>'
+        . '<tr><td><code>option_name</code>, <code>choice</code>, <code>choice_sku</code>, <code>choice_price</code>, <code>choice_sale_price</code></td>'
+        . '<td>For a product with options (like sizes), one row per choice. Leave choice_price empty for the product\'s price.</td></tr>'
+        . '<tr><td><code>description</code></td><td>Paragraphs and lists as in the product form.</td></tr></table>';
+    admin_shell('Import and export', '<h1>Import and export products</h1>' . $report
+        . ($report === '' ? '<h2>Export</h2>
+      <p class="muted">Every product as a spreadsheet: one row per product, or one row per choice for a product with options.
+      Change it in Excel or Numbers, save it as CSV, and import it here.</p>
+      <p><a class="btn quiet" href="' . e(admin_url('import') . (str_contains(admin_url('import'), '?') ? '&' : '?') . 'export=products') . '">Download products (CSV)</a></p>
+      <h2>Import</h2>
+      <p class="muted">Rows are matched to products by SKU, then by web address. Anything else becomes a new product, hidden until you
+      add photos. A blank cell leaves that value as it is, so a file with just <code>sku</code> and <code>price</code> columns is a price
+      update. To clear a value (a sale price, say), put a single <code>-</code> in its cell. Nothing is ever deleted.</p>
+      <form method="post" enctype="multipart/form-data">' . csrf_field() . '
+        <label>CSV file <input type="file" name="file" accept=".csv,text/csv" required></label>
+        <button>Check this file</button></form>
+      <p class="muted">You\'ll see what would change before anything does. This server accepts files up to ' . e(import_limit_text()) . '.</p>
+      <details><summary>The columns</summary>' . $cols . '</details>' : ''));
+}
+
+/* "2M (about 6,000 products)": the upload limit, for a file of products (about 300 bytes a row). */
+function import_limit_text(): string
+{
+    $raw = trim((string)ini_get('upload_max_filesize'));
+    if (!preg_match('/^(\d+)\s*([kmg]?)/i', $raw, $m)) {
+        return $raw;
+    }
+    $bytes = (int)$m[1] * ['' => 1, 'k' => 1024, 'm' => 1048576, 'g' => 1073741824][strtolower($m[2])];
+    return $raw . ' (about ' . number_format(max(1, intdiv($bytes, 300000)) * 1000) . ' products)';
+}
+
+function import_counts(array $rep): string
+{
+    $bits = [];
+    foreach (['new' => 'new product', 'changed' => 'product changed', 'same' => 'product unchanged'] as $k => $w) {
+        if ($rep[$k]) {
+            $bits[] = number_format($rep[$k]) . ' ' . ($rep[$k] === 1 ? $w : str_replace('product', 'products', $w));
+        }
+    }
+    if ($rep['choices']) {
+        $bits[] = $rep['choices'] . ' new choice' . ($rep['choices'] === 1 ? '' : 's');
+    }
+    if ($rep['cats']) {
+        $bits[] = count($rep['cats']) . ' new categor' . (count($rep['cats']) === 1 ? 'y' : 'ies');
+    }
+    return $bits ? implode(', ', $bits) : 'nothing to change';
+}
+
+function import_report_html(array $rep, int $rows, string $name, string $token, float $secs): string
+{
+    $out = '<div class="report"><p class="lede">Checked <b>' . e($name) . '</b>: ' . number_format($rows) . ' row' . ($rows === 1 ? '' : 's')
+         . ' in ' . number_format($secs, 1) . ' seconds. Nothing has changed yet.</p>';
+    if ($rep['errors']) {
+        $out .= '<div class="err"><b>' . count($rep['errors']) . ' problem' . (count($rep['errors']) === 1 ? '' : 's')
+              . '.</b> Nothing can be imported until ' . (count($rep['errors']) === 1 ? 'it\'s' : 'they\'re') . ' fixed: correct the file and check it again.'
+              . '<table class="errs">' . implode('', array_map(fn($x) => '<tr><td>' . ($x[0] ? 'Row ' . $x[0] : 'File') . '</td><td>' . e($x[1]) . '</td></tr>',
+                array_slice($rep['errors'], 0, 500))) . '</table>'
+              . (count($rep['errors']) > 500 ? '<p>…and ' . (count($rep['errors']) - 500) . ' more.</p>' : '') . '</div>';
+    } else {
+        $out .= '<p class="flash"><b>' . e(ucfirst(import_counts($rep))) . '.</b>'
+              . ($rep['cats'] ? ' New categories: ' . e(implode(', ', array_slice($rep['cats'], 0, 20))) . (count($rep['cats']) > 20 ? '…' : '') . '.' : '') . '</p>';
+    }
+    foreach ($rep['warnings'] as $w) {
+        $out .= '<p class="muted">' . e($w) . '</p>';
+    }
+    if ($rep['hidden']) {
+        $out .= '<p class="muted">' . $rep['hidden'] . ' product' . ($rep['hidden'] === 1 ? '' : 's') . ' will stay hidden: a product needs a photo before it can be shown.</p>';
+    }
+    if (!$rep['errors'] && ($rep['new'] || $rep['changed'])) {
+        $out .= '<form method="post" class="actions-row" style="margin-top:1rem;border:0;padding:0">' . csrf_field()
+              . '<input type="hidden" name="do" value="apply"><input type="hidden" name="token" value="' . e($token) . '">'
+              . '<button>Apply these changes</button> <a href="' . e(admin_url('import')) . '">Cancel</a></form>';
+    } else {
+        $out .= '<p><a class="btn quiet" href="' . e(admin_url('import')) . '">Check another file</a></p>';
+    }
+    if ($rep['changes'] && !$rep['errors']) {
+        $out .= '<h2>' . (count($rep['changes']) > IMPORT_SHOW_CHANGES ? 'The first ' . IMPORT_SHOW_CHANGES . ' of ' . number_format(count($rep['changes'])) . ' changes' : 'What will change') . '</h2>'
+              . '<div class="table-wrap"><table class="changes"><tr><th>Product</th><th>What</th><th>Now</th><th>After</th></tr>';
+        foreach (array_slice($rep['changes'], 0, IMPORT_SHOW_CHANGES, true) as $c) {
+            if (!empty($c['new'])) {
+                $out .= '<tr><td>' . e($c['label']) . '</td><td colspan="3"><span class="pill ok">New</span></td></tr>';
+                continue;
+            }
+            foreach ($c['diff'] as $i => [$what, $was, $now]) {
+                $out .= '<tr><td>' . ($i === 0 ? e($c['label']) : '') . '</td><td>' . e($what) . '</td><td class="was">' . e($was === '' ? '—' : $was)
+                      . '</td><td>' . e($now === '' ? '—' : $now) . '</td></tr>';
+            }
+        }
+        $out .= '</table></div>';
+    }
+    return $out . '</div>';
+}
+/* ================================================================== search */
+/* 1.2.0. Searches product names, SKUs (the product's and its choices'), category
+   names and descriptions. Uses SQLite's full-text search (FTS5) where the host
+   has it, and a plainer LIKE search where it doesn't. Every word has to match,
+   as the start of a word ("wish" finds "wishbone"), and an optional list of
+   synonyms widens a word ("alu = alloy = aluminium"). An exact SKU comes first,
+   and a search that is exactly one product's SKU goes straight to that product.
+
+   The full-text index is a copy of the catalogue. Rather than every way of
+   changing a product having to remember to update it, the index keeps a
+   fingerprint of what it was built from and is rebuilt on the next search if
+   the catalogue has changed since (a few tens of milliseconds for 2,000 products). */
+
+const SEARCH_MAX_WORDS = 8;
+const SEARCH_BOX_FROM = 12;   // the search box shows once the shop has this many products
+
+function search_fts(): bool
+{
+    static $ok = null;
+    if ($ok === null) {
+        $ok = setting('search_fts', '1') !== '0';   // can be switched off to use LIKE (tests use this)
+        if ($ok) {
+            try {
+                db()->exec('CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(name, sku, cats, body,
+                            tokenize = "unicode61 remove_diacritics 2", prefix = "2 3")');
+            } catch (Throwable $e) {
+                $ok = false;   // this host's SQLite has no FTS5
+            }
+        }
+    }
+    return $ok;
+}
+
+/* What the index was built from: changes whenever a product, choice or category does. */
+function search_fingerprint(): string
+{
+    return (string)db()->query("SELECT
+        (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + LENGTH(description) + LENGTH(option_name)) || ':' || IFNULL(MAX(updated), '') || ':' || TOTAL(category_id) FROM products)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + product_id) FROM variants)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + parent_id) FROM categories)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(category_id * 7 + product_id) FROM product_categories)")->fetchColumn();
+}
+
+function search_index_fresh(): void
+{
+    $fp = search_fingerprint();
+    if (setting('search_fp') === $fp) {
+        return;
+    }
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $pdo->exec('DELETE FROM products_fts');
+        $extra = [];
+        foreach ($pdo->query('SELECT product_id, category_id FROM product_categories') as $r) {
+            $extra[(int)$r['product_id']][] = (int)$r['category_id'];
+        }
+        $vars = [];
+        foreach ($pdo->query('SELECT product_id, name, sku FROM variants') as $v) {
+            $vars[(int)$v['product_id']][] = $v;
+        }
+        $ins = $pdo->prepare('INSERT INTO products_fts (rowid, name, sku, cats, body) VALUES (?, ?, ?, ?, ?)');
+        foreach ($pdo->query('SELECT id, name, sku, description, option_name, category_id FROM products') as $p) {
+            $id = (int)$p['id'];
+            $cats = [];
+            foreach (array_merge([(int)$p['category_id']], $extra[$id] ?? []) as $c) {
+                array_push($cats, ...array_column(cat_trail($c), 'name'));
+            }
+            $vs = $vars[$id] ?? [];
+            $ins->execute([$id, $p['name'], trim($p['sku'] . ' ' . implode(' ', array_column($vs, 'sku'))),
+                           implode(' ', array_unique($cats)), $p['description'] . ' ' . $p['option_name'] . ' ' . implode(' ', array_column($vs, 'name'))]);
+        }
+        // Name matters most, then SKU, then category, then the description.
+        $pdo->exec("INSERT INTO products_fts (products_fts, rank) VALUES ('rank', 'bm25(10.0, 8.0, 3.0, 1.0)')");
+        set_setting('search_fp', $fp);
+        $pdo->exec('COMMIT');
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+        throw $e;
+    }
+}
+
+/* The synonyms setting as word => [every word it can mean]. One group a line:
+   "alu = alloy = aluminium", or with commas. */
+function search_synonyms(): array
+{
+    $map = [];
+    foreach (preg_split('/\R/', setting('search_synonyms')) as $line) {
+        $group = array_values(array_unique(array_filter(array_map(fn($w) => mb_strtolower(trim($w)), preg_split('/[=,]/', $line)), fn($w) => $w !== '')));
+        if (count($group) > 1) {
+            foreach ($group as $w) {
+                $map[$w] = array_values(array_unique(array_merge($map[$w] ?? [], $group)));
+            }
+        }
+    }
+    return $map;
+}
+
+/* The search as a list of words, each with the words it may also be. */
+function search_terms(string $s): array
+{
+    $syn = search_synonyms();
+    $words = array_slice(array_values(array_filter(preg_split('/\s+/', mb_strtolower(trim($s))), fn($w) => $w !== '')), 0, SEARCH_MAX_WORDS);
+    $terms = [];
+    foreach ($words as $w) {
+        $w = trim(preg_replace('/[^\p{L}\p{N}\-.\/]+/u', '', $w), '-./');
+        if ($w !== '') {
+            $terms[] = $syn[$w] ?? [$w];
+        }
+    }
+    return $terms;
+}
+
+/* [where, args, order] for products matching the search. */
+function search_sql(string $s): array
+{
+    $terms = search_terms($s);
+    $exact = db()->quote(trim($s));
+    $skuFirst = "CASE WHEN p.sku = $exact COLLATE NOCASE OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.sku = $exact COLLATE NOCASE) THEN 0 ELSE 1 END";
+    if (!$terms) {
+        return ['0', [], 'p.id'];
+    }
+    if (search_fts()) {
+        search_index_fresh();
+        // Each word as the start of a word, its synonyms as alternatives: ("alu"* OR "aluminium"*) AND ("wishbone"*)
+        $match = implode(' AND ', array_map(fn($alts) => '(' . implode(' OR ', array_map(fn($w) => '"' . str_replace('"', '', $w) . '"*', $alts)) . ')', $terms));
+        $m = db()->quote($match);
+        return ["p.id IN (SELECT rowid FROM products_fts WHERE products_fts MATCH $m)", [],
+                "$skuFirst, (SELECT rank FROM products_fts WHERE products_fts MATCH $m AND rowid = p.id), p.name COLLATE NOCASE"];
+    }
+    // No FTS5: every word somewhere in the name, SKUs, categories (and the ones they sit in) or description.
+    $up = fn(string $id) => "(SELECT parent_id FROM categories WHERE id = $id)";
+    $trail = fn(string $id) => "$id, " . $up($id) . ', ' . $up($up($id));
+    $inCats = '(' . $trail('p.category_id') . ') OR c.id IN (SELECT pc.category_id FROM product_categories pc WHERE pc.product_id = p.id'
+            . ' UNION SELECT parent_id FROM categories WHERE id IN (SELECT category_id FROM product_categories WHERE product_id = p.id)'
+            . ' UNION SELECT parent_id FROM categories WHERE id IN (SELECT parent_id FROM categories WHERE id IN (SELECT category_id FROM product_categories WHERE product_id = p.id)))';
+    $where = [];
+    $args = [];
+    $inName = [];
+    foreach ($terms as $alts) {
+        $any = [];
+        foreach ($alts as $w) {
+            $like = '%' . strtr($w, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']) . '%';
+            $any[] = "(p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\'
+                      OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.sku LIKE ? ESCAPE '\\' OR v.name LIKE ? ESCAPE '\\'))
+                      OR EXISTS (SELECT 1 FROM categories c WHERE c.name LIKE ? ESCAPE '\\' AND (c.id IN $inCats)))";
+            array_push($args, $like, $like, $like, $like, $like, $like);
+            $inName[] = 'p.name LIKE ' . db()->quote($like) . " ESCAPE '\\'";
+        }
+        $where[] = '(' . implode(' OR ', $any) . ')';
+    }
+    return [implode(' AND ', $where), $args, "$skuFirst, CASE WHEN " . implode(' OR ', $inName) . ' THEN 0 ELSE 1 END, p.name COLLATE NOCASE'];
+}
+
+/* The shop's search box (in the shop menu once there are enough products to need it). */
+function search_box(string $value = ''): string
+{
+    $route = setting('pretty_urls', '1') !== '1' ? '<input type="hidden" name="q" value="search">' : '';
+    return '<form class="shop-search" role="search" method="get" action="' . e(strtok(shop_url('search'), '?')) . '">' . $route
+         . '<input type="search" name="s" value="' . e($value) . '" placeholder="Search" aria-label="Search the shop" maxlength="100">'
+         . '<button class="shop-button shop-quiet">Search</button></form>';
+}
+
+function search_box_wanted(): bool
+{
+    static $want = null;
+    return $want ??= (int)db()->query('SELECT COUNT(*) FROM (SELECT 1 FROM products WHERE visible = 1 LIMIT ' . SEARCH_BOX_FROM . ')')->fetchColumn() >= SEARCH_BOX_FROM;
+}
+
+function view_search(): never
+{
+    $s = mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100);
+    $body = '';
+    $page = 1;
+    if ($s !== '') {
+        // Exactly one product's part number: go straight to it.
+        if (!isset($_GET['page']) && !isset($_GET['sort'])) {
+            $st = db()->prepare('SELECT DISTINCT p.slug FROM products p LEFT JOIN variants v ON v.product_id = p.id
+                                 WHERE p.visible = 1 AND (p.sku = ? COLLATE NOCASE OR v.sku = ? COLLATE NOCASE) LIMIT 2');
+            $st->execute([$s, $s]);
+            $hit = $st->fetchAll(PDO::FETCH_COLUMN);
+            if (count($hit) === 1) {
+                redirect(shop_url('p/' . $hit[0]));
+            }
+        }
+        [$where, $args, $order] = search_sql($s);
+        [$grid, $page] = product_grid($where, $args, 'search', '', [
+            'sorts' => ['best' => 'Best match'] + SORTS, 'best' => $order, 'keep' => ['s' => $s], 'noun' => 'products match', 'noun1' => 'product matches', 'count' => true]);
+        $body = $grid !== '<p></p>' ? $grid
+              : '<p>Nothing matches <strong>' . e($s) . '</strong>. Try fewer words, the start of a word, or a part number.</p>';
+    }
+    render('Search' . ($s !== '' ? ': ' . $s : '') . ($page > 1 ? ' (page ' . $page . ')' : ''),
+        '<h1 class="post-title">' . ($s !== '' ? 'Search: ' . e($s) : 'Search') . '</h1><div class="post-body">'
+        . ($s === '' || !search_box_wanted() ? '<div class="shop-search-page">' . search_box($s) . '</div>' : '') . $body . '</div>',
+        ['route' => 'search', 'noindex' => true, 'crumbs' => [['Search', null]], 'search' => $s]);
+}
+/* ================================================================ invoices */
+/* 1.2.0. A printable invoice for each paid order, from the admin order page and
+   the customer's own order page; the browser's Print or Save as PDF does the rest.
+   An order placed while the shop was VAT-registered gets a full UK VAT invoice
+   (invoice number = order number); any other order gets a receipt. Prices in the
+   shop include VAT, so each line's amount before VAT is worked out from what was
+   charged, and the VAT is exactly what the order recorded: the invoice always adds
+   up to the order total to the penny. */
+
+const VAT_RATE = 20;
+
+/* The order as invoice lines: [description, detail, qty, gross pence], items first,
+   then discount, group saving and delivery as lines of their own. */
+function invoice_lines(array $o): array
+{
+    $lines = [];
+    foreach (order_items((int)$o['id']) as $it) {
+        $lines[] = [$it['name'], trim(($it['option_label'] !== '' ? $it['option_label'] : '') . (($it['sku'] ?? '') !== '' ? ($it['option_label'] !== '' ? ' · ' : '') . 'SKU ' . $it['sku'] : '')),
+                    (int)$it['qty'], (int)$it['unit_pence'] * (int)$it['qty']];
+    }
+    if ((int)$o['discount_pence'] > 0) {
+        $lines[] = ['Discount', 'Code ' . $o['discount_code'], 1, -(int)$o['discount_pence']];
+    }
+    if ((int)$o['group_pence'] > 0) {
+        $lines[] = [$o['group_name'] . ' prices', 'Customer group discount', 1, -(int)$o['group_pence']];
+    }
+    if ((int)$o['postage_pence'] > 0) {
+        $lines[] = [$o['delivery'] === 'collect' ? 'Collection' : 'Delivery', '', 1, (int)$o['postage_pence']];
+    }
+    // Anything an older order recorded differently: a line that makes it add up, never a wrong total.
+    $diff = (int)$o['total_pence'] - array_sum(array_column($lines, 3));
+    if ($diff !== 0) {
+        $lines[] = ['Adjustment', '', 1, $diff];
+    }
+    return $lines;
+}
+
+/* Each line's amount before VAT, adding up exactly to the order's total less its VAT. */
+function invoice_net(array $lines, int $vat, int $total): array
+{
+    $net = array_map(fn($l) => (int)round($l[3] * 100 / (100 + VAT_RATE)), $lines);
+    $short = ($total - $vat) - array_sum($net);
+    if ($short !== 0 && $net) {
+        // A penny or two of rounding goes on the biggest single-item line (so its unit price
+        // still times its quantity), or the biggest line if every line has several.
+        $pick = array_filter(array_keys($lines), fn($i) => $lines[$i][2] === 1) ?: array_keys($lines);
+        usort($pick, fn($a, $b) => abs($lines[$b][3]) <=> abs($lines[$a][3]));
+        $net[$pick[0]] += $short;
+    }
+    return $net;
+}
+
+function uk_day(string $utc): string
+{
+    return $utc === '' ? '' : (new DateTimeImmutable($utc, new DateTimeZone('UTC')))->setTimezone(new DateTimeZone('Europe/London'))->format('j F Y');
+}
+
+function invoice_html(array $o, string $back): string
+{
+    $vatInvoice = $o['vat_pence'] !== null;
+    $lines = invoice_lines($o);
+    $total = (int)$o['total_pence'];
+    $vat = $vatInvoice ? (int)$o['vat_pence'] : 0;
+    $net = $vatInvoice ? invoice_net($lines, $vat, $total) : [];
+    $title = $vatInvoice ? 'VAT invoice' : 'Receipt';
+    $day = uk_day($o['paid_at'] ?: $o['created']);
+    $rows = '';
+    foreach ($lines as $i => [$what, $detail, $qty, $gross]) {
+        $rows .= '<tr><td>' . e($what) . ($detail !== '' ? '<div class="muted">' . e($detail) . '</div>' : '') . '</td><td class="n">' . $qty . '</td>'
+               . ($vatInvoice
+                   ? '<td class="n">' . unit_net($net[$i], $qty) . '</td><td class="n">' . VAT_RATE . '%</td><td class="n">' . money_signed($net[$i]) . '</td>'
+                   : '<td class="n">' . money_signed((int)round($gross / max(1, $qty))) . '</td><td class="n">' . money_signed($gross) . '</td>')
+               . '</tr>';
+    }
+    $foot = $vatInvoice
+        ? '<tr><th colspan="4">Total before VAT</th><td class="n">' . money($total - $vat) . '</td></tr>'
+          . '<tr><th colspan="4">VAT at ' . VAT_RATE . '%</th><td class="n">' . money($vat) . '</td></tr>'
+          . '<tr class="grand"><th colspan="4">Total</th><td class="n">' . money($total) . '</td></tr>'
+        : '<tr class="grand"><th colspan="3">Total paid</th><td class="n">' . money($total) . '</td></tr>';
+    $seller = array_filter(array_merge([setting('business_name') ?: setting('shop_title', 'Shop')],
+        explode("\n", str_replace("\r", '', trim(setting('business_address')))), [setting('business_email')]));
+    $buyer = array_merge([$o['bill_name']], array_slice(mail_address_lines('bill_', $o), 1), [$o['email']]);
+    $facts = $vatInvoice
+        ? ['Invoice number' => (string)(int)$o['number'], 'Invoice date' => $day, 'Time of supply' => $day, 'VAT number' => $o['vat_number'],
+           'Paid by' => method_label($o['payment_method'])]
+        : ['Order number' => (string)(int)$o['number'], 'Date paid' => $day, 'Paid by' => method_label($o['payment_method'])];
+    $factHtml = '';
+    foreach ($facts as $k => $v) {
+        $factHtml .= '<tr><th>' . e($k) . '</th><td>' . e($v) . '</td></tr>';
+    }
+    return '<!doctype html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>' . $title . ' ' . (int)$o['number'] . '</title><style>
+body{font:15px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;margin:0;padding:24px;background:#eee}
+.page{background:#fff;max-width:760px;margin:0 auto;padding:44px}
+.top{display:flex;justify-content:space-between;gap:28px;flex-wrap:wrap;align-items:flex-start}
+h1{font-size:26px;margin:0 0 14px}.muted{color:#666;font-size:13px}
+.facts th{text-align:left;font-weight:600;padding:2px 14px 2px 0;color:#444;font-size:14px}.facts td{font-size:14px;padding:2px 0}
+.parties{display:flex;gap:40px;flex-wrap:wrap;margin:26px 0 6px}.parties div{min-width:220px}
+.parties h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#666;margin:0 0 4px}
+table.lines{width:100%;border-collapse:collapse;margin:26px 0 0}
+.lines th,.lines td{padding:9px 8px;border-bottom:1px solid #ddd;vertical-align:top;text-align:left}
+.lines thead th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#666}
+.lines .n{text-align:right;white-space:nowrap}.lines tfoot th{text-align:right;font-weight:600;border-bottom:0}.lines tfoot td{border-bottom:0}
+.lines tr.grand th,.lines tr.grand td{font-size:17px;font-weight:700;border-top:2px solid #111}
+.flag{display:inline-block;border:2px solid #b42318;color:#b42318;font-weight:700;padding:3px 10px;border-radius:4px;letter-spacing:.06em}
+.bar{max-width:760px;margin:0 auto 12px;display:flex;justify-content:space-between;align-items:center}
+.bar a{color:#111}
+button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;background:#111;color:#fff;cursor:pointer}
+@media print{body{background:#fff;padding:0}.page{padding:0;max-width:none}.bar{display:none}}
+</style></head><body><div class="bar"><a href="' . e($back) . '">&larr; Back to the order</a><button onclick="window.print()">Print or save as PDF</button></div>
+<div class="page"><div class="top"><div><h1>' . $title . '</h1><table class="facts">' . $factHtml . '</table></div>'
+        . ($o['status'] === 'refunded' ? '<div><span class="flag">REFUNDED</span><div class="muted" style="margin-top:6px">This order was refunded in full.</div></div>' : '') . '</div>
+<div class="parties"><div><h2>From</h2>' . implode('<br>', array_map('e', $seller)) . '</div><div><h2>To</h2>' . implode('<br>', array_map('e', array_filter($buyer))) . '</div></div>
+<table class="lines"><thead><tr><th>Description</th><th class="n">Qty</th>'
+        . ($vatInvoice ? '<th class="n">Unit price<br>excl. VAT</th><th class="n">VAT rate</th><th class="n">Amount<br>excl. VAT</th>' : '<th class="n">Unit price</th><th class="n">Amount</th>')
+        . '</tr></thead><tbody>' . $rows . '</tbody><tfoot>' . $foot . '</tfoot></table>'
+        . ($vatInvoice ? '' : '<p class="muted" style="margin-top:22px">No VAT is charged: we are not registered for VAT.</p>')
+        . '<p class="muted" style="margin-top:30px">Thank you for your order.</p></div></body></html>';
+}
+
+/* A unit price before VAT: £2.78, or £2.775 when it isn't a whole penny (prices include
+   VAT, so 3 at £3.33 is £8.33 before VAT: £2.775 each). */
+function unit_net(int $lineNet, int $qty): string
+{
+    $u = $lineNet / max(1, $qty);
+    if (abs($u - round($u)) < 0.0001) {
+        return money_signed((int)round($u));
+    }
+    return ($u < 0 ? '−' : '') . '£' . rtrim(number_format(abs($u) / 100, 3, '.', ','), '0');
+}
+
+/* −£1.50 for a discount line, £1.50 otherwise. */
+function money_signed(int $pence): string
+{
+    return ($pence < 0 ? '−' : '') . money(abs($pence));
+}
+
+function invoice_ready(array $o): bool
+{
+    return in_array($o['status'], ['paid', 'refunded'], true);
+}
+
+function view_invoice_admin(int $id): never
+{
+    require_admin();
+    $o = order_by('id', $id);
+    if (!$o) {
+        redirect(admin_url('orders'));
+    }
+    if (!invoice_ready($o)) {
+        flash('An invoice is ready once the order is paid.');
+        redirect(admin_url('order/' . $id));
+    }
+    header('X-Robots-Tag: noindex, nofollow');
+    header('Cache-Control: no-store');
+    echo invoice_html($o, admin_url('order/' . $id));
+    exit;
+}
+
+/* The customer's copy, at their order's private address. */
+function view_invoice_public(string $token): never
+{
+    $o = preg_match('/^[a-f0-9]{32}$/', $token) ? order_by('token', $token) : null;
+    if (!$o || !invoice_ready($o)) {
+        view_404();
+    }
+    header('X-Robots-Tag: noindex, nofollow');
+    header('Cache-Control: no-store, private');
+    echo invoice_html($o, shop_url('order/' . $token));
+    exit;
+}
 /* ------------------------------------------------------------------ router */
 
 $q = trim(str_in($_GET['q'] ?? ''), '/');
@@ -8176,6 +10383,7 @@ if ($q === '' && !empty($_SERVER['REQUEST_URI'])) {
     }
 }
 $seg = $q === '' ? [] : explode('/', $q);
+$GLOBALS['shop_seg'] = $seg;   // the admin menu reads it to show where you are
 
 if (($seg[0] ?? '') === 'admin') {
     $sub = $seg[1] ?? '';
@@ -8196,6 +10404,7 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'duplicate' && is_post()       => admin_duplicate(),
         $sub === 'delete' && is_post()          => admin_delete(),
         $sub === 'categories'                   => view_admin_categories(),
+        $sub === 'import'                       => view_admin_import(),
         $sub === 'orders'                       => view_admin_orders(),
         $sub === 'customers'                    => view_admin_customers(),
         $sub === 'discounts'                    => view_admin_discounts(),
@@ -8209,9 +10418,10 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'discount' && isset($seg[2])   => view_admin_discount($seg[2]),
         $sub === 'customer' && isset($seg[2])   => view_admin_customer((int)$seg[2]),
         $sub === 'order' && isset($seg[2]) && ($seg[3] ?? '') === 'slip' => view_packing_slip((int)$seg[2]),
+        $sub === 'order' && isset($seg[2]) && ($seg[3] ?? '') === 'invoice' => view_invoice_admin((int)$seg[2]),
         $sub === 'order' && isset($seg[2])      => is_post() ? admin_order_action((int)$seg[2]) : view_admin_order((int)$seg[2]),
-        $sub === 'settings'                     => view_admin_settings(),
-        $sub === 'refresh-look'                 => redirect(admin_url('settings')),
+        $sub === 'settings'                     => view_admin_settings($seg[2] ?? 'general'),
+        $sub === 'refresh-look'                 => redirect(settings_url('advanced')),
         default                                 => redirect(admin_url()),
     };
 }
@@ -8255,7 +10465,9 @@ match (true) {
     ($seg[0] ?? '') === 'licence' && count($seg) === 2 => licence_api($seg[1]),
     $q === 'paypal/cancel'                       => paypal_cancel(),
     ($seg[0] ?? '') === 'order' && count($seg) === 2 => view_order($seg[1]),
+    ($seg[0] ?? '') === 'order' && count($seg) === 3 && $seg[2] === 'invoice' => view_invoice_public($seg[1]),
     $q === 'basket'                              => view_basket(),
+    $q === 'search'                              => view_search(),
     $q === 'sitemap.xml' && !shop_demo()           => view_sitemap(),
     default                                      => view_404(),
 };
