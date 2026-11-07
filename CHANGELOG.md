@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.3 (7 November 2026)
+
+- **The search box** sits at the top of the categories card on a computer (and in the menu along the top on phones and tablets). **Settings → Shop → Search** now chooses when it shows: once the shop has 12 or more products, as before, or always, or never.
+- Upgrading needs nothing but the new `index.php`.
+
 ## 1.3.2 (7 November 2026)
 
 - **Categories down the side**: on a computer, the shop's categories are now in a card of their own down the left, beside the products, in the theme's card style. It shows the categories inside the one you're in (or all of them, in a shop with 15 or fewer) and stays in view as you scroll. Phones and tablets keep the menu along the top. To keep the menu along the top everywhere, choose **Along the top** under Settings → Shop → Categories menu.

@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.3.2';
+const SHOP_VERSION    = '1.3.3';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -1309,7 +1309,7 @@ function shop_nav(?int $active): string
     return '<nav class="shop-nav' . ($fold ? ' shop-foldable' : '') . ($side ? ' shop-with-side' : '') . '" aria-label="Shop">'
          . ($li ? ($fold ? '<button type="button" class="shop-menu-btn" aria-expanded="false" aria-controls="shop-cats">Categories</button>' : '')
                   . '<ul class="shop-cats" id="shop-cats">' . $li . '</ul>' : '<span></span>')
-         . '<span class="shop-nav-end">' . (search_box_wanted() ? search_box(($GLOBALS['shop_seg'][0] ?? '') === 'search' ? mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100) : '') : '')
+         . '<span class="shop-nav-end">' . (search_box_wanted() ? search_box(search_box_value()) : '')
          . $acct . '<a class="shop-basket-link" href="' . e(shop_url('basket')) . '">Basket' . ($n ? ' (' . $n . ')' : '') . '</a></span></nav>'
          . ($deep || $fold ? shop_nav_script() : '');
 }
@@ -1359,7 +1359,8 @@ function shop_side(?int $active): string
     foreach ($top as $c) {
         $li .= $item($c, 1);
     }
-    return '<nav class="shop-side-nav" aria-label="Categories"><h2 class="shop-side-title">Categories</h2><ul>' . $li . '</ul></nav>';
+    return (search_box_wanted() ? search_box(search_box_value(), true) : '')
+        . '<nav class="shop-side-nav" aria-label="Categories"><h2 class="shop-side-title">Categories</h2><ul>' . $li . '</ul></nav>';
 }
 
 /* One dropdown open at a time; Escape or a click elsewhere closes it; the menu
@@ -1433,6 +1434,11 @@ function shop_css(): string
 }
 .wren-shop .shop-nav-end{display:flex;gap:1.1rem;white-space:nowrap}
 .wren-shop-side{display:none}
+.wren-shop .shop-search-side{display:flex;position:relative;margin:0 0 1.1rem}
+.wren-shop .shop-search-side input{flex:1;width:auto;min-width:0;padding:.45rem 2.4rem .45rem .65rem;font-size:.95em}
+.wren-shop .shop-search-go{position:absolute;right:2px;top:2px;bottom:2px;width:2.2rem;display:flex;align-items:center;justify-content:center;
+  border:0;border-radius:0 5px 5px 0;background:none;color:inherit;opacity:.65;cursor:pointer;padding:0}
+.wren-shop .shop-search-go:hover,.wren-shop .shop-search-go:focus-visible{opacity:1;color:var(--shop-acc)}
 .wren-shop .shop-side-title{font-size:.8em;font-weight:700;text-transform:uppercase;letter-spacing:.06em;opacity:.7;margin:0 0 .6rem}
 .wren-shop .shop-side-nav ul{list-style:none;margin:0;padding:0}
 .wren-shop .shop-side-nav li{margin:0}
@@ -1448,7 +1454,7 @@ function shop_css(): string
   .wren-shop-side{display:block;position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow-y:auto;border-radius:10px}
   .wren-shop-side>article.shop-side-card{margin:0;padding:18px 20px}
   .wren-shop .shop-with-side{justify-content:flex-end}
-  .wren-shop .shop-with-side .shop-cats,.wren-shop .shop-with-side .shop-menu-btn{display:none!important}
+  .wren-shop .shop-with-side .shop-cats,.wren-shop .shop-with-side .shop-menu-btn,.wren-shop .shop-with-side .shop-search{display:none!important}
   .wren-shop-layout .wren-shop .shop-grid{grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:1.25rem}
 }
 .wren-shop .shop-account-link{color:inherit;font-weight:600}
@@ -4262,6 +4268,7 @@ function view_admin_settings(string $tab = 'general'): never
             case 'search':
                 $lines = array_filter(array_map('trim', preg_split('/\R/', mb_substr(str_in($_POST['search_synonyms'] ?? ''), 0, 5000))), fn($l) => $l !== '');
                 set_setting('search_synonyms', implode("\n", $lines));
+                set_setting('search_box', in_array(post('search_box'), ['always', 'never'], true) ? post('search_box') : 'auto');
                 flash($lines ? 'Saved. Searches now treat ' . count($lines) . ' group' . (count($lines) === 1 ? '' : 's') . ' of words as the same.' : 'Saved: no synonyms.');
                 break;
             case 'postage':
@@ -4603,9 +4610,13 @@ function view_admin_settings(string $tab = 'general'): never
         <div class="row"><label>Send a test email to <input type="email" name="test_to" value="' . e(mail_shop_address()) . '"></label></div>
         <button class="quiet">Send test email</button></form>' : '') . '';
     $s['general'] .= '<h2 id="search">Search</h2>
-      <p class="muted">The shop\'s search box appears once it has ' . SEARCH_BOX_FROM . ' or more products. It finds names, SKUs, categories and descriptions,
+      <p class="muted">The shop\'s search finds names, SKUs, categories and descriptions,
       and the start of a word is enough ("wish" finds "wishbone"). If customers use other words for the same thing, list them here, one group a line.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="search">
+        <fieldset style="border:0;padding:0;margin:0 0 1rem"><legend style="font-weight:600;padding:0">Show the search box</legend>
+          <label class="check"><input type="radio" name="search_box" value="auto"' . (!in_array(setting('search_box', 'auto'), ['always', 'never'], true) ? ' checked' : '') . '> Once the shop has ' . SEARCH_BOX_FROM . ' or more products</label>
+          <label class="check"><input type="radio" name="search_box" value="always"' . (setting('search_box') === 'always' ? ' checked' : '') . '> Always</label>
+          <label class="check"><input type="radio" name="search_box" value="never"' . (setting('search_box') === 'never' ? ' checked' : '') . '> Never <span class="hint">(the search page still works for anyone with its address)</span></label></fieldset>
         <label>Words that mean the same <span class="hint">(e.g. <code>alloy = aluminium = alu</code>)</span>
           <textarea name="search_synonyms" style="min-height:6rem" placeholder="alloy = aluminium = alu&#10;fr = front&#10;diff = differential">' . e(setting('search_synonyms')) . '</textarea></label>
         <button>Save</button></form>';
@@ -10872,19 +10883,33 @@ function search_sql(string $s): array
     return [implode(' AND ', $where), $args, "$skuFirst, CASE WHEN " . implode(' OR ', $inName) . ' THEN 0 ELSE 1 END, p.name COLLATE NOCASE'];
 }
 
-/* The shop's search box (in the shop menu once there are enough products to need it). */
-function search_box(string $value = ''): string
+/* The shop's search box: in the shop menu, or at the top of the categories card
+   ($side, with a magnifying-glass button to fit the narrow card). */
+function search_box(string $value = '', bool $side = false): string
 {
     $route = setting('pretty_urls', '1') !== '1' ? '<input type="hidden" name="q" value="search">' : '';
-    return '<form class="shop-search" role="search" method="get" action="' . e(strtok(shop_url('search'), '?')) . '">' . $route
+    return '<form class="shop-search' . ($side ? ' shop-search-side' : '') . '" role="search" method="get" action="' . e(strtok(shop_url('search'), '?')) . '">' . $route
          . '<input type="search" name="s" value="' . e($value) . '" placeholder="Search" aria-label="Search the shop" maxlength="100">'
-         . '<button class="shop-button shop-quiet">Search</button></form>';
+         . ($side ? '<button class="shop-search-go" aria-label="Search"><svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true" focusable="false"><circle cx="8.5" cy="8.5" r="5.75" fill="none" stroke="currentColor" stroke-width="2"/><path d="M13 13l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>'
+                  : '<button class="shop-button shop-quiet">Search</button>') . '</form>';
 }
 
+/* What's in the box on the search page, so it stays there for another go. */
+function search_box_value(): string
+{
+    return ($GLOBALS['shop_seg'][0] ?? '') === 'search' ? mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100) : '';
+}
+
+/* Settings → Shop → Search: always, never, or (to start with) once the shop
+   has enough products to need it. */
 function search_box_wanted(): bool
 {
     static $want = null;
-    return $want ??= (int)db()->query('SELECT COUNT(*) FROM (SELECT 1 FROM products WHERE visible = 1 LIMIT ' . SEARCH_BOX_FROM . ')')->fetchColumn() >= SEARCH_BOX_FROM;
+    return $want ??= match (setting('search_box', 'auto')) {
+        'always' => true,
+        'never'  => false,
+        default  => (int)db()->query('SELECT COUNT(*) FROM (SELECT 1 FROM products WHERE visible = 1 LIMIT ' . SEARCH_BOX_FROM . ')')->fetchColumn() >= SEARCH_BOX_FROM,
+    };
 }
 
 function view_search(): never
