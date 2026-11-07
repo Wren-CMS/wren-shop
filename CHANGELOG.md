@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1 (7 November 2026)
+
+- **Fixed**: the categories card showed a sideways scrollbar under the list (since 1.3.3), and the admin's tabs a small scrollbar at the right (since 1.2.0), on computers set to always show scrollbars. Both were one pixel of overflow.
+- Upgrading needs nothing but the new `index.php`.
+
 ## 1.4.0 (7 November 2026)
 
 **Smarter search: finding what customers mean.**

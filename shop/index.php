@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.4.0';
+const SHOP_VERSION    = '1.4.1';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -1507,7 +1507,7 @@ function shop_css(): string
   .wren-shop-layout{display:grid;grid-template-columns:14rem minmax(0,1fr);gap:22px;align-items:start}
   .wren-shop-layout>article{margin:0;min-width:0}
   .wren-shop-side{display:block;position:sticky;top:1rem;z-index:5}
-  .wren-shop-side .shop-side-nav{max-height:calc(100vh - 9rem);overflow-y:auto;margin:0 -.5rem;padding:0 .5rem}
+  .wren-shop-side .shop-side-nav{max-height:calc(100vh - 9rem);overflow-x:hidden;overflow-y:auto;margin:0 -.6rem;padding:0 .6rem}
   .wren-shop-side>article.shop-side-card{margin:0;padding:18px 20px}
   .wren-shop .shop-with-side{justify-content:flex-end}
   .wren-shop .shop-with-side .shop-cats,.wren-shop .shop-with-side .shop-menu-btn,.wren-shop .shop-with-side .shop-search{display:none!important}
@@ -2953,10 +2953,10 @@ body { margin:0; background:var(--paper); color:var(--ink);
 .side .util a, .side .util button { font-size:.88rem; color:var(--quiet); padding:.4rem .6rem; }
 .navform { margin:0; }
 .page { padding:1.4rem clamp(1rem, 3vw, 2.5rem) 4rem; min-width:0; }
-.tabs { border-bottom:1px solid var(--line); margin:0 0 1.6rem; overflow-x:auto; scrollbar-width:thin; }
+.tabs { box-shadow:inset 0 -1px 0 var(--line); margin:0 0 1.6rem; overflow-x:auto; overflow-y:hidden; scrollbar-width:thin; }
 .tabs ul { display:flex; gap:.2rem; list-style:none; margin:0; padding:0; }
 .tabs a { display:block; padding:.55rem .85rem .6rem; white-space:nowrap; color:var(--quiet); text-decoration:none; font-size:.93rem;
-          border-bottom:3px solid transparent; margin-bottom:-1px; }
+          border-bottom:3px solid transparent; }
 .tabs a:hover { color:var(--ink); border-bottom-color:var(--line); }
 .tabs a[aria-current] { color:var(--ink); font-weight:600; border-bottom-color:var(--moss); }
 /* Forms and writing stay a comfortable width; lists and tables use it all. */
