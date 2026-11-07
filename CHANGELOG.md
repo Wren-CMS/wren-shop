@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.0 (7 November 2026)
+
+**Smarter search: finding what customers mean.**
+
+- **Spelling mistakes forgiven**: a search that finds nothing tries the nearest words the shop knows (*wishbnoe* finds wishbone, *aluminum* finds aluminium), says **Showing results for …**, and links to search for what was typed instead. Part numbers and short words are never guessed at.
+- **Suggestions as you type**: after two letters, up to 6 products (photo, name, price) and 3 categories under the search box, then See all results. Arrow keys, Enter and Escape work, and screen readers hear how many there are. A setting switches it off.
+- **Tags** on products, typed on the product form (tags in use are one tap away) or in a `tags` CSV column, and brought across from WooCommerce. Search finds them; showing them on product pages, each a link to a page of products with that tag, is a setting.
+- **Filters** on search results, the shop's list and categories with 12 or more products: category (with counts), price bands worked out from what's listed, in stock only, and on sale. They're links, so a filtered page can be shared, and on a phone they fold behind a Filter button.
+- **Better ranking**: an exact part number first, then every word in the name, then the name starting with the first word, then SKU, tags, category and description. The words searched for are in bold in the results.
+- **Search report** (Orders → Searches): the most searched words and the searches that found nothing, each with **Add a synonym**. Only the words and how many products they found are kept, by day, never who searched, for 12 months; a setting switches it off.
+- **Your logo** on receipts, VAT invoices and packing slips: upload it under Settings → Business and VAT (PNG, JPEG, WebP or SVG).
+- Nothing changes for customers until they search; upgrading needs nothing but the new `index.php`.
+
 ## 1.3.3 (7 November 2026)
 
 - **The search box** sits at the top of the categories card on a computer (and in the menu along the top on phones and tablets). **Settings → Shop → Search** now chooses when it shows: once the shop has 12 or more products, as before, or always, or never.

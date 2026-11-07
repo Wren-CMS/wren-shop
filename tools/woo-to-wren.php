@@ -148,7 +148,7 @@ foreach ($rows as $r) {
 
 $cols = ['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'stock', 'backorders', 'visible',
          'main_category', 'categories', 'option_name', 'option2_name', 'choice', 'choice2', 'choice_sku', 'choice_price', 'choice_sale_price',
-         'choice_active', 'weight', 'choice_weight', 'photos', 'old_url', 'description'];
+         'choice_active', 'weight', 'choice_weight', 'photos', 'old_url', 'tags', 'description'];
 // The old shop's product addresses: from its sitemap if given, else WooCommerce's default /product/<slug>/.
 $oldBySlug = [];
 if (isset($opt['sitemap'])) {
@@ -226,7 +226,9 @@ foreach ($rows as $r) {
              'backorders' => $bo, 'visible' => $visible, 'main_category' => $paths[0] ?? '', 'categories' => implode(' | ', array_slice($paths, 1)),
              'option_name' => '', 'option2_name' => '', 'choice' => '', 'choice2' => '', 'choice_sku' => '', 'choice_price' => '', 'choice_sale_price' => '',
              'choice_active' => '', 'weight' => kg($col($r, 'Weight (kg)')), 'choice_weight' => '',
-             'photos' => implode(' | ', array_filter(array_map('trim', explode(',', $col($r, 'Images'))))), 'old_url' => $oldUrl($name, $slug), 'description' => $desc];
+             'photos' => implode(' | ', array_filter(array_map('trim', explode(',', $col($r, 'Images'))))), 'old_url' => $oldUrl($name, $slug),
+             'tags' => implode(' | ', array_filter(array_map(fn($t) => trim(html_entity_decode($t, ENT_QUOTES | ENT_HTML5, 'UTF-8')), explode(',', $col($r, 'Tags'))), fn($t) => $t !== '')),
+             'description' => $desc];
     if ($base['old_url'] === '') {
         $report['old_missing'][] = $name;
     }

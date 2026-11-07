@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.3.3';
+const SHOP_VERSION    = '1.4.0';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -759,6 +759,45 @@ function shop_migrate(PDO $pdo): void
         $pdo->exec("UPDATE settings SET value = '14' WHERE name = 'schema_version'");
         $pdo->commit();
     }
+    if ((int)$pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn() < 15) {
+        // 1.4.0: smarter search. Tags on products; the list of words that spelling
+        // mistakes are matched against; a log of what was searched for (words and
+        // result counts by day, nothing about who).
+        $pdo->beginTransaction();
+        $pdo->exec('
+            CREATE TABLE tags (
+                id   INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE product_tags (
+                product_id INTEGER NOT NULL,
+                tag_id     INTEGER NOT NULL,
+                PRIMARY KEY (product_id, tag_id)
+            );
+            CREATE INDEX product_tags_tag ON product_tags (tag_id);
+            CREATE TABLE search_words (
+                word TEXT PRIMARY KEY,
+                n    INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE search_log (
+                day     TEXT NOT NULL,
+                words   TEXT NOT NULL,
+                results INTEGER NOT NULL DEFAULT 0,
+                times   INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (day, words)
+            );
+        ');
+        // The full-text index gains a tags column: it is rebuilt on the next search.
+        $pdo->exec("DELETE FROM settings WHERE name IN ('search_fp', 'search_words_fp')");
+        $pdo->exec("UPDATE settings SET value = '15' WHERE name = 'schema_version'");
+        $pdo->commit();
+        try {
+            $pdo->exec('DROP TABLE IF EXISTS products_fts');
+        } catch (Throwable $e) {
+            // a host without FTS5 never had one
+        }
+    }
 }
 
 /* Demo mode: a banner on every page, nothing indexed by search engines, no
@@ -1160,7 +1199,7 @@ function render(string $title, string $content, array $seo = [], int $status = 2
     // $seo['crumbs'] lists what comes after Home › Shop: [label, route|null].
     $trail = array_merge([['Home', null, site_base() . '/'], ['Shop', '']],
                          array_map(fn($c) => [$c[0], $c[1]], $seo['crumbs'] ?? []));
-    $content = shop_nav($seo['cat'] ?? null) . crumbs_html($trail) . $content;
+    $content = shop_nav($seo['cat'] ?? null) . crumbs_html($trail) . $content . (search_box_wanted() || !empty($seo['search_page']) ? search_suggest_script() : '');
     if (shop_demo()) {
         $seo['noindex'] = true;
         $content = demo_banner() . $content;
@@ -1434,6 +1473,22 @@ function shop_css(): string
 }
 .wren-shop .shop-nav-end{display:flex;gap:1.1rem;white-space:nowrap}
 .wren-shop-side{display:none}
+.wren-shop .shop-search{position:relative}
+.wren-shop .shop-suggest{position:absolute;z-index:30;top:calc(100% + 4px);left:0;width:min(24rem,calc(100vw - 2rem));max-height:70vh;overflow-y:auto;
+  background:var(--card,var(--bg,#fff));border:1px solid var(--line,rgba(127,127,127,.3));border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.14);padding:.3rem;
+  white-space:normal;text-align:left;font-size:.95rem}
+.wren-shop .shop-nav-end .shop-suggest{left:auto;right:0}
+.wren-shop .shop-suggest a{display:flex;align-items:center;gap:.6rem;padding:.35rem .5rem;border-radius:6px;color:inherit;text-decoration:none;font-weight:400}
+.wren-shop .shop-suggest a.on,.wren-shop .shop-suggest a:hover{background:var(--paper,rgba(127,127,127,.1))}
+.wren-shop .shop-suggest img,.wren-shop .shop-sg-noimg{width:40px;height:40px;object-fit:cover;border-radius:4px;flex:none;background:var(--paper,rgba(127,127,127,.1))}
+.wren-shop .shop-sg-name{flex:1;min-width:0;line-height:1.3}
+.wren-shop .shop-sg-name strong{font-weight:700}
+.wren-shop .shop-sg-price{white-space:nowrap;font-weight:600;font-size:.92em}
+.wren-shop .shop-sg-price .shop-was,.wren-shop .shop-sg-price small{display:none}
+.wren-shop .shop-sg-in{font-size:.85em;opacity:.7;white-space:nowrap}
+.wren-shop .shop-sg-head,.wren-shop .shop-sg-note,.wren-shop .shop-sg-none{margin:.35rem .5rem .2rem;font-size:.8em;opacity:.75}
+.wren-shop .shop-sg-head{text-transform:uppercase;letter-spacing:.05em;font-weight:700}
+.wren-shop a.shop-sg-all{justify-content:center;font-weight:600;color:var(--shop-acc);border-top:1px solid var(--line,rgba(127,127,127,.2));border-radius:0 0 6px 6px;margin-top:.25rem;padding:.5rem}
 .wren-shop .shop-search-side{display:flex;position:relative;margin:0 0 1.1rem}
 .wren-shop .shop-search-side input{flex:1;width:auto;min-width:0;padding:.45rem 2.4rem .45rem .65rem;font-size:.95em}
 .wren-shop .shop-search-go{position:absolute;right:2px;top:2px;bottom:2px;width:2.2rem;display:flex;align-items:center;justify-content:center;
@@ -1451,7 +1506,8 @@ function shop_css(): string
 @media (min-width:800px){
   .wren-shop-layout{display:grid;grid-template-columns:14rem minmax(0,1fr);gap:22px;align-items:start}
   .wren-shop-layout>article{margin:0;min-width:0}
-  .wren-shop-side{display:block;position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow-y:auto;border-radius:10px}
+  .wren-shop-side{display:block;position:sticky;top:1rem;z-index:5}
+  .wren-shop-side .shop-side-nav{max-height:calc(100vh - 9rem);overflow-y:auto;margin:0 -.5rem;padding:0 .5rem}
   .wren-shop-side>article.shop-side-card{margin:0;padding:18px 20px}
   .wren-shop .shop-with-side{justify-content:flex-end}
   .wren-shop .shop-with-side .shop-cats,.wren-shop .shop-with-side .shop-menu-btn,.wren-shop .shop-with-side .shop-search{display:none!important}
@@ -1472,6 +1528,12 @@ function shop_css(): string
 .wren-shop .shop-crumbs li+li::before{content:"\203A";margin:0 .45em;opacity:.6}
 .wren-shop .shop-crumbs span[aria-current]{opacity:.8}
 .wren-shop .shop-related{margin-top:2.5rem}
+.wren-shop .shop-corrected{margin:0 0 1rem}
+.wren-shop .shop-tags{display:flex;flex-wrap:wrap;align-items:center;gap:.35rem .5rem;margin:1rem 0;font-size:.92em}
+.wren-shop .shop-tags span{opacity:.75}
+.wren-shop .shop-tags ul{display:contents;list-style:none}
+.wren-shop .shop-tags a{display:inline-block;padding:.15rem .65rem;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:99px;color:inherit;text-decoration:none}
+.wren-shop .shop-tags a:hover{border-color:var(--shop-acc);color:var(--shop-acc)}
 .wren-shop .shop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1.5rem;margin:1.5rem 0}
 .wren-shop .shop-listbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem;margin:1rem 0 -.5rem}
 .wren-shop .shop-count{margin:0;font-size:.92em;opacity:.85}
@@ -1585,6 +1647,7 @@ function shop_css(): string
   .wren-shop .shop-basket tfoot .shop-discount th{flex:1;text-align:left}
   .wren-shop .shop-basket tfoot .shop-discount td{padding:.4rem 0}
 }
+' . filters_css() . '
 </style>' . "\n";
 }
 
@@ -1831,7 +1894,7 @@ function product_cards(array $rows): string
                    . '" alt="" width="400" height="400" loading="lazy"></a>' : '';
         $cards .= '<div class="shop-card">' . $img
                 . ($off || sold_out($p, $pv) ? '<span class="shop-soldout">Sold out</span>' : (product_on_sale($p, $pv) ? '<span class="shop-sale">Sale</span>' : ''))
-                . '<div class="shop-card-text"><h2><a href="' . $link . '">' . e($p['name']) . '</a></h2>'
+                . '<div class="shop-card-text"><h2><a href="' . $link . '">' . search_mark(e($p['name'])) . '</a></h2>'
                 . '<p class="shop-price">' . shop_price_html($p, $pv) . '</p></div></div>';
     }
     return $cards;
@@ -1885,9 +1948,15 @@ function view_list(?string $catSlug = null): never
         }
     }
     $route = $cat ? 'c/' . $cat['slug'] : '';
-    [$grid, $page, $pages] = $cat
-        ? product_grid(cat_in_sql(cat_descendants((int)$cat['id'])), [], $route, 'Nothing for sale here yet.')
-        : product_grid('1', [], $route, 'Nothing for sale here yet.');
+    $where = $cat ? cat_in_sql(cat_descendants((int)$cat['id'])) : '1';
+    $f = filters_read();
+    if ($cat) {
+        $f['cat'] = '';   // a category page is already one category
+    }
+    $bar = filter_bar($where, [], shop_url($route), $f, !$cat);
+    [$grid, $page, $pages] = product_grid($where . ' AND ' . filters_sql($f), [], $route,
+        filters_active($f) ? 'Nothing matches these filters. <a href="' . e(shop_url($route)) . '">Clear filters</a>' : 'Nothing for sale here yet.',
+        ['keep' => filters_keep($f)]);
     // The categories inside this one, to narrow it down (first page only).
     $subs = '';
     if ($cat && $page === 1) {
@@ -1904,12 +1973,12 @@ function view_list(?string $catSlug = null): never
     // "Spares" alone says little in a search result or a browser tab: "SRX2 Spares".
     $tab = $cat && count($trail) > 1 ? $trail[count($trail) - 2]['name'] . ' ' . $cat['name'] : $title;
     render($tab . ($page > 1 ? ' (page ' . $page . ')' : ''),
-        '<h1 class="post-title">' . e($title) . '</h1><div class="post-body">' . $subs . $grid . '</div>',
+        '<h1 class="post-title">' . e($title) . '</h1><div class="post-body">' . $subs . $bar . $grid . '</div>',
         ['description' => ($cat ? $tab . ' from ' : 'Everything for sale from ') . setting('last_site_title', 'us') . '.'
                         . ($page > 1 ? ' Page ' . $page . ' of ' . $pages . '.' : ''),
          'route' => $route,
          'query' => ['page' => $page],
-         'noindex' => list_sort() !== 'new',   // sorted copies of the same list
+         'noindex' => list_sort() !== 'new' || filters_active($f),   // sorted or filtered copies of the same list
          'cat' => $cat ? (int)$cat['id'] : 0,
          'crumbs' => array_map(fn($c) => [$c['name'], $c['id'] === (int)$cat['id'] ? null : 'c/' . $c['slug']], $trail)]);
 }
@@ -2030,7 +2099,7 @@ function view_product(string $slug): never
         . ($f ? '<p class="shop-note" role="status">' . e($f) . '</p>' : '')
         . '<div class="post-body' . ($photos ? ' shop-product' : '') . '">' . $gallery
         . '<div><p class="shop-price" id="shop-price">' . shop_price_html($p, $vars) . '</p>'
-        . $skuHtml . md_lite($p['description']) . $buy
+        . $skuHtml . md_lite($p['description']) . $buy . tags_html((int)$p['id'])
         . '<p><a href="' . e(shop_url($pc ? 'c/' . $pc['slug'] : '')) . '">&larr; ' . ($pc ? 'More ' . e($pc['name']) : 'Back to the shop') . '</a></p></div></div>'
         . related_html($p),
         [
@@ -2764,7 +2833,7 @@ function admin_sections(): array
 {
     return [
         'orders'    => ['Orders', '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
-                        ['orders' => 'All orders', 'reports' => 'Reports', 'export' => 'Export']],
+                        ['orders' => 'All orders', 'reports' => 'Reports', 'searches' => 'Searches', 'export' => 'Export']],
         'products'  => ['Products', '<path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8.5" r="1.5"/>',
                         ['' => 'All products', 'new' => 'Add a product', 'categories' => 'Categories', 'import' => 'Import and export']],
         'customers' => ['Customers', '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>',
@@ -2794,6 +2863,7 @@ function admin_where(): array
         'orders', 'order'    => ['orders', 'orders'],
         'export'             => ['orders', 'export'],
         'reports'            => ['orders', 'reports'],
+        'searches'           => ['orders', 'searches'],
         'customers', 'customer' => ['customers', 'customers'],
         'groups', 'group'    => ['customers', 'groups'],
         'trade'              => ['customers', 'trade'],
@@ -3027,6 +3097,12 @@ table.changes td.was { color:var(--quiet); text-decoration:line-through; text-de
 .optrow input { margin:0 !important; }
 .opthead span { font-size:.8rem; font-weight:600; }
 details.opts { border:1px solid var(--line); border-radius:8px; padding:.6rem .9rem .8rem; background:#fff; }
+.tagchips { margin:.35rem 0 0; display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; }
+.tagchip { font:inherit; font-size:.85rem; padding:.15rem .55rem; border:1px solid var(--line); border-radius:99px; background:#fff; color:inherit; cursor:pointer; }
+.tagchip:hover { border-color:var(--accent, #555); }
+.logoprev { display:inline-block; padding:.8rem 1rem; border:1px solid var(--line); border-radius:8px; background:#fff; margin:.2rem 0 .6rem; }
+.logoprev img { display:block; height:56px; width:auto; max-width:260px; object-fit:contain; object-position:left center; }
+form.inline { display:inline-block; margin:0 0 .6rem .6rem; vertical-align:top; }
 .badge { background:var(--moss); color:#fff; border-radius:9px; padding:0 .45rem; font-size:.7rem; font-weight:700; }
 .pill.ok { border-color:var(--moss); color:var(--moss-d); }
 .pill.wait { border-color:#b07a1f; color:#8a5d10; }
@@ -3659,6 +3735,7 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
                                                                : 'Add more photos.') . '</p></div>'
         . '<label>Description <span class="hint">(optional)</span><textarea name="description" maxlength="5000">' . e($v['description']) . '</textarea></label>'
         . '<p class="muted" style="margin:.3rem 0 0">Leave a blank line between paragraphs. **bold**, *italic*, and lines starting "- " make a list.</p>'
+        . tags_form_html($p, $v)
         . $optionsHtml
         . group_prices_html($p, $v)
         . related_form_html($p, $v)
@@ -3911,6 +3988,8 @@ function admin_save(): never
     $dg = digital_input($p, $v, $errors);
     $gpIn = group_prices_read($errors);
     $relIn = isset($_POST['related']) ? related_parse(post('related'), (int)($p['id'] ?? 0), $errors) : null;
+    $tagsIn = isset($_POST['tags']) ? tags_parse(post('tags'), $errors) : null;
+    $v['tags'] = isset($_POST['tags']) ? post('tags') : null;
     $v['related'] = isset($_POST['related']) ? post('related') : null;
     $v['gp'] = is_array($_POST['gp'] ?? null) ? $_POST['gp'] : null;
     if ($errors) {
@@ -3986,6 +4065,9 @@ function admin_save(): never
     group_prices_save($pid, $gpIn);
     if ($relIn !== null) {
         related_save($pid, $relIn);
+    }
+    if ($tagsIn !== null) {
+        tags_save($pid, $tagsIn);
     }
 
     $msgs = [];
@@ -4085,6 +4167,8 @@ function admin_duplicate(): never
         ->execute([$nid, $p['id']]);
     $pdo->prepare('INSERT INTO product_related (product_id, related_id, position) SELECT ?, related_id, position FROM product_related WHERE product_id = ?')
         ->execute([$nid, $p['id']]);
+    $pdo->prepare('INSERT INTO product_tags (product_id, tag_id) SELECT ?, tag_id FROM product_tags WHERE product_id = ?')
+        ->execute([$nid, $p['id']]);
     foreach (product_photos((int)$p['id']) as $ph) {
         $file = $ph['file'];
         $thumb = $ph['thumb'];
@@ -4128,6 +4212,7 @@ function admin_delete(): never
         db()->prepare('DELETE FROM products WHERE id = ?')->execute([$p['id']]);
         db()->prepare('DELETE FROM group_prices WHERE product_id = ?')->execute([$p['id']]);
         db()->prepare('DELETE FROM product_related WHERE product_id = ? OR related_id = ?')->execute([$p['id'], $p['id']]);
+        tags_save((int)$p['id'], []);
         flash($p['name'] . ' deleted.');
     }
     redirect(admin_url());
@@ -4237,7 +4322,7 @@ const SETTINGS_TABS = ['general' => 'Shop', 'delivery' => 'Delivery', 'payments'
                        'business' => 'Business and VAT', 'account' => 'Your sign-in', 'advanced' => 'Advanced'];
 const SETTINGS_FORMS = ['shop' => 'general', 'search' => 'general', 'accounts' => 'general', 'stock' => 'general', 'demo' => 'general',
                         'postage' => 'delivery', 'payments' => 'payments', 'email' => 'email', 'email_test' => 'email',
-                        'business' => 'business', 'vat' => 'business', 'legal' => 'business',
+                        'business' => 'business', 'vat' => 'business', 'legal' => 'business', 'logo' => 'business', 'logo_remove' => 'business',
                         'password' => 'account', 'signout_all' => 'account', '2fa_start' => 'account', '2fa_confirm' => 'account', '2fa_off' => 'account',
                         'site_url' => 'advanced', 'proxy' => 'advanced', 'version' => 'advanced', 'refresh' => 'advanced'];
 
@@ -4257,6 +4342,7 @@ function view_admin_settings(string $tab = 'general'): never
             case 'shop':
                 set_setting('shop_title', post('shop_title') ?: 'Shop');
                 set_setting('cat_menu', post('cat_menu') === 'top' ? 'top' : 'side');
+                set_setting('show_tags', empty($_POST['show_tags']) ? '0' : '1');
                 $per = post('per_page');
                 if (ctype_digit($per) && (int)$per >= 6 && (int)$per <= 96) {
                     set_setting('per_page', (string)(int)$per);
@@ -4269,6 +4355,8 @@ function view_admin_settings(string $tab = 'general'): never
                 $lines = array_filter(array_map('trim', preg_split('/\R/', mb_substr(str_in($_POST['search_synonyms'] ?? ''), 0, 5000))), fn($l) => $l !== '');
                 set_setting('search_synonyms', implode("\n", $lines));
                 set_setting('search_box', in_array(post('search_box'), ['always', 'never'], true) ? post('search_box') : 'auto');
+                set_setting('search_suggest', empty($_POST['search_suggest']) ? '0' : '1');
+                set_setting('search_log', empty($_POST['search_log']) ? '0' : '1');
                 flash($lines ? 'Saved. Searches now treat ' . count($lines) . ' group' . (count($lines) === 1 ? '' : 's') . ' of words as the same.' : 'Saved: no synonyms.');
                 break;
             case 'postage':
@@ -4321,6 +4409,10 @@ function view_admin_settings(string $tab = 'general'): never
                 set_setting('business_address', post('business_address'));
                 flash('Business details saved.');
                 break;
+            case 'logo':
+            case 'logo_remove':
+                flash(logo_settings_post(post('form')));
+                redirect(settings_url('business', 'logo'));
             case 'payments':
                 $notes = [];
                 $sort = preg_replace('/\D/', '', post('bank_sort_code'));
@@ -4547,6 +4639,7 @@ function view_admin_settings(string $tab = 'general'): never
         <fieldset style="border:0;padding:0;margin:1rem 0"><legend style="font-weight:600;padding:0">Categories menu</legend>
           <label class="check"><input type="radio" name="cat_menu" value="side"' . (side_menu_on() ? ' checked' : '') . '> Down the side, in a card of its own <span class="hint">(on wide screens; along the top on phones and tablets)</span></label>
           <label class="check"><input type="radio" name="cat_menu" value="top"' . (side_menu_on() ? '' : ' checked') . '> Along the top</label></fieldset>
+        <label class="check"><input type="checkbox" name="show_tags" value="1"' . (tags_shown() ? ' checked' : '') . '> Show tags on product pages <span class="hint">(as links, each to a page of products with that tag; search finds tags either way)</span></label>
         <button>Save</button></form>';
     $s['delivery'] .= '<h2 id="postage">Postage and collection</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="postage">
@@ -4617,8 +4710,12 @@ function view_admin_settings(string $tab = 'general'): never
           <label class="check"><input type="radio" name="search_box" value="auto"' . (!in_array(setting('search_box', 'auto'), ['always', 'never'], true) ? ' checked' : '') . '> Once the shop has ' . SEARCH_BOX_FROM . ' or more products</label>
           <label class="check"><input type="radio" name="search_box" value="always"' . (setting('search_box') === 'always' ? ' checked' : '') . '> Always</label>
           <label class="check"><input type="radio" name="search_box" value="never"' . (setting('search_box') === 'never' ? ' checked' : '') . '> Never <span class="hint">(the search page still works for anyone with its address)</span></label></fieldset>
+        <label class="check"><input type="checkbox" name="search_suggest" value="1"' . (search_suggest_on() ? ' checked' : '') . '> Suggest products and categories as customers type</label>
+        <label class="check"><input type="checkbox" name="search_log" value="1"' . (search_log_on() ? ' checked' : '') . '> Keep a log of what customers search for <span class="hint">(the words and how many products they found, never who; kept ' . SEARCH_LOG_MONTHS . ' months; see Orders → Searches)</span></label>
         <label>Words that mean the same <span class="hint">(e.g. <code>alloy = aluminium = alu</code>)</span>
-          <textarea name="search_synonyms" style="min-height:6rem" placeholder="alloy = aluminium = alu&#10;fr = front&#10;diff = differential">' . e(setting('search_synonyms')) . '</textarea></label>
+          <textarea name="search_synonyms" style="min-height:6rem" placeholder="alloy = aluminium = alu&#10;fr = front&#10;diff = differential">' . e(setting('search_synonyms')
+              . (($syn = mb_substr(trim(str_in($_GET['syn'] ?? '')), 0, 100)) !== '' ? (setting('search_synonyms') !== '' ? "\n" : '') . $syn . ' = ' : '')) . '</textarea></label>'
+          . ($syn !== '' ? '<p class="muted">Finish the line with the word customers should find instead, like <code>' . e($syn) . ' = ' . e('the word you use') . '</code>, then Save.</p>' : '') . '
         <button>Save</button></form>';
     $s['general'] .= '<h2 id="accounts">Customer accounts</h2>
       <p class="muted">Customers can create an account to save their addresses and see their orders. Checking out as a guest always works too.</p>
@@ -4640,7 +4737,7 @@ function view_admin_settings(string $tab = 'general'): never
         <label>Business name <input name="business_name" value="' . e(setting('business_name')) . '" maxlength="120"></label>
         <label>Email for customers <input type="email" name="business_email" value="' . e(setting('business_email')) . '" maxlength="200"></label>
         <label>Address <textarea name="business_address" maxlength="300" style="min-height:4rem">' . e(setting('business_address')) . '</textarea></label>
-        <button>Save business details</button></form>';
+        <button>Save business details</button></form>' . logo_settings_html();
     $s['advanced'] .= '<h2 id="site">Web address</h2>
       <p class="muted">The address used in links in emails (order pages, password resets) and to fetch your site\'s look. It\'s taken from your
       own visits here, so it only needs changing if the site moves, for example to https or to a new domain.</p>
@@ -6595,7 +6692,7 @@ function view_packing_slip(int $id): never
 body{font:15px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;margin:0;padding:24px;background:#eee}
 .page{background:#fff;max-width:720px;margin:0 auto;padding:40px}
 .top{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
-h1{font-size:24px;margin:0 0 4px}.muted{color:#666;font-size:13px}
+h1{font-size:24px;margin:0 0 4px}.doclogo{display:block;height:56px;width:auto;max-width:260px;object-fit:contain;object-position:left center;margin:0 0 14px}.muted{color:#666;font-size:13px}
 .to{border:1.5px solid #111;border-radius:6px;padding:14px 18px;font-size:17px;line-height:1.5;min-width:240px}
 table{width:100%;border-collapse:collapse;margin:28px 0}th,td{text-align:left;padding:9px 8px;border-bottom:1px solid #ccc;vertical-align:top}
 th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#666}.qty{width:3em;font-weight:700;font-size:17px}
@@ -6605,7 +6702,7 @@ th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#666}.qty{
 button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;background:#111;color:#fff;cursor:pointer}
 @media print{body{background:#fff;padding:0}.page{padding:0;max-width:none}.bar{display:none}}
 </style></head><body><div class="bar"><button onclick="window.print()">Print</button></div><div class="page">
-<div class="top"><div><h1>Order #' . (int)$o['number'] . '</h1><div class="muted">Placed ' . e(gmdate('j F Y', strtotime($o['created'] . ' UTC')))
+<div class="top"><div>' . logo_html() . '<h1>Order #' . (int)$o['number'] . '</h1><div class="muted">Placed ' . e(gmdate('j F Y', strtotime($o['created'] . ' UTC')))
         . ' · ' . e(order_kind_label($o)) . '</div></div>
 <div class="to">' . implode('<br>', array_map('e', $to)) . '</div></div>
 <table><thead><tr><th></th><th>Qty</th><th>Item</th>' . ($skus ? '<th>SKU</th>' : '') . '</tr></thead><tbody>' . $rows . '</tbody></table>'
@@ -9900,7 +9997,7 @@ function live_choices(array $vars): array
 
 const PRODUCT_CSV_COLUMNS = ['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'stock', 'backorders', 'visible',
                              'main_category', 'categories', 'option_name', 'option2_name', 'choice', 'choice2', 'choice_sku', 'choice_price', 'choice_sale_price',
-                             'choice_active', 'weight', 'choice_weight', 'group_prices', 'photos', 'old_url', 'related', 'description'];
+                             'choice_active', 'weight', 'choice_weight', 'group_prices', 'photos', 'old_url', 'related', 'tags', 'description'];
 const IMPORT_MAX_ROWS = 20000;
 const IMPORT_SHOW_CHANGES = 50;
 
@@ -9939,6 +10036,7 @@ function admin_export_products(): never
     foreach (db()->query('SELECT r.product_id, x.sku, x.slug FROM product_related r JOIN products x ON x.id = r.related_id ORDER BY r.product_id, r.position') as $r) {
         $rel[(int)$r['product_id']][] = $r['sku'] !== '' ? $r['sku'] : $r['slug'];
     }
+    $tagsOf = tags_all();
     $old = [];
     foreach (db()->query('SELECT product_id, old_path FROM redirects ORDER BY old_path') as $r) {
         $old[(int)$r['product_id']][] = $r['old_path'];
@@ -9957,9 +10055,9 @@ function admin_export_products(): never
             $r[7] = $num($v['stock']);
             $rows[] = array_merge($r, [$v['name'], $v['name2'], $v['sku'], $money($v['price_pence']), $money($v['sale_pence']), (int)$v['active'],
                                        $kg($p['weight_g']), $kg($v['weight_g']),
-                                       $gpc($p['id'] . ':' . ($v['price_pence'] === null && !isset($gp[$p['id'] . ':' . $v['id']]) ? 0 : $v['id'])), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $p['description']]);
+                                       $gpc($p['id'] . ':' . ($v['price_pence'] === null && !isset($gp[$p['id'] . ':' . $v['id']]) ? 0 : $v['id'])), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $tagsOf[(int)$p['id']] ?? '', $p['description']]);
         }
-        $rows = $rows ?: [array_merge($base, ['', '', '', '', '', '', $kg($p['weight_g']), '', $gpc($p['id'] . ':0'), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $p['description']])];
+        $rows = $rows ?: [array_merge($base, ['', '', '', '', '', '', $kg($p['weight_g']), '', $gpc($p['id'] . ':0'), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $tagsOf[(int)$p['id']] ?? '', $p['description']])];
         foreach ($rows as $r) {
             echo implode(',', array_map('csv_cell', $r)), "\r\n";
         }
@@ -10097,6 +10195,7 @@ function import_run(array $rows, bool $apply): array
             'photo_items' => [], 'later' => 0];
     $queued = [];   // product|address, so a photo listed twice is fetched once
     $relLater = [];
+    $tagsDone = [];
     $pdo->exec('BEGIN IMMEDIATE');
     try {
         $touched = [];   // product id => 'new' | 'changed' | 'same'
@@ -10423,6 +10522,24 @@ function import_run(array $rows, bool $apply): array
                                              'name' => basename((string)parse_url($url, PHP_URL_PATH)) ?: 'photo', 'show' => import_bool($g('visible')) === 1];
                 }
             }
+            // ---- tags (a product's first row with any says what they are)
+            if ($g('tags') !== '' && !isset($tagsDone[$pid])) {
+                $tagsDone[$pid] = true;
+                $terrs = [];
+                $tnew = $g('tags') === '-' ? [] : tags_parse($g('tags'), $terrs);
+                foreach ($terrs as $e) {
+                    $err($n, $e);
+                }
+                $tnow = array_column(tags_for($pid), 'name');
+                $key = function (array $a) { $a = array_map('slugify', $a); sort($a); return $a; };
+                if (!$terrs && $key($tnew) !== $key($tnow)) {
+                    $note($pid, $label, 'tags', implode(' | ', $tnow), implode(' | ', $tnew));
+                    tags_save($pid, $tnew);
+                    if ($touched[$pid] === 'same') {
+                        $touched[$pid] = 'changed';
+                    }
+                }
+            }
             // ---- related products: set once every row is in (they may be further down the file)
             if ($g('related') !== '') {
                 $relLater[$pid] = [$n, $g('related'), $label];
@@ -10634,6 +10751,7 @@ function view_admin_import(): never
         . '<tr><td><code>photos</code></td><td>Web addresses of its photos, separated by <code>|</code>. They\'re fetched after the import, in batches; one fetched before isn\'t fetched again.</td></tr>'
         . '<tr><td><code>old_url</code></td><td>Its address in your old shop, like <code>/product/wishbone-front/</code>, so it can redirect here (see Customers → Import).</td></tr>'
         . '<tr><td><code>related</code></td><td>Up to 8 related products ("You might also like"), by SKU or web address, separated by <code>|</code>. - clears them.</td></tr>'
+        . '<tr><td><code>tags</code></td><td>Other words the product should be found by, separated by <code>|</code> or commas, like <code>brushless | 2S</code>. - clears them.</td></tr>'
         . '<tr><td><code>description</code></td><td>Paragraphs and lists as in the product form.</td></tr></table>';
     admin_shell('Import and export', '<h1>Import and export products</h1>' . $report
         . ($report === '' ? '<h2>Export</h2>
@@ -10752,7 +10870,7 @@ function search_fts(): bool
         $ok = setting('search_fts', '1') !== '0';   // can be switched off to use LIKE (tests use this)
         if ($ok) {
             try {
-                db()->exec('CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(name, sku, cats, body,
+                db()->exec('CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(name, sku, tags, cats, body,
                             tokenize = "unicode61 remove_diacritics 2", prefix = "2 3")');
             } catch (Throwable $e) {
                 $ok = false;   // this host's SQLite has no FTS5
@@ -10769,7 +10887,9 @@ function search_fingerprint(): string
         (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + LENGTH(description) + LENGTH(option_name) + LENGTH(option2_name)) || ':' || IFNULL(MAX(updated), '') || ':' || TOTAL(category_id) FROM products)
         || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(name2) + LENGTH(sku) + product_id + active) FROM variants)
         || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + parent_id) FROM categories)
-        || '|' || (SELECT COUNT(*) || ':' || TOTAL(category_id * 7 + product_id) FROM product_categories)")->fetchColumn();
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(category_id * 7 + product_id) FROM product_categories)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(tag_id * 7 + product_id) FROM product_tags)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + id) FROM tags)")->fetchColumn();
 }
 
 function search_index_fresh(): void
@@ -10790,7 +10910,8 @@ function search_index_fresh(): void
         foreach ($pdo->query('SELECT product_id, name || \' \' || name2 AS name, sku FROM variants') as $v) {
             $vars[(int)$v['product_id']][] = $v;
         }
-        $ins = $pdo->prepare('INSERT INTO products_fts (rowid, name, sku, cats, body) VALUES (?, ?, ?, ?, ?)');
+        $tagsOf = tags_all(' ');
+        $ins = $pdo->prepare('INSERT INTO products_fts (rowid, name, sku, tags, cats, body) VALUES (?, ?, ?, ?, ?, ?)');
         foreach ($pdo->query('SELECT id, name, sku, description, option_name || \' \' || option2_name AS option_name, category_id FROM products') as $p) {
             $id = (int)$p['id'];
             $cats = [];
@@ -10798,11 +10919,11 @@ function search_index_fresh(): void
                 array_push($cats, ...array_column(cat_trail($c), 'name'));
             }
             $vs = $vars[$id] ?? [];
-            $ins->execute([$id, $p['name'], trim($p['sku'] . ' ' . implode(' ', array_column($vs, 'sku'))),
+            $ins->execute([$id, $p['name'], trim($p['sku'] . ' ' . implode(' ', array_column($vs, 'sku'))), $tagsOf[$id] ?? '',
                            implode(' ', array_unique($cats)), $p['description'] . ' ' . $p['option_name'] . ' ' . implode(' ', array_column($vs, 'name'))]);
         }
-        // Name matters most, then SKU, then category, then the description.
-        $pdo->exec("INSERT INTO products_fts (products_fts, rank) VALUES ('rank', 'bm25(10.0, 8.0, 3.0, 1.0)')");
+        // Name matters most, then SKU, then tags, then category, then the description.
+        $pdo->exec("INSERT INTO products_fts (products_fts, rank) VALUES ('rank', 'bm25(10.0, 8.0, 5.0, 3.0, 1.0)')");
         set_setting('search_fp', $fp);
         $pdo->exec('COMMIT');
     } catch (Throwable $e) {
@@ -10847,6 +10968,16 @@ function search_sql(string $s): array
 {
     $terms = search_terms($s);
     $exact = db()->quote(trim($s));
+    // 1.4.0 ranking: an exact part number, then every word in the name, then a name
+    // starting with the first word, then however well the rest matched.
+    $nm = "(' ' || REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(p.name, '-', ' '), '(', ' '), '/', ' '), ',', ' '), '.', ' '))";
+    $q = fn(string $w) => db()->quote(strtr($w, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']));
+    $tiers = '';
+    if ($terms) {
+        $all = implode(' AND ', array_map(fn($alts) => '(' . implode(' OR ', array_map(fn($w) => "$nm LIKE '% ' || " . $q($w) . " || '%' ESCAPE '\\'", $alts)) . ')', $terms));
+        $starts = implode(' OR ', array_map(fn($w) => "$nm LIKE ' ' || " . $q($w) . " || '%' ESCAPE '\\'", $terms[0]));
+        $tiers = "CASE WHEN $all THEN 0 ELSE 1 END, CASE WHEN $starts THEN 0 ELSE 1 END, ";
+    }
     $skuFirst = "CASE WHEN p.sku = $exact COLLATE NOCASE OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.sku = $exact COLLATE NOCASE) THEN 0 ELSE 1 END";
     if (!$terms) {
         return ['0', [], 'p.id'];
@@ -10857,7 +10988,7 @@ function search_sql(string $s): array
         $match = implode(' AND ', array_map(fn($alts) => '(' . implode(' OR ', array_map(fn($w) => '"' . str_replace('"', '', $w) . '"*', $alts)) . ')', $terms));
         $m = db()->quote($match);
         return ["p.id IN (SELECT rowid FROM products_fts WHERE products_fts MATCH $m)", [],
-                "$skuFirst, (SELECT rank FROM products_fts WHERE products_fts MATCH $m AND rowid = p.id), p.name COLLATE NOCASE"];
+                "$skuFirst, $tiers(SELECT rank FROM products_fts WHERE products_fts MATCH $m AND rowid = p.id), p.name COLLATE NOCASE"];
     }
     // No FTS5: every word somewhere in the name, SKUs, categories (and the ones they sit in) or description.
     $up = fn(string $id) => "(SELECT parent_id FROM categories WHERE id = $id)";
@@ -10868,19 +10999,210 @@ function search_sql(string $s): array
     $where = [];
     $args = [];
     $inName = [];
+    $inTags = [];
+    $inSku = [];
     foreach ($terms as $alts) {
         $any = [];
         foreach ($alts as $w) {
             $like = '%' . strtr($w, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']) . '%';
             $any[] = "(p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\'
                       OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.sku LIKE ? ESCAPE '\\' OR (v.name || ' ' || v.name2) LIKE ? ESCAPE '\\'))
+                      OR EXISTS (SELECT 1 FROM product_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.product_id = p.id AND t.name LIKE ? ESCAPE '\\')
                       OR EXISTS (SELECT 1 FROM categories c WHERE c.name LIKE ? ESCAPE '\\' AND (c.id IN $inCats)))";
-            array_push($args, $like, $like, $like, $like, $like, $like);
+            array_push($args, $like, $like, $like, $like, $like, $like, $like);
             $inName[] = 'p.name LIKE ' . db()->quote($like) . " ESCAPE '\\'";
+            $inSku[] = '(p.sku LIKE ' . db()->quote($like) . " ESCAPE '\\' OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.sku LIKE " . db()->quote($like) . " ESCAPE '\\'))";
+            $inTags[] = 'EXISTS (SELECT 1 FROM product_tags pt JOIN tags t ON t.id = pt.tag_id WHERE pt.product_id = p.id AND t.name LIKE ' . db()->quote($like) . " ESCAPE '\\')";
         }
         $where[] = '(' . implode(' OR ', $any) . ')';
     }
-    return [implode(' AND ', $where), $args, "$skuFirst, CASE WHEN " . implode(' OR ', $inName) . ' THEN 0 ELSE 1 END, p.name COLLATE NOCASE'];
+    return [implode(' AND ', $where), $args, "$skuFirst, $tiers" . 'CASE WHEN ' . implode(' OR ', $inName) . ' THEN 0 ELSE 1 END, CASE WHEN ' . implode(' OR ', $inSku) . ' THEN 0 ELSE 1 END, CASE WHEN '
+            . implode(' OR ', $inTags) . ' THEN 0 ELSE 1 END, p.name COLLATE NOCASE'];
+}
+
+/* ----------------------------------------------------- spelling mistakes
+   1.4.0. Every word in the shop's products (names, descriptions, tags,
+   categories, choices), with how many products use it. A search that finds
+   nothing has each word it doesn't know swapped for the nearest one it does:
+   one letter wrong, missing, extra or two swapped for words of 4 to 6 letters,
+   up to two for longer ones. Words shorter than 4 letters, and anything with a
+   digit in it (part numbers), are never guessed at. Rebuilt, like the full-text
+   index, when the catalogue has changed since it was made. */
+
+const SPELL_MIN = 4;
+
+function search_words_fresh(): void
+{
+    $fp = search_fingerprint() . '|' . db()->query('SELECT TOTAL(visible) FROM products')->fetchColumn();
+    if (setting('search_words_fp') === $fp) {
+        return;
+    }
+    $pdo = db();
+    $count = [];
+    $tagsOf = tags_all(' ');
+    $vars = [];
+    foreach ($pdo->query('SELECT product_id, name || \' \' || name2 AS name FROM variants') as $v) {
+        $vars[(int)$v['product_id']][] = $v['name'];
+    }
+    $extra = [];
+    foreach ($pdo->query('SELECT product_id, category_id FROM product_categories') as $r) {
+        $extra[(int)$r['product_id']][] = (int)$r['category_id'];
+    }
+    foreach ($pdo->query('SELECT id, name, sku, description, option_name, option2_name, category_id FROM products WHERE visible = 1') as $p) {
+        $id = (int)$p['id'];
+        $cats = [];
+        foreach (array_merge([(int)$p['category_id']], $extra[$id] ?? []) as $c) {
+            array_push($cats, ...array_column(cat_trail($c), 'name'));
+        }
+        $text = implode(' ', [$p['name'], $p['sku'], $p['description'], $p['option_name'], $p['option2_name'], $tagsOf[$id] ?? '',
+                              implode(' ', $cats), implode(' ', $vars[$id] ?? [])]);
+        foreach (array_unique(search_words_in($text)) as $w) {
+            $count[$w] = ($count[$w] ?? 0) + 1;
+        }
+    }
+    $pdo->exec('BEGIN IMMEDIATE');
+    try {
+        $pdo->exec('DELETE FROM search_words');
+        $ins = $pdo->prepare('INSERT INTO search_words (word, n) VALUES (?, ?)');
+        foreach ($count as $w => $n) {
+            $ins->execute([(string)$w, $n]);
+        }
+        set_setting('search_words_fp', $fp);
+        $pdo->exec('COMMIT');
+    } catch (Throwable $e) {
+        $pdo->exec('ROLLBACK');
+        throw $e;
+    }
+}
+
+/* The words in some text worth knowing: letters only, 3 or more of them. */
+function search_words_in(string $text): array
+{
+    $text = mb_strtolower(html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $out = [];
+    foreach (preg_split('/[^\p{L}\p{N}]+/u', $text, -1, PREG_SPLIT_NO_EMPTY) as $w) {
+        if (mb_strlen($w) >= 3 && !preg_match('/\d/', $w)) {
+            $out[] = $w;
+        }
+    }
+    return $out;
+}
+
+/* Is $w a word, or the start of one, that the shop has? */
+function search_word_known(string $w): bool
+{
+    $st = db()->prepare('SELECT 1 FROM search_words WHERE word >= ? AND word < ? LIMIT 1');
+    $st->execute([$w, $w . "\u{10FFFF}"]);
+    return (bool)$st->fetchColumn();
+}
+
+/* Edit distance counting a swap of two neighbouring letters as one change. */
+function spell_distance(string $a, string $b, int $max): int
+{
+    $x = mb_str_split($a);
+    $y = mb_str_split($b);
+    $n = count($x);
+    $m = count($y);
+    if (abs($n - $m) > $max) {
+        return $max + 1;
+    }
+    $d = [];
+    for ($i = 0; $i <= $n; $i++) {
+        $d[$i][0] = $i;
+    }
+    for ($j = 0; $j <= $m; $j++) {
+        $d[0][$j] = $j;
+    }
+    for ($i = 1; $i <= $n; $i++) {
+        $best = PHP_INT_MAX;
+        for ($j = 1; $j <= $m; $j++) {
+            $c = $x[$i - 1] === $y[$j - 1] ? 0 : 1;
+            $v = min($d[$i - 1][$j] + 1, $d[$i][$j - 1] + 1, $d[$i - 1][$j - 1] + $c);
+            if ($i > 1 && $j > 1 && $x[$i - 1] === $y[$j - 2] && $x[$i - 2] === $y[$j - 1]) {
+                $v = min($v, $d[$i - 2][$j - 2] + 1);
+            }
+            $d[$i][$j] = $v;
+            $best = min($best, $v);
+        }
+        if ($best > $max) {
+            return $max + 1;   // can only get worse
+        }
+    }
+    return $d[$n][$m];
+}
+
+/* The nearest word the shop knows, or null if none is close enough. A word
+   can also be close to the start of a longer one ("wishbn" → "wishbone"). */
+function spell_nearest(string $w): ?string
+{
+    $len = mb_strlen($w);
+    $max = $len <= 6 ? 1 : 2;
+    $st = db()->prepare('SELECT word, n FROM search_words WHERE LENGTH(word) >= CAST(? AS INTEGER) ORDER BY n DESC, LENGTH(word), word');
+    $st->execute([max(3, $len - $max)]);
+    $best = null;
+    $bestD = $max + 1;
+    foreach ($st as $r) {
+        $cand = (string)$r['word'];
+        if (levenshtein($w, $cand) > 2 * $max + 4 && levenshtein($w, mb_substr($cand, 0, $len)) > 2 * $max + 4) {
+            continue;   // nowhere near, by bytes (quick)
+        }
+        $d = spell_distance($w, $cand, $max);
+        if (mb_strlen($cand) > $len + $max) {
+            $d = min($d, spell_distance($w, mb_substr($cand, 0, $len), $max));
+        }
+        if ($d < $bestD) {   // ties: the word more products use (the order of the rows)
+            [$best, $bestD] = [$cand, $d];
+        }
+    }
+    return $bestD <= $max ? $best : null;
+}
+
+/* The search with its unknown words corrected, or null if nothing changed. */
+function search_corrected(string $s): ?string
+{
+    search_words_fresh();
+    $syn = search_synonyms();
+    $out = [];
+    $changed = false;
+    foreach (array_slice(preg_split('/\s+/', trim($s), -1, PREG_SPLIT_NO_EMPTY), 0, SEARCH_MAX_WORDS) as $raw) {
+        $w = trim(preg_replace('/[^\p{L}\p{N}\-.\/]+/u', '', mb_strtolower($raw)), '-./');
+        if ($w === '' || preg_match('/\d/', $w) || isset($syn[$w]) || search_word_known($w)) {
+            $out[] = $raw;
+            continue;
+        }
+        // Each part of a joined word on its own ("t-shrit" → "t-shirt").
+        $parts = preg_split('/([\-.\/])/', $w, -1, PREG_SPLIT_DELIM_CAPTURE);
+        $fixedAny = false;
+        foreach ($parts as $i => $part) {
+            if ($i % 2 === 0 && mb_strlen($part) >= SPELL_MIN && !search_word_known($part) && ($near = spell_nearest($part)) !== null) {
+                $parts[$i] = $near;
+                $fixedAny = true;
+            }
+        }
+        $out[] = $fixedAny ? implode('', $parts) : $raw;
+        $changed = $changed || $fixedAny;
+    }
+    return $changed ? implode(' ', $out) : null;
+}
+
+/* How many products a search's where-clause finds. */
+function search_count(string $where, array $args): int
+{
+    $st = db()->prepare("SELECT COUNT(*) FROM products p WHERE p.visible = 1 AND ($where)");
+    $st->execute($args);
+    return (int)$st->fetchColumn();
+}
+
+/* Search words picked out in bold in an (escaped) product name. */
+function search_mark(string $html): string
+{
+    $words = $GLOBALS['shop_marks'] ?? [];
+    if (!$words) {
+        return $html;
+    }
+    usort($words, fn($a, $b) => mb_strlen($b) <=> mb_strlen($a));
+    $re = '/(?<![\p{L}\p{N}&#])(' . implode('|', array_map(fn($w) => preg_quote(e($w), '/'), $words)) . ')/iu';
+    return (string)preg_replace($re, '<strong>$1</strong>', $html);
 }
 
 /* The shop's search box: in the shop menu, or at the top of the categories card
@@ -10925,19 +11247,142 @@ function view_search(): never
             $st->execute([$s, $s]);
             $hit = $st->fetchAll(PDO::FETCH_COLUMN);
             if (count($hit) === 1) {
+                search_log_add($s, 1);
                 redirect(shop_url('p/' . $hit[0]));
             }
         }
         [$where, $args, $order] = search_sql($s);
-        [$grid, $page] = product_grid($where, $args, 'search', '', [
-            'sorts' => ['best' => 'Best match'] + SORTS, 'best' => $order, 'keep' => ['s' => $s], 'noun' => 'products match', 'noun1' => 'product matches', 'count' => true]);
-        $body = $grid !== '<p></p>' ? $grid
-              : '<p>Nothing matches <strong>' . e($s) . '</strong>. Try fewer words, the start of a word, or a part number.</p>';
+        $used = $s;
+        // Nothing found: try again with any misspelt words corrected.
+        if (!isset($_GET['exact']) && search_count($where, $args) === 0 && ($fixed = search_corrected($s)) !== null) {
+            [$w2, $a2, $o2] = search_sql($fixed);
+            if (search_count($w2, $a2) > 0) {
+                [$where, $args, $order, $used] = [$w2, $a2, $o2, $fixed];
+                $body .= '<p class="shop-note shop-corrected">Showing results for <strong>' . e($fixed) . '</strong>. '
+                       . '<a href="' . e(url_with(shop_url('search'), ['s' => $s, 'exact' => 1])) . '">Search for ' . e($s) . ' instead</a></p>';
+            }
+        }
+        $GLOBALS['shop_marks'] = array_merge(...(search_terms($used) ?: [[]]));
+        if (!isset($_GET['page']) && !isset($_GET['sort']) && !isset($_GET['exact']) && !filters_active(filters_read())) {   // a new search, not another look at one
+            search_log_add($s, search_count($where, $args));
+        }
+        $keep = ['s' => $s] + (isset($_GET['exact']) ? ['exact' => '1'] : []);
+        $f = filters_read();
+        $body .= filter_bar($where, $args, url_with(shop_url('search'), $keep), $f, true);
+        [$grid, $page] = product_grid($where . ' AND ' . filters_sql($f), $args, 'search', '', [
+            'sorts' => ['best' => 'Best match'] + SORTS, 'best' => $order, 'keep' => $keep + filters_keep($f), 'noun' => 'products match', 'noun1' => 'product matches', 'count' => true]);
+        $body .= $grid !== '<p></p>' ? $grid
+              : (filters_active($f) ? '<p>Nothing matches these filters. <a href="' . e(url_with(shop_url('search'), $keep)) . '">Clear filters</a></p>'
+                 : '<p>Nothing matches <strong>' . e($s) . '</strong>. Try fewer words, the start of a word, or a part number.</p>');
     }
     render('Search' . ($s !== '' ? ': ' . $s : '') . ($page > 1 ? ' (page ' . $page . ')' : ''),
         '<h1 class="post-title">' . ($s !== '' ? 'Search: ' . e($s) : 'Search') . '</h1><div class="post-body">'
         . ($s === '' || !search_box_wanted() ? '<div class="shop-search-page">' . search_box($s) . '</div>' : '') . $body . '</div>',
-        ['route' => 'search', 'noindex' => true, 'crumbs' => [['Search', null]], 'search' => $s]);
+        ['route' => 'search', 'noindex' => true, 'crumbs' => [['Search', null]], 'search' => $s, 'search_page' => true]);
+}
+
+/* ------------------------------------------------- suggestions as you type
+   1.4.0. After two letters, a list under the search box: up to 6 products
+   (photo, name, price) and 3 categories, best match first, then See all
+   results. The shop answers with JSON from the same search as the results
+   page (spelling mistakes forgiven too). Without JavaScript the box works as
+   it always has. A setting (Settings → Shop → Search) switches it off. */
+
+const SUGGEST_PRODUCTS = 6;
+const SUGGEST_CATS = 3;
+
+function search_suggest_on(): bool
+{
+    return setting('search_suggest', '1') === '1';
+}
+
+function search_suggest(): never
+{
+    $s = mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100);
+    $out = ['products' => [], 'cats' => [], 'count' => 0, 'all' => url_with(shop_url('search'), ['s' => $s]), 'fixed' => null];
+    if (search_suggest_on() && mb_strlen($s) >= 2) {
+        [$where, $args, $order] = search_sql($s);
+        $used = $s;
+        $total = search_count($where, $args);
+        if ($total === 0 && ($fixed = search_corrected($s)) !== null) {
+            [$w2, $a2, $o2] = search_sql($fixed);
+            if (($t2 = search_count($w2, $a2)) > 0) {
+                [$where, $args, $order, $used, $total, $out['fixed']] = [$w2, $a2, $o2, $fixed, $t2, $fixed];
+            }
+        }
+        $out['count'] = $total;
+        $GLOBALS['shop_marks'] = array_merge(...(search_terms($used) ?: [[]]));
+        if ($total > 0) {
+            $st = db()->prepare("SELECT p.* FROM products p WHERE p.visible = 1 AND ($where) ORDER BY $order LIMIT " . SUGGEST_PRODUCTS);
+            $st->execute($args);
+            $rows = $st->fetchAll();
+            $photos = first_photos(array_column($rows, 'id'));
+            $vars = variants_for(array_column($rows, 'id'));
+            foreach ($rows as $p) {
+                $ph = $photos[(int)$p['id']] ?? null;
+                $out['products'][] = ['name' => search_mark(e($p['name'])), 'url' => shop_url('p/' . $p['slug']),
+                                      'img' => $ph ? media_url($ph['thumb']) : '', 'price' => shop_price_html($p, live_choices($vars[(int)$p['id']] ?? []))];
+            }
+        }
+        // Categories whose names have every word (as the start of a word).
+        $live = cat_live();
+        $words = array_map(fn($alts) => $alts, search_terms($used));
+        foreach (categories() as $c) {
+            if (count($out['cats']) >= SUGGEST_CATS || !isset($live[$c['id']])) {
+                continue;
+            }
+            $name = ' ' . mb_strtolower(preg_replace('/[^\p{L}\p{N}]+/u', ' ', $c['name']));
+            $all = $words && !array_filter($words, fn($alts) => !array_filter($alts, fn($w) => str_contains($name, ' ' . $w)));
+            if ($all) {
+                $trail = cat_trail((int)$c['id']);
+                $out['cats'][] = ['name' => search_mark(e($c['name'])), 'url' => shop_url('c/' . $c['slug']),
+                                  'in' => count($trail) > 1 ? e($trail[count($trail) - 2]['name']) : ''];
+            }
+        }
+    }
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: private, max-age=60');
+    header('X-Robots-Tag: noindex');
+    echo json_encode($out, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/* The browser side: one list per search box, kept up to date as you type. */
+function search_suggest_script(): string
+{
+    if (!search_suggest_on()) {
+        return '';
+    }
+    $url = json_encode(strtok(shop_url('search/suggest'), '?') . (setting('pretty_urls', '1') !== '1' ? '?q=search/suggest&' : '?'), JSON_UNESCAPED_SLASHES);
+    return '<div class="shop-vh" role="status" aria-live="polite" id="shop-suggest-say"></div><script>(function(){var U=' . $url . ',n=0,say=document.getElementById("shop-suggest-say");'
+        . 'document.querySelectorAll("form.shop-search").forEach(function(f){var i=f.querySelector("input[type=search]");if(!i)return;'
+        . 'var id="shop-sg-"+(++n),box=document.createElement("div"),items=[],at=-1,t=0,last="",ctl=null,cache={};'
+        . 'box.className="shop-suggest";box.id=id;box.setAttribute("role","listbox");box.setAttribute("aria-label","Suggestions");box.hidden=true;f.appendChild(box);'
+        . 'i.setAttribute("role","combobox");i.setAttribute("aria-autocomplete","list");i.setAttribute("aria-expanded","false");i.setAttribute("aria-controls",id);i.setAttribute("autocomplete","off");'
+        . 'function close(){box.hidden=true;i.setAttribute("aria-expanded","false");i.removeAttribute("aria-activedescendant");at=-1;}'
+        . 'function mark(k){items.forEach(function(e,j){e.classList.toggle("on",j===k);e.setAttribute("aria-selected",j===k?"true":"false");});at=k;'
+        . 'if(k>=0){i.setAttribute("aria-activedescendant",items[k].id);items[k].scrollIntoView({block:"nearest"});}else i.removeAttribute("aria-activedescendant");}'
+        . 'function show(d){var h="",k=0;function opt(cls,url,inner){return \'<a role="option" aria-selected="false" class="\'+cls+\'" id="\'+id+"-"+(k++)+\'" href="\'+url.replace(/"/g,"&quot;")+\'">\'+inner+"</a>";}'
+        . 'if(d.fixed)h+=\'<p class="shop-sg-note">Showing results for <strong>\'+d.fixed.replace(/[<&]/g,"")+"</strong></p>";'
+        . 'd.products.forEach(function(p){h+=opt("shop-sg-p",p.url,(p.img?\'<img src="\'+p.img+\'" alt="" width="40" height="40">\':\'<span class="shop-sg-noimg"></span>\')+\'<span class="shop-sg-name">\'+p.name+\'</span><span class="shop-sg-price">\'+p.price+"</span>");});'
+        . 'if(d.cats.length){h+=\'<p class="shop-sg-head">Categories</p>\';d.cats.forEach(function(c){h+=opt("shop-sg-c",c.url,\'<span class="shop-sg-name">\'+c.name+"</span>"+(c.in?\'<span class="shop-sg-in">in \'+c.in+"</span>":""));});}'
+        . 'if(d.count>0)h+=opt("shop-sg-all",d.all,"See all "+d.count+" result"+(d.count===1?"":"s"));else h+=\'<p class="shop-sg-none">Nothing matches. Press Enter to search anyway.</p>\';'
+        . 'box.innerHTML=h;items=[].slice.call(box.querySelectorAll("[role=option]"));at=-1;box.hidden=false;i.setAttribute("aria-expanded","true");'
+        . 'say.textContent=d.count>0?(d.products.length+d.cats.length)+" suggestions. Use the up and down arrows to choose.":"No suggestions.";}'
+        . 'function go(){var q=i.value.trim();if(q.length<2){close();last="";return;}if(q===last&&!box.hidden)return;last=q;'
+        . 'if(cache[q]){show(cache[q]);return;}if(ctl)ctl.abort();ctl=window.AbortController?new AbortController():null;'
+        . 'fetch(U+"s="+encodeURIComponent(q),{signal:ctl?ctl.signal:undefined,credentials:"same-origin"}).then(function(r){return r.json();})'
+        . '.then(function(d){cache[q]=d;if(i.value.trim()===q&&document.activeElement===i)show(d);}).catch(function(){});}'
+        . 'i.addEventListener("input",function(){clearTimeout(t);t=setTimeout(go,150);});'
+        . 'i.addEventListener("focus",function(){if(i.value.trim().length>=2)go();});'
+        . 'i.addEventListener("keydown",function(e){if(box.hidden||!items.length){if(e.key==="ArrowDown"&&i.value.trim().length>=2){last="";go();}return;}'
+        . 'if(e.key==="ArrowDown"){e.preventDefault();mark(at+1>=items.length?0:at+1);}'
+        . 'else if(e.key==="ArrowUp"){e.preventDefault();mark(at<=0?items.length-1:at-1);}'
+        . 'else if(e.key==="Escape"){e.preventDefault();close();}'
+        . 'else if(e.key==="Enter"&&at>=0){e.preventDefault();location.href=items[at].href;}});'
+        . 'document.addEventListener("click",function(e){if(!f.contains(e.target))close();});'
+        . 'f.addEventListener("focusout",function(e){if(!f.contains(e.relatedTarget))setTimeout(function(){if(!f.contains(document.activeElement))close();},0);});'
+        . '});})();</script>';
 }
 /* ================================================================ invoices */
 /* 1.2.0. A printable invoice for each paid order, from the admin order page and
@@ -11034,7 +11479,7 @@ function invoice_html(array $o, string $back): string
 body{font:15px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;margin:0;padding:24px;background:#eee}
 .page{background:#fff;max-width:760px;margin:0 auto;padding:44px}
 .top{display:flex;justify-content:space-between;gap:28px;flex-wrap:wrap;align-items:flex-start}
-h1{font-size:26px;margin:0 0 14px}.muted{color:#666;font-size:13px}
+h1{font-size:26px;margin:0 0 14px}.doclogo{display:block;height:56px;width:auto;max-width:260px;object-fit:contain;object-position:left center;margin:0 0 16px}.muted{color:#666;font-size:13px}
 .facts th{text-align:left;font-weight:600;padding:2px 14px 2px 0;color:#444;font-size:14px}.facts td{font-size:14px;padding:2px 0}
 .parties{display:flex;gap:40px;flex-wrap:wrap;margin:26px 0 6px}.parties div{min-width:220px}
 .parties h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:#666;margin:0 0 4px}
@@ -11049,7 +11494,7 @@ table.lines{width:100%;border-collapse:collapse;margin:26px 0 0}
 button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;background:#111;color:#fff;cursor:pointer}
 @media print{body{background:#fff;padding:0}.page{padding:0;max-width:none}.bar{display:none}}
 </style></head><body><div class="bar"><a href="' . e($back) . '">&larr; Back to the order</a><button onclick="window.print()">Print or save as PDF</button></div>
-<div class="page"><div class="top"><div><h1>' . $title . '</h1><table class="facts">' . $factHtml . '</table></div>'
+<div class="page"><div class="top"><div>' . logo_html() . '<h1>' . $title . '</h1><table class="facts">' . $factHtml . '</table></div>'
         . ($o['status'] === 'refunded' ? '<div><span class="flag">REFUNDED</span><div class="muted" style="margin-top:6px">This order was refunded in full.</div></div>' : '') . '</div>
 <div class="parties"><div><h2>From</h2>' . implode('<br>', array_map('e', $seller)) . '</div><div><h2>To</h2>' . implode('<br>', array_map('e', array_filter($buyer))) . '</div></div>
 <table class="lines"><thead><tr><th>Description</th><th class="n">Qty</th>'
@@ -13231,6 +13676,634 @@ function view_admin_reports(): never
         . '<div class="rhead"><h2>By category</h2>' . $csv('cats') . '</div>' . $tbl($d['cats'], 'Category')
         . '<p class="muted">Best sellers and categories count items at the prices charged, before any discount code on the whole order, and by each product\'s main category today.</p>');
 }
+
+/* ==================================================================== tags
+   1.4.0. Words a product should be found by that aren't in its name: typed on
+   the product form or in the CSV's tags column, and brought across from
+   WooCommerce. Search finds them. Showing them to customers, as links to a page
+   of everything with that tag, is a setting (Settings → Shop), off to start. */
+
+const TAGS_MAX = 20;        // per product
+const TAG_MAX_LEN = 40;
+
+function tags_shown(): bool
+{
+    return setting('show_tags', '0') === '1';
+}
+
+/* "brushless, 2S | short course" as names, tidied and without repeats. */
+function tags_parse(string $list, array &$errors = []): array
+{
+    $out = [];
+    foreach (preg_split('/\s*[,|\n]\s*/u', trim($list), -1, PREG_SPLIT_NO_EMPTY) as $t) {
+        $t = trim(preg_replace('/\s+/u', ' ', $t), " \t#");
+        if ($t === '' || slugify($t) === '') {
+            continue;
+        }
+        if (mb_strlen($t) > TAG_MAX_LEN) {
+            $errors[] = 'A tag can be up to ' . TAG_MAX_LEN . ' letters long ("' . mb_substr($t, 0, 20) . '…").';
+            continue;
+        }
+        $out[slugify($t)] ??= $t;
+    }
+    if (count($out) > TAGS_MAX) {
+        $errors[] = 'Up to ' . TAGS_MAX . ' tags on a product, please.';
+    }
+    return array_values(array_slice($out, 0, TAGS_MAX));
+}
+
+/* A product's tags, in name order. */
+function tags_for(int $pid): array
+{
+    $st = db()->prepare('SELECT t.* FROM tags t JOIN product_tags pt ON pt.tag_id = t.id WHERE pt.product_id = ? ORDER BY t.name COLLATE NOCASE');
+    $st->execute([$pid]);
+    return $st->fetchAll();
+}
+
+function tags_text(int $pid, string $sep = ', '): string
+{
+    return implode($sep, array_column(tags_for($pid), 'name'));
+}
+
+/* Every product's tags at once, for the CSV export: product id => "a | b". */
+function tags_all(string $sep = ' | '): array
+{
+    $out = [];
+    foreach (db()->query('SELECT pt.product_id, t.name FROM product_tags pt JOIN tags t ON t.id = pt.tag_id ORDER BY t.name COLLATE NOCASE') as $r) {
+        $out[(int)$r['product_id']][] = $r['name'];
+    }
+    return array_map(fn($a) => implode($sep, $a), $out);
+}
+
+/* Replace a product's tags. A tag is shared by name (ignoring case); one no
+   product uses any more is removed. The first spelling used is kept. */
+function tags_save(int $pid, array $names): void
+{
+    $pdo = db();
+    $ids = [];
+    foreach ($names as $n) {
+        $slug = slugify($n);
+        $st = $pdo->prepare('SELECT id FROM tags WHERE slug = ?');
+        $st->execute([$slug]);
+        $id = $st->fetchColumn();
+        if (!$id) {
+            $pdo->prepare('INSERT INTO tags (name, slug) VALUES (?, ?)')->execute([$n, $slug]);
+            $id = $pdo->lastInsertId();
+        }
+        $ids[] = (int)$id;
+    }
+    $pdo->prepare('DELETE FROM product_tags WHERE product_id = ?')->execute([$pid]);
+    foreach (array_unique($ids) as $id) {
+        $pdo->prepare('INSERT INTO product_tags (product_id, tag_id) VALUES (?, ?)')->execute([$pid, $id]);
+    }
+    $pdo->exec('DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM product_tags)');
+}
+
+/* The product form's Tags field, with the tags already in use one tap away. */
+function tags_form_html(?array $p, array $v): string
+{
+    $val = $v['tags'] ?? ($p ? tags_text((int)$p['id']) : '');
+    $used = db()->query('SELECT t.name, COUNT(*) AS n FROM tags t JOIN product_tags pt ON pt.tag_id = t.id GROUP BY t.id ORDER BY n DESC, t.name COLLATE NOCASE LIMIT 40')->fetchAll();
+    $chips = '';
+    foreach ($used as $t) {
+        $chips .= '<button type="button" class="tagchip" data-tag="' . e($t['name']) . '">' . e($t['name']) . '</button>';
+    }
+    return '<label>Tags <span class="hint">(optional: other words it should be found by, separated by commas)</span>'
+        . '<input name="tags" id="tags" value="' . e($val) . '" maxlength="1000" placeholder="e.g. brushless, 2S, short course"></label>'
+        . ($chips !== '' ? '<p class="tagchips"><span class="hint">Tags in use:</span> ' . $chips . '</p>'
+            . '<script>document.querySelectorAll(".tagchip").forEach(function(b){b.addEventListener("click",function(){var i=document.getElementById("tags"),'
+            . 'have=i.value.split(",").map(function(x){return x.trim().toLowerCase();}).filter(Boolean),t=b.dataset.tag;'
+            . 'if(have.indexOf(t.toLowerCase())<0)i.value=(i.value.trim().replace(/,\s*$/,"")+(i.value.trim()?", ":"")+t);i.focus();});});</script>' : '');
+}
+
+/* On the product page, when tags are shown: links to each tag's page. */
+function tags_html(int $pid): string
+{
+    if (!tags_shown() || !($tags = tags_for($pid))) {
+        return '';
+    }
+    $links = array_map(fn($t) => '<li><a href="' . e(shop_url('t/' . $t['slug'])) . '">' . e($t['name']) . '</a></li>', $tags);
+    return '<div class="shop-tags"><span>Tags:</span><ul>' . implode('', $links) . '</ul></div>';
+}
+
+/* A tag's page: everything for sale with that tag. Only when tags are shown. */
+function view_tag(string $slug): never
+{
+    $st = db()->prepare('SELECT * FROM tags WHERE slug = ?');
+    $st->execute([$slug]);
+    $tag = $st->fetch();
+    if (!$tag || !tags_shown()) {
+        view_404();
+    }
+    [$grid, $page, $pages] = product_grid('p.id IN (SELECT product_id FROM product_tags WHERE tag_id = ' . (int)$tag['id'] . ')', [],
+        't/' . $tag['slug'], 'Nothing for sale with this tag at the moment.', ['count' => true]);
+    render($tag['name'] . ($page > 1 ? ' (page ' . $page . ')' : ''),
+        '<h1 class="post-title">' . e($tag['name']) . '</h1><div class="post-body">' . $grid . '</div>',
+        ['description' => 'Everything tagged ' . $tag['name'] . ' from ' . setting('last_site_title', 'us') . '.',
+         'route' => 't/' . $tag['slug'], 'query' => ['page' => $page],
+         'noindex' => true,   // the same products as the categories, grouped another way
+         'crumbs' => [['Tagged ' . $tag['name'], null]]]);
+}
+
+/* ================================================================= filters
+   1.4.0. Narrowing a long list: search results, the shop's own list and each
+   category get a bar of filters once there are 12 or more products to narrow:
+   category (search and the shop's list only, with a count for each), price
+   (bands worked out from what's listed), in stock only, and on sale. Filters
+   are plain links that change the page's address, so a filtered page can be
+   shared or bookmarked and works without JavaScript. On a phone the bar folds
+   behind a Filter button. */
+
+const FILTER_FROM = 12;
+const PRICE_LADDER = [1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000, 1500, 2000, 2500, 5000, 10000];
+
+/* The filters in the address: cat (a category's web address), price ("10-25",
+   "-10" or "100-", in pounds), stock=1 and sale=1. */
+function filters_read(): array
+{
+    $f = ['cat' => '', 'price' => null, 'stock' => false, 'sale' => false];
+    $c = str_in($_GET['cat'] ?? '');
+    if ($c !== '' && preg_match('/^[a-z0-9-]{1,100}$/', $c) && ($cat = cat_by_slug($c))) {
+        $f['cat'] = $cat['slug'];
+    }
+    if (preg_match('/^(\d{1,6})?-(\d{1,6})?$/', str_in($_GET['price'] ?? ''), $m) && (($m[1] ?? '') !== '' || ($m[2] ?? '') !== '')) {
+        $lo = ($m[1] ?? '') === '' ? null : (int)$m[1] * 100;
+        $hi = ($m[2] ?? '') === '' ? null : (int)$m[2] * 100;
+        if ($lo === null || $hi === null || $lo < $hi) {
+            $f['price'] = [$lo, $hi];
+        }
+    }
+    $f['stock'] = ($_GET['stock'] ?? '') === '1';
+    $f['sale'] = ($_GET['sale'] ?? '') === '1';
+    return $f;
+}
+
+function filters_active(array $f): bool
+{
+    return $f['cat'] !== '' || $f['price'] !== null || $f['stock'] || $f['sale'];
+}
+
+function cat_by_slug(string $slug): ?array
+{
+    foreach (categories() as $c) {
+        if ($c['slug'] === $slug) {
+            return $c;
+        }
+    }
+    return null;
+}
+
+/* The address's own words for the filters (for links that keep them). */
+function filters_keep(array $f): array
+{
+    return array_filter([
+        'cat' => $f['cat'],
+        'price' => $f['price'] ? price_param($f['price']) : '',
+        'stock' => $f['stock'] ? '1' : '',
+        'sale' => $f['sale'] ? '1' : '',
+    ], fn($v) => $v !== '');
+}
+
+function price_param(array $r): string
+{
+    return ($r[0] === null ? '' : intdiv($r[0], 100)) . '-' . ($r[1] === null ? '' : intdiv($r[1], 100));
+}
+
+function price_band_label(array $r): string
+{
+    $m = fn($p) => '£' . number_format($p / 100);
+    return $r[0] === null ? 'Under ' . $m($r[1]) : ($r[1] === null ? $m($r[0]) . ' and over' : $m($r[0]) . '&ndash;' . $m($r[1]));
+}
+
+/* SQL: in stock (or selling on backorder), and on sale today. */
+function in_stock_sql(): string
+{
+    return "((p.backorders != 'no' AND p.kind = 'physical')
+             OR (NOT EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id) AND (p.stock IS NULL OR p.stock > 0))
+             OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.active = 1 AND (v.stock IS NULL OR v.stock > 0)))";
+}
+
+function on_sale_sql(): string
+{
+    $today = db()->quote(uk_today());
+    return "(p.sale_from <= $today AND (p.sale_to = '' OR p.sale_to >= $today) AND (
+               (NOT EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id) AND p.sale_pence IS NOT NULL AND p.sale_pence < p.price_pence)
+               OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.active = 1 AND (
+                   (v.price_pence IS NULL AND p.sale_pence IS NOT NULL AND p.sale_pence < p.price_pence)
+                   OR (v.price_pence IS NOT NULL AND v.sale_pence IS NOT NULL AND v.sale_pence < v.price_pence)))))";
+}
+
+/* SQL for the filters, leaving out one ($skip) so its own counts can be shown. */
+function filters_sql(array $f, string $skip = ''): string
+{
+    $and = [];
+    if ($f['cat'] !== '' && $skip !== 'cat' && ($c = cat_by_slug($f['cat']))) {
+        $and[] = cat_in_sql(cat_descendants((int)$c['id']));
+    }
+    if ($f['price'] && $skip !== 'price') {
+        [$lo, $hi] = $f['price'];
+        $and[] = '(' . price_sql() . ')' . ($lo !== null ? ' >= ' . $lo : '') . ($lo !== null && $hi !== null ? ' AND (' . price_sql() . ')' : '') . ($hi !== null ? ' < ' . $hi : '');
+    }
+    if ($f['stock'] && $skip !== 'stock') {
+        $and[] = in_stock_sql();
+    }
+    if ($f['sale'] && $skip !== 'sale') {
+        $and[] = on_sale_sql();
+    }
+    return $and ? implode(' AND ', $and) : '1';
+}
+
+/* Up to 4 bands from what's listed: boundaries at the quarters, rounded to
+   prices people expect (£10, £25, £50...). [[lo, hi, count], ...] */
+function price_bands(array $prices): array
+{
+    $n = count($prices);
+    if ($n < 4) {
+        return [];
+    }
+    sort($prices);
+    $cuts = [];
+    foreach ([0.25, 0.5, 0.75] as $q) {
+        $v = $prices[(int)floor($q * ($n - 1))] / 100;
+        $best = PRICE_LADDER[0];
+        foreach (PRICE_LADDER as $l) {
+            if (abs($l - $v) < abs($best - $v)) {
+                $best = $l;
+            }
+        }
+        $cuts[] = $best * 100;
+    }
+    $cuts = array_values(array_unique(array_filter($cuts, fn($c) => $c > $prices[0] && $c <= $prices[$n - 1])));
+    if (!$cuts) {
+        return [];
+    }
+    $bands = [];
+    $edges = array_merge([null], $cuts, [null]);
+    for ($i = 0; $i < count($edges) - 1; $i++) {
+        [$lo, $hi] = [$edges[$i], $edges[$i + 1]];
+        $c = count(array_filter($prices, fn($p) => ($lo === null || $p >= $lo) && ($hi === null || $p < $hi)));
+        if ($c > 0) {
+            $bands[] = [$lo, $hi, $c];
+        }
+    }
+    return count($bands) > 1 ? $bands : [];
+}
+
+/* The bar of filters for a list. $where/$args = the list before filtering;
+   $base = its address (with e.g. the search words); $cats = offer categories. */
+function filter_bar(string $where, array $args, string $base, array $f, bool $cats): string
+{
+    $count = function (string $extra) use ($where, $args) {
+        $st = db()->prepare("SELECT COUNT(*) FROM products p WHERE p.visible = 1 AND ($where) AND $extra");
+        $st->execute($args);
+        return (int)$st->fetchColumn();
+    };
+    if (!filters_active($f) && $count('1') < FILTER_FROM) {
+        return '';
+    }
+    $keep = filters_keep($f);
+    $link = fn(array $change) => url_with($base, array_merge($keep, $change, ['page' => '']));
+    $parts = '';
+
+    // ---- category: the top-level ones, or the ones inside the one chosen
+    if ($cats) {
+        $st = db()->prepare("SELECT p.id, p.category_id FROM products p WHERE p.visible = 1 AND ($where) AND " . filters_sql($f, 'cat'));
+        $st->execute($args);
+        $pcats = [];
+        foreach ($st as $r) {
+            $pcats[(int)$r['id']][] = (int)$r['category_id'];
+        }
+        if ($pcats) {
+            foreach (db()->query('SELECT product_id, category_id FROM product_categories WHERE product_id IN (' . implode(',', array_keys($pcats)) . ')') as $r) {
+                $pcats[(int)$r['product_id']][] = (int)$r['category_id'];
+            }
+        }
+        $chosen = $f['cat'] !== '' ? cat_by_slug($f['cat']) : null;
+        $level = $chosen ? cat_children((int)$chosen['id']) : cat_children(0);
+        $counts = [];
+        foreach ($level as $c) {
+            $in = array_flip(cat_descendants((int)$c['id']));
+            $counts[$c['id']] = count(array_filter($pcats, fn($cs) => (bool)array_intersect_key(array_flip($cs), $in)));
+        }
+        $opts = $chosen ? '<li><a href="' . e($link(['cat' => ''])) . '">&lsaquo; All categories</a></li>' : '';
+        foreach ($level as $c) {
+            if ($counts[$c['id']] > 0) {
+                $opts .= '<li><a href="' . e($link(['cat' => $c['slug']])) . '">' . e($c['name']) . ' <span class="shop-fn">' . $counts[$c['id']] . '</span></a></li>';
+            }
+        }
+        if ($opts !== '' && ($chosen || array_filter($counts))) {
+            $parts .= '<details class="shop-f"><summary' . ($chosen ? ' class="on"' : '') . '>' . ($chosen ? e($chosen['name']) : 'Category') . '</summary><ul>' . $opts . '</ul></details>';
+        }
+    }
+
+    // ---- price
+    $st = db()->prepare('SELECT ' . price_sql() . " AS pr FROM products p WHERE p.visible = 1 AND ($where) AND " . filters_sql($f, 'price'));
+    $st->execute($args);
+    $bands = price_bands(array_map('intval', $st->fetchAll(PDO::FETCH_COLUMN)));
+    if ($bands || $f['price']) {
+        $opts = $f['price'] ? '<li><a href="' . e($link(['price' => ''])) . '">&lsaquo; Any price</a></li>' : '';
+        foreach ($bands as [$lo, $hi, $c]) {
+            $here = $f['price'] === [$lo, $hi];
+            $opts .= '<li><a href="' . e($link(['price' => price_param([$lo, $hi])])) . '"' . ($here ? ' aria-current="true"' : '') . '>' . price_band_label([$lo, $hi]) . ' <span class="shop-fn">' . $c . '</span></a></li>';
+        }
+        $parts .= '<details class="shop-f"><summary' . ($f['price'] ? ' class="on"' : '') . '>' . ($f['price'] ? price_band_label($f['price']) : 'Price') . '</summary><ul>' . $opts . '</ul></details>';
+    }
+
+    // ---- in stock, on sale
+    $nStock = $count(filters_sql($f, 'stock') . ' AND ' . in_stock_sql());
+    $nAll = $count(filters_sql($f, 'stock'));
+    if ($f['stock'] || ($nStock > 0 && $nStock < $nAll)) {
+        $parts .= '<a class="shop-ft' . ($f['stock'] ? ' on' : '') . '" role="switch" aria-checked="' . ($f['stock'] ? 'true' : 'false') . '" href="' . e($link(['stock' => $f['stock'] ? '' : 1])) . '">In stock only</a>';
+    }
+    $nSale = $count(filters_sql($f, 'sale') . ' AND ' . on_sale_sql());
+    if ($f['sale'] || $nSale > 0) {
+        $parts .= '<a class="shop-ft' . ($f['sale'] ? ' on' : '') . '" role="switch" aria-checked="' . ($f['sale'] ? 'true' : 'false') . '" href="' . e($link(['sale' => $f['sale'] ? '' : 1])) . '">On sale' . ($f['sale'] ? '' : ' <span class="shop-fn">' . $nSale . '</span>') . '</a>';
+    }
+    if ($parts === '') {
+        return '';
+    }
+    $clear = filters_active($f) ? '<a class="shop-fclear" href="' . e(url_with($base, [])) . '">Clear filters</a>' : '';
+    $on = (int)($f['cat'] !== '') + (int)($f['price'] !== null) + (int)$f['stock'] + (int)$f['sale'];
+    return '<div class="shop-filters"><button type="button" class="shop-fbtn" aria-expanded="false">Filter' . ($on ? ' (' . $on . ')' : '') . '</button>'
+        . '<div class="shop-fbar" role="group" aria-label="Filter">' . $parts . $clear . '</div></div>'
+        . '<script>(function(){var w=document.currentScript.previousElementSibling,b=w.querySelector(".shop-fbtn"),d=w.querySelectorAll("details");w.classList.add("shop-fjs");'
+        . 'b.addEventListener("click",function(){var o=b.getAttribute("aria-expanded")!=="true";b.setAttribute("aria-expanded",o);w.classList.toggle("shop-fopen",o);});'
+        . 'd.forEach(function(x){x.addEventListener("toggle",function(){if(x.open)d.forEach(function(y){if(y!==x)y.open=false;});});});'
+        . 'document.addEventListener("click",function(e){d.forEach(function(y){if(!y.contains(e.target))y.open=false;});});'
+        . 'document.addEventListener("keydown",function(e){if(e.key==="Escape")d.forEach(function(y){if(y.open){y.open=false;y.querySelector("summary").focus();}});});})();</script>';
+}
+
+/* The filters' CSS, added to the shop's own. */
+function filters_css(): string
+{
+    return '.wren-shop .shop-filters{margin:.4rem 0 .2rem}
+.wren-shop .shop-fbar{display:flex;flex-wrap:wrap;gap:.45rem;align-items:center}
+.wren-shop .shop-f{position:relative}
+.wren-shop .shop-f summary,.wren-shop .shop-ft,.wren-shop .shop-fbtn{display:inline-flex;align-items:center;gap:.35em;cursor:pointer;list-style:none;font:inherit;font-size:.92em;font-weight:600;
+  padding:.3rem .8rem;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:99px;color:inherit;background:none;text-decoration:none;line-height:1.4}
+.wren-shop .shop-fbtn{display:none}
+.wren-shop .shop-f summary::-webkit-details-marker{display:none}
+.wren-shop .shop-f summary::after{content:"";width:.35em;height:.35em;border:solid currentColor;border-width:0 2px 2px 0;transform:translateY(-.12em) rotate(45deg);opacity:.6}
+.wren-shop .shop-f summary:hover,.wren-shop .shop-ft:hover{border-color:var(--shop-acc);color:var(--shop-acc)}
+.wren-shop .shop-f summary.on,.wren-shop .shop-ft.on{border-color:var(--shop-acc);background:var(--shop-acc);color:#fff}
+.wren-shop .shop-ft.on::before{content:"\2713"}
+.wren-shop .shop-f ul{list-style:none;margin:0;padding:.35rem;position:absolute;z-index:25;top:calc(100% + 4px);left:0;min-width:13rem;max-height:60vh;overflow-y:auto;
+  background:var(--card,var(--bg,#fff));border:1px solid var(--line,rgba(127,127,127,.3));border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.12)}
+.wren-shop .shop-f li a{display:flex;justify-content:space-between;gap:1rem;padding:.35rem .55rem;border-radius:6px;color:inherit;text-decoration:none;font-size:.95em}
+.wren-shop .shop-f li a:hover,.wren-shop .shop-f li a[aria-current]{background:var(--paper,rgba(127,127,127,.1));color:var(--shop-acc)}
+.wren-shop .shop-fn{opacity:.6;font-weight:400;font-size:.9em}
+.wren-shop .shop-ft.on .shop-fn{opacity:.85}
+.wren-shop .shop-fclear{font-size:.9em;margin-left:.2rem}
+@media (max-width:640px){
+  .wren-shop .shop-fjs .shop-fbtn{display:inline-flex}
+  .wren-shop .shop-fjs .shop-fbar{display:none;margin-top:.5rem}
+  .wren-shop .shop-fjs.shop-fopen .shop-fbar{display:flex}
+  .wren-shop .shop-f{position:static}
+  .wren-shop .shop-f ul{left:0;right:0;min-width:0}
+}';
+}
+
+/* ========================================================== search report
+   1.4.0. Orders → Searches: what customers searched for, and the searches that
+   found nothing (each with a way to add a synonym). The shop keeps only the
+   words and how many results they found, by day: never who searched, their
+   address or their basket. Rows older than 12 months are removed. A setting
+   (Settings → Shop → Search) switches the log off. Searches made while signed
+   in to the admin, and by search engines' robots, aren't counted. */
+
+const SEARCH_LOG_MONTHS = 12;
+const SEARCH_REPORT_ROWS = 30;
+
+function search_log_on(): bool
+{
+    return setting('search_log', '1') === '1';
+}
+
+function search_log_add(string $s, int $results): void
+{
+    if (!search_log_on() || current_admin() || preg_match('/bot|crawl|spider|slurp|fetch|preview/i', $_SERVER['HTTP_USER_AGENT'] ?? '')) {
+        return;
+    }
+    $words = mb_substr(trim(preg_replace('/\s+/u', ' ', mb_strtolower($s))), 0, 100);
+    if ($words === '') {
+        return;
+    }
+    $day = uk_today();
+    try {
+        db()->prepare('INSERT INTO search_log (day, words, results, times) VALUES (?, ?, ?, 1)
+                       ON CONFLICT(day, words) DO UPDATE SET times = times + 1, results = excluded.results')->execute([$day, $words, $results]);
+        if (setting('search_log_pruned') !== $day) {
+            $cut = (new DateTimeImmutable($day))->modify('-' . SEARCH_LOG_MONTHS . ' months')->format('Y-m-d');
+            db()->prepare('DELETE FROM search_log WHERE day < ?')->execute([$cut]);
+            set_setting('search_log_pruned', $day);
+        }
+    } catch (Throwable $e) {
+        // a busy database never stops a search
+    }
+}
+
+/* [top searches, searches that found nothing] for a date range. */
+function search_report(string $from, string $to): array
+{
+    $top = db()->prepare('SELECT words, SUM(times) AS times,
+                                 (SELECT l2.results FROM search_log l2 WHERE l2.words = l.words AND l2.day BETWEEN ? AND ? ORDER BY l2.day DESC LIMIT 1) AS results
+                          FROM search_log l WHERE day BETWEEN ? AND ? GROUP BY words ORDER BY times DESC, words LIMIT ' . SEARCH_REPORT_ROWS);
+    $top->execute([$from, $to, $from, $to]);
+    $none = db()->prepare('SELECT words, SUM(times) AS times, MAX(day) AS last FROM search_log l
+                           WHERE day BETWEEN ? AND ? AND results = 0
+                             AND NOT EXISTS (SELECT 1 FROM search_log n WHERE n.words = l.words AND n.day > l.day AND n.results > 0)
+                           GROUP BY words ORDER BY times DESC, words LIMIT ' . SEARCH_REPORT_ROWS);
+    $none->execute([$from, $to]);
+    $tot = db()->prepare('SELECT COALESCE(SUM(times), 0), COUNT(DISTINCT words), COALESCE(SUM(CASE WHEN results = 0 THEN times END), 0) FROM search_log WHERE day BETWEEN ? AND ?');
+    $tot->execute([$from, $to]);
+    return [$top->fetchAll(), $none->fetchAll(), $tot->fetch(PDO::FETCH_NUM)];
+}
+
+function view_admin_searches(): never
+{
+    require_admin();
+    [$from, $to] = report_range();
+    [$top, $none, [$all, $distinct, $empty]] = search_report($from, $to);
+    if (isset($_GET['csv']) && in_array($_GET['csv'], ['top', 'none'], true)) {
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="searches-' . $_GET['csv'] . '-' . $from . '-to-' . $to . '.csv"');
+        header('Cache-Control: no-store');
+        echo "\xEF\xBB\xBF", $_GET['csv'] === 'top' ? "Search,Times,Results\r\n" : "Search,Times,Last searched\r\n";
+        foreach ($_GET['csv'] === 'top' ? $top : $none as $r) {
+            echo implode(',', array_map('csv_cell', $_GET['csv'] === 'top' ? [$r['words'], (int)$r['times'], (int)$r['results']] : [$r['words'], (int)$r['times'], $r['last']])), "\r\n";
+        }
+        exit;
+    }
+    $csv = fn(string $w) => '<a class="rcsv" href="' . e(url_with(admin_url('searches'), ['from' => $from, 'to' => $to, 'csv' => $w])) . '">Download CSV</a>';
+    $shop = fn(string $w) => '<a href="' . e(url_with(shop_url('search'), ['s' => $w])) . '" target="_blank" rel="noopener">' . e($w) . '</a>';
+    $rowsTop = '';
+    foreach ($top as $i => $r) {
+        $rowsTop .= '<tr><td>' . ($i + 1) . '.</td><td>' . $shop($r['words']) . '</td><td class="num">' . (int)$r['times'] . '</td><td class="num' . ((int)$r['results'] === 0 ? ' muted' : '') . '">'
+                  . ((int)$r['results'] === 0 ? 'none' : number_format((int)$r['results'])) . '</td></tr>';
+    }
+    $rowsNone = '';
+    foreach ($none as $i => $r) {
+        $rowsNone .= '<tr><td>' . ($i + 1) . '.</td><td>' . $shop($r['words']) . '</td><td class="num">' . (int)$r['times'] . '</td>'
+                   . '<td><a href="' . e(url_with(settings_url(), ['syn' => $r['words']]) . '#search') . '">Add a synonym</a></td></tr>';
+    }
+    $presets = [];
+    $now = new DateTimeImmutable('now', new DateTimeZone('Europe/London'));
+    foreach (['This month' => [$now->modify('first day of this month'), $now], 'Last month' => [$now->modify('first day of last month'), $now->modify('last day of last month')],
+              'Last 12 months' => [$now->modify('first day of this month')->modify('-11 months'), $now]] as $label => [$a, $b]) {
+        $presets[] = '<a href="' . e(url_with(admin_url('searches'), ['from' => $a->format('Y-m-d'), 'to' => $b->format('Y-m-d')])) . '">' . $label . '</a>';
+    }
+    admin_shell('Searches', '<h1>What customers search for</h1>'
+        . '<form method="get" action="' . e(admin_url('searches')) . '" class="rrange">'
+        . (str_contains(admin_url('searches'), '?') ? '<input type="hidden" name="q" value="admin/searches">' : '')
+        . '<label>From <input type="date" name="from" value="' . e($from) . '"></label><label>To <input type="date" name="to" value="' . e($to) . '"></label>'
+        . '<button class="quiet">Show</button><span class="muted">' . implode(' · ', $presets) . '</span></form>'
+        . (search_log_on() ? '' : '<p class="err">The search log is switched off, so nothing new is being added. <a href="' . e(settings_url() . '#search') . '">Switch it on</a></p>')
+        . '<p class="muted">The shop keeps the words searched for and how many products they found, by day, for ' . SEARCH_LOG_MONTHS . ' months. '
+        . 'Never who searched. Your own searches while signed in here aren\'t counted.</p>'
+        . '<div class="rsum"><div><span>' . number_format((int)$all) . '</span>Searches</div><div><span>' . number_format((int)$distinct) . '</span>Different searches</div>'
+        . '<div><span>' . ($all ? round(100 * $empty / $all) . '%' : '–') . '</span>Found nothing</div></div>'
+        . '<div class="rcols"><div><div class="rhead"><h2>Most searched for</h2>' . ($top ? $csv('top') : '') . '</div>'
+        . ($rowsTop !== '' ? '<table class="rtable"><tr><th></th><th>Search</th><th class="num">Times</th><th class="num">Found</th></tr>' . $rowsTop . '</table>' : '<p class="muted">No searches in these dates.</p>') . '</div>'
+        . '<div><div class="rhead"><h2>Found nothing</h2>' . ($none ? $csv('none') : '') . '</div>'
+        . ($rowsNone !== '' ? '<table class="rtable"><tr><th></th><th>Search</th><th class="num">Times</th><th></th></tr>' . $rowsNone . '</table>'
+            . '<p class="muted">If customers use another word for something you sell, add it as a synonym. If it\'s something you don\'t sell, it may be worth stocking.</p>'
+            : '<p class="muted">Every search in these dates found something.</p>') . '</div></div>');
+}
+
+/* ==================================================================== logo
+   1.4.0. The shop's logo on receipts, VAT invoices and packing slips. Wren
+   themes have no logo picture to borrow, so the owner uploads one in Settings
+   → Business and VAT: PNG, JPEG, WebP or SVG. A photo is made smaller and kept
+   as PNG (so a transparent background stays transparent); an SVG is kept as
+   it is, after checking it has nothing in it that could run. With no logo, the
+   documents are as they were. */
+
+const LOGO_MAX_W = 800;
+const LOGO_MAX_H = 300;
+const LOGO_SVG_MAX = 500_000;
+
+function logo_file(): string
+{
+    $f = setting('logo');
+    return preg_match('#^logo/[a-f0-9]{16}\.(png|svg)$#', $f) && is_file(MEDIA_DIR . '/' . $f) ? $f : '';
+}
+
+function logo_html(): string
+{
+    $f = logo_file();
+    return $f === '' ? '' : '<img class="doclogo" src="' . e(media_url($f)) . '" alt="' . e(setting('business_name') ?: setting('shop_title', 'Shop')) . '">';
+}
+
+/* Is this SVG safe to show? (An <img> never runs scripts, but the file could be
+   opened on its own.) No scripts, event handlers, outside links or entities. */
+function logo_svg_ok(string $svg): bool
+{
+    if (!preg_match('/<svg[\s>]/i', $svg)) {
+        return false;
+    }
+    return !preg_match('/<script|<foreignObject|<iframe|<embed|<object|<!ENTITY|<!DOCTYPE|\bon[a-z]+\s*=|javascript:|data:text|'
+        . '(?:xlink:)?href\s*=\s*["\']\s*(?!#|data:image\/(?:png|jpeg|gif|webp);)/i', $svg);
+}
+
+/* Save an uploaded logo. Returns its file, or null with $err set. */
+function logo_store(array $up, ?string &$err): ?string
+{
+    $name = $up['name'] !== '' ? $up['name'] : 'The file';
+    if ($up['error'] === UPLOAD_ERR_INI_SIZE || $up['error'] === UPLOAD_ERR_FORM_SIZE) {
+        $err = "$name is too big for this server. " . upload_limit_text();
+        return null;
+    }
+    if ($up['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($up['tmp']) && PHP_SAPI !== 'cli') {
+        $err = 'Please choose a file to upload.';
+        return null;
+    }
+    media_htaccess();
+    if (!is_dir(MEDIA_DIR . '/logo')) {
+        mkdir(MEDIA_DIR . '/logo', 0755, true);
+    }
+    $base = 'logo/' . bin2hex(random_bytes(8));
+    $head = (string)file_get_contents($up['tmp'], false, null, 0, 1024);
+    if (preg_match('/^\s*(<\?xml[^>]*>\s*)?(<!--.*?-->\s*)*<svg[\s>]/is', $head)) {
+        $svg = (string)file_get_contents($up['tmp']);
+        if (strlen($svg) > LOGO_SVG_MAX) {
+            $err = "$name is over 500 KB, which is a lot for a logo. Please save a simpler SVG, or use a PNG.";
+            return null;
+        }
+        if (!logo_svg_ok($svg)) {
+            $err = "$name has scripts or links to other files in it, which the shop won't use. Please save it as a plain SVG, or use a PNG.";
+            return null;
+        }
+        file_put_contents(MEDIA_DIR . '/' . $base . '.svg', $svg);
+        return $base . '.svg';
+    }
+    $info = @getimagesize($up['tmp']);
+    if (!$info || !in_array($info[2], [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_WEBP, IMAGETYPE_GIF], true) || $info[0] * $info[1] > 50_000_000) {
+        $err = "$name isn't a picture the shop can use. Please use PNG, JPEG, WebP or SVG.";
+        return null;
+    }
+    @ini_set('memory_limit', '512M');
+    $src = @imagecreatefromstring((string)file_get_contents($up['tmp']));
+    if (!$src) {
+        $err = "$name couldn't be opened. Please try a different file.";
+        return null;
+    }
+    $w = imagesx($src);
+    $h = imagesy($src);
+    $s = min(1, LOGO_MAX_W / $w, LOGO_MAX_H / $h);
+    $nw = max(1, (int)round($w * $s));
+    $nh = max(1, (int)round($h * $s));
+    $out = imagecreatetruecolor($nw, $nh);
+    imagealphablending($out, false);
+    imagesavealpha($out, true);
+    imagefill($out, 0, 0, imagecolorallocatealpha($out, 255, 255, 255, 127));
+    imagecopyresampled($out, $src, 0, 0, 0, 0, $nw, $nh, $w, $h);
+    imagepng($out, MEDIA_DIR . '/' . $base . '.png', 9);
+    imagedestroy($src);
+    imagedestroy($out);
+    return $base . '.png';
+}
+
+function logo_remove_file(): void
+{
+    $f = setting('logo');
+    if (preg_match('#^logo/[a-f0-9]{16}\.(png|svg)$#', $f)) {
+        @unlink(MEDIA_DIR . '/' . $f);
+    }
+    set_setting('logo', '');
+}
+
+/* Settings → Business and VAT: the logo's own form (a file upload). */
+function logo_settings_html(): string
+{
+    $f = logo_file();
+    return '<h2 id="logo">Logo</h2>
+      <p class="muted">Shown at the top of receipts, VAT invoices and packing slips. PNG, JPEG, WebP or SVG; a wide logo works best.</p>'
+        . ($f !== '' ? '<div class="logoprev"><img src="' . e(media_url($f)) . '" alt="Your logo"></div>'
+            . '<form method="post" class="inline">' . csrf_field() . '<input type="hidden" name="form" value="logo_remove"><button class="quiet">Remove the logo</button></form>' : '')
+        . '<form method="post" enctype="multipart/form-data">' . csrf_field() . '<input type="hidden" name="form" value="logo">
+        <label>' . ($f !== '' ? 'Replace it' : 'Choose a file') . ' <input type="file" name="logo" accept="image/png,image/jpeg,image/webp,image/svg+xml,.svg" required></label>
+        <button>Upload logo</button></form>';
+}
+
+/* Saving either form. Returns the message for the page. */
+function logo_settings_post(string $form): string
+{
+    if ($form === 'logo_remove') {
+        logo_remove_file();
+        return 'Logo removed. Documents show your business name instead.';
+    }
+    $u = $_FILES['logo'] ?? null;
+    $up = ['name' => is_array($u) ? basename((string)$u['name']) : '', 'tmp' => is_array($u) ? (string)$u['tmp_name'] : '',
+           'error' => is_array($u) ? (int)$u['error'] : UPLOAD_ERR_NO_FILE, 'size' => is_array($u) ? (int)$u['size'] : 0];
+    $err = null;
+    $file = logo_store($up, $err);
+    if ($file === null) {
+        return (string)$err;
+    }
+    logo_remove_file();
+    set_setting('logo', $file);
+    return 'Logo saved. It\'s on receipts, invoices and packing slips from now on.';
+}
 /* ------------------------------------------------------------------ router */
 
 $q = trim(str_in($_GET['q'] ?? ''), '/');
@@ -13281,6 +14354,7 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'moving' && ($_GET['rules'] ?? '') === '1' => (function () { require_admin(); redirect_rules_download(); })(),
         $sub === 'moving'                       => view_admin_moving(),
         $sub === 'reports'                      => view_admin_reports(),
+        $sub === 'searches'                     => view_admin_searches(),
         $sub === 'ready'                        => view_admin_ready(),
         $sub === 'export'                       => view_admin_export(),
         $sub === 'licences'                     => view_admin_licences(),
@@ -13331,6 +14405,7 @@ match (true) {
     $q === ''                                    => view_list(),
     ($seg[0] ?? '') === 'p' && count($seg) === 2 => view_product($seg[1]),
     ($seg[0] ?? '') === 'c' && count($seg) === 2 => view_list($seg[1]),
+    ($seg[0] ?? '') === 't' && count($seg) === 2 => view_tag($seg[1]),
     $q === 'basket/add' && is_post()             => basket_add(),
     $q === 'basket/update' && is_post()          => basket_update(),
     $q === 'checkout'                            => is_post() ? checkout_post() : view_checkout(),
@@ -13341,6 +14416,7 @@ match (true) {
     ($seg[0] ?? '') === 'order' && count($seg) === 3 && $seg[2] === 'invoice' => view_invoice_public($seg[1]),
     $q === 'basket'                              => view_basket(),
     $q === 'search'                              => view_search(),
+    $q === 'search/suggest'                      => search_suggest(),
     $q === 'sitemap.xml' && !shop_demo()           => view_sitemap(),
     default                                      => view_404(),
 };

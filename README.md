@@ -11,15 +11,15 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 - Sale prices with optional start and end dates, and backorders for stock that's on its way
 - Product import and export by spreadsheet (CSV), checked before anything changes, and photo import (a zip named by SKU, or web addresses), done in batches
 - Moving from WooCommerce: products, photos, customers keeping their passwords, past orders and redirects from the old addresses
-- Search, with part numbers first and your own synonyms; paged and sortable lists
+- Search that forgives spelling mistakes and suggests products as you type, with part numbers first, tags and your own synonyms; filters by category, price, stock and sale; paged and sortable lists
 - Delivery methods (standard, next day, courier, collection) priced flat, by order value or by weight, with UK postcode zones, and free delivery over an amount
 - Payment by **PayPal**, **bank transfer** or **pay on collection**
-- VAT shown for VAT-registered shops, and printable VAT invoices (receipts for other shops)
+- VAT shown for VAT-registered shops, and printable VAT invoices (receipts for other shops) with your logo
 - Order emails over your own SMTP, packing slips, refunds through PayPal
 - Customer accounts (guest checkout always works), discount codes, and customer groups such as reseller prices
 - Trade accounts: fixed trade prices, prices shown without VAT, minimum orders, ways to pay per group and an application form
 - **Digital downloads**, including Wren themes licensed per website, with renewals for updates
-- Sales reports (by month, best sellers, categories), related products, low-stock emails, CSV export for bookkeeping, and a tool for customers' data requests
+- Sales reports (by month, best sellers, categories) and a report of what customers search for, related products, low-stock emails, CSV export for bookkeeping, and a tool for customers' data requests
 - A full-width admin with sections down the side and tabs along the top that works on a phone, with two-factor sign-in and a "Getting ready" checklist for launch or handover
 
 **Demo:** [wrencms.com/shop](https://wrencms.com/shop/)
@@ -44,7 +44,7 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 
 Upload only the new `shop/index.php`, replacing the old one. Never replace the `data` or `media` folders. Then open the shop admin once.
 
-Upgrading to 1.3.3 from any earlier version is the same; everything is kept. One thing looks different: on a computer, the categories are now in a card down the side (Settings → Shop puts them back along the top). If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
+Upgrading to 1.4.0 from any earlier version is the same; everything is kept. If you're coming from 1.3.1 or earlier, one thing looks different: on a computer, the categories are now in a card down the side (Settings → Shop puts them back along the top). If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
 
 Upgrading from 0.12.0 or earlier: the shop now learns its web address from your signed-in visit to the admin, so it uses a plain version of your theme and sends no emails until you've opened the admin once.
 
