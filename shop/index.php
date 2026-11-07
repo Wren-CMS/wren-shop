@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.3.0';
+const SHOP_VERSION    = '1.3.1';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -1337,9 +1337,9 @@ function shop_css(): string
 .wren-shop{--shop-acc:var(--shop-accent,var(--orange,var(--moss,#444)))}
 .wren-shop .shop-demo{margin:0 0 1.2rem;padding:.6rem .9rem;border-left:4px solid var(--shop-acc);
   background:var(--paper,rgba(127,127,127,.08));border-radius:0 6px 6px 0;font-size:.92em}
-.wren-shop .shop-nav{display:flex;align-items:baseline;justify-content:space-between;gap:.5rem 1.25rem;
+.wren-shop .shop-nav{display:flex;flex-wrap:wrap-reverse;align-items:baseline;justify-content:space-between;gap:.6rem 1.25rem;
   padding:0 0 .7rem;margin:0 0 .8rem;border-bottom:1px solid var(--line,rgba(127,127,127,.3))}
-.wren-shop .shop-cats{display:flex;flex-wrap:wrap;gap:.35rem 1.1rem;margin:0;padding:0;list-style:none}
+.wren-shop .shop-cats{display:flex;flex-wrap:wrap;gap:.35rem 1.1rem;margin:0;padding:0;list-style:none;flex:1 1 auto;min-width:0}
 .wren-shop .shop-cats a{color:inherit;font-weight:600}
 .wren-shop .shop-cats a:hover,.wren-shop .shop-cats a.on{color:var(--shop-acc)}
 .wren-shop .shop-cats a.on{text-decoration:underline;text-decoration-thickness:2px;text-underline-offset:5px}
@@ -1364,14 +1364,14 @@ function shop_css(): string
 .wren-shop .shop-search{display:inline-flex;gap:.35rem;align-items:center;margin:0}
 .wren-shop .shop-search input{width:11rem;font:inherit;font-size:.92em;padding:.3rem .55rem;border:1px solid var(--line,rgba(127,127,127,.4));border-radius:6px;background:var(--bg,#fff);color:inherit}
 .wren-shop .shop-search .shop-button{padding:.3rem .7rem;font-size:.92em;margin:0}
-.wren-shop .shop-nav-end{align-items:center;flex-wrap:wrap;justify-content:flex-end;row-gap:.5rem}
+.wren-shop .shop-nav-end{align-items:center;flex-wrap:nowrap;justify-content:flex-end;row-gap:.5rem;flex:0 0 auto;margin-left:auto}
 .wren-shop .shop-search-page{margin:0 0 1.2rem}.wren-shop .shop-search-page input{width:min(22rem,60vw)}
 .wren-shop .shop-subcats{display:flex;flex-wrap:wrap;gap:.45rem;list-style:none;margin:0 0 1.2rem;padding:0}
 .wren-shop .shop-subcats a{display:inline-block;padding:.3rem .8rem;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:99px;color:inherit;font-weight:600;font-size:.92em;text-decoration:none}
 .wren-shop .shop-subcats a:hover{border-color:var(--shop-acc);color:var(--shop-acc)}
 @media (max-width:640px){
-  .wren-shop .shop-foldable{flex-wrap:wrap}
-  .wren-shop .shop-nav-end{flex-basis:100%;justify-content:flex-end}
+  .wren-shop .shop-nav{flex-wrap:wrap}
+  .wren-shop .shop-nav-end{flex-basis:100%;flex-wrap:wrap;justify-content:flex-end}
   .wren-shop .shop-nav-end .shop-search{flex:1 1 100%}
   .wren-shop .shop-nav-end .shop-search input{flex:1;width:auto;min-width:0}
   .wren-shop .shop-js .shop-menu-btn{display:inline-flex;align-items:center;gap:.4em;font:inherit;font-weight:600;background:none;color:inherit;border:1px solid var(--line,rgba(127,127,127,.35));border-radius:6px;padding:.3rem .7rem;cursor:pointer}

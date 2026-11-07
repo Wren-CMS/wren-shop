@@ -44,7 +44,7 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 
 Upload only the new `shop/index.php`, replacing the old one. Never replace the `data` or `media` folders. Then open the shop admin once.
 
-Upgrading to 1.3.0 from any earlier version is the same; a shop with one delivery price looks exactly as it did. If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
+Upgrading to 1.3.1 from any earlier version is the same; a shop with one delivery price looks exactly as it did. If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
 
 Upgrading from 0.12.0 or earlier: the shop now learns its web address from your signed-in visit to the admin, so it uses a plain version of your theme and sends no emails until you've opened the admin once.
 

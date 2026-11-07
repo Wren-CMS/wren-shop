@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1 (7 November 2026)
+
+- **The shop menu** no longer splits up when the categories don't fit on one line beside Sign in and Basket (with a theme's larger text, say). Sign in and Basket now stay together on a line of their own above the categories, instead of breaking onto two lines.
+- Upgrading needs nothing but the new `index.php`.
+
 ## 1.3.0 (6 November 2026)
 
 **Variety: products with two options, delivery that depends on weight and where it's going, trade accounts, and moving in from another shop.**
