@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.2 (7 November 2026)
+
+- **Categories down the side**: on a computer, the shop's categories are now in a card of their own down the left, beside the products, in the theme's card style. It shows the categories inside the one you're in (or all of them, in a shop with 15 or fewer) and stays in view as you scroll. Phones and tablets keep the menu along the top. To keep the menu along the top everywhere, choose **Along the top** under Settings → Shop → Categories menu.
+- Upgrading needs nothing but the new `index.php`.
+
 ## 1.3.1 (7 November 2026)
 
 - **The shop menu** no longer splits up when the categories don't fit on one line beside Sign in and Basket (with a theme's larger text, say). Sign in and Basket now stay together on a line of their own above the categories, instead of breaking onto two lines.

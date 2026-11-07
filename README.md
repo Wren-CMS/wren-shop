@@ -7,7 +7,7 @@ Wren Shop lives in its own `/shop/` folder and borrows your Wren site's theme an
 It's one PHP file and a SQLite database, made for UK businesses, from a handful of products to a few thousand.
 
 - Products with photos, SKUs, and one or two options (colour and size) with their own prices, stock, SKUs and weights; combinations not made can be switched off
-- Categories inside categories (three levels), products in several categories, with dropdown menus
+- Categories inside categories (three levels), products in several categories, in a card down the side of the shop (or dropdown menus along the top)
 - Sale prices with optional start and end dates, and backorders for stock that's on its way
 - Product import and export by spreadsheet (CSV), checked before anything changes, and photo import (a zip named by SKU, or web addresses), done in batches
 - Moving from WooCommerce: products, photos, customers keeping their passwords, past orders and redirects from the old addresses
@@ -44,7 +44,7 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 
 Upload only the new `shop/index.php`, replacing the old one. Never replace the `data` or `media` folders. Then open the shop admin once.
 
-Upgrading to 1.3.1 from any earlier version is the same; a shop with one delivery price looks exactly as it did. If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
+Upgrading to 1.3.2 from any earlier version is the same; everything is kept. One thing looks different: on a computer, the categories are now in a card down the side (Settings → Shop puts them back along the top). If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
 
 Upgrading from 0.12.0 or earlier: the shop now learns its web address from your signed-in visit to the admin, so it uses a plain version of your theme and sends no emails until you've opened the admin once.
 

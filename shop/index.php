@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.3.1';
+const SHOP_VERSION    = '1.3.2';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -1199,7 +1199,7 @@ function render(string $title, string $content, array $seo = [], int $status = 2
     $html = strtr($frame, [
         TITLE_MARK   => e($full),
         HEAD_MARK    => $head,
-        CONTENT_MARK => '<article class="wren-shop">' . $content . '</article>',
+        CONTENT_MARK => shop_layout($content, $seo['cat'] ?? null),
     ]);
     http_response_code($status);
     header('Content-Type: text/html; charset=utf-8');
@@ -1305,12 +1305,61 @@ function shop_nav(?int $active): string
           . (current_customer() ? 'Your account' : 'Sign in') . '</a>' : '';
     // Folding on a phone is only worth it for a longer menu.
     $fold = $deep || count($top) > 5;
-    return '<nav class="shop-nav' . ($fold ? ' shop-foldable' : '') . '" aria-label="Shop">'
+    $side = $top && side_menu_on();
+    return '<nav class="shop-nav' . ($fold ? ' shop-foldable' : '') . ($side ? ' shop-with-side' : '') . '" aria-label="Shop">'
          . ($li ? ($fold ? '<button type="button" class="shop-menu-btn" aria-expanded="false" aria-controls="shop-cats">Categories</button>' : '')
                   . '<ul class="shop-cats" id="shop-cats">' . $li . '</ul>' : '<span></span>')
          . '<span class="shop-nav-end">' . (search_box_wanted() ? search_box(($GLOBALS['shop_seg'][0] ?? '') === 'search' ? mb_substr(trim(str_in($_GET['s'] ?? '')), 0, 100) : '') : '')
          . $acct . '<a class="shop-basket-link" href="' . e(shop_url('basket')) . '">Basket' . ($n ? ' (' . $n . ')' : '') . '</a></span></nav>'
          . ($deep || $fold ? shop_nav_script() : '');
+}
+
+/* Categories down the side (the default) or along the top: Settings → Shop. */
+function side_menu_on(): bool
+{
+    return setting('cat_menu', 'side') !== 'top';
+}
+
+/* The shop's content in the theme's card, with the categories in a card of their
+   own down the left on wide screens. Both cards are <article>, as Wren themes
+   style posts, so they look alike in any theme. On narrower screens the side
+   card is hidden and the categories are in the menu along the top instead. */
+function shop_layout(string $content, ?int $active): string
+{
+    $main = '<article class="wren-shop">' . $content . '</article>';
+    $side = side_menu_on() ? shop_side($active) : '';
+    return $side === '' ? $main
+        : '<div class="wren-shop-layout"><aside class="wren-shop-side"><article class="wren-shop shop-side-card">' . $side . '</article></aside>' . $main . '</div>';
+}
+
+/* The side menu: every top-level category with something for sale, and what's
+   inside the one you're in. A small shop (15 categories or fewer) shows them all. */
+function shop_side(?int $active): string
+{
+    $live = cat_live();
+    $top = array_values(array_filter(cat_children(0), fn($c) => isset($live[$c['id']])));
+    if (!$top) {
+        return '';
+    }
+    $trail = $active ? array_column(cat_trail($active), 'id') : [];
+    $all = count($live) <= 15;
+    $item = function (array $c, int $depth) use (&$item, $live, $trail, $all, $active): string {
+        $kids = $depth < 3 && ($all || in_array($c['id'], $trail, true))
+            ? array_filter(cat_children($c['id']), fn($k) => isset($live[$k['id']])) : [];
+        $here = $c['id'] === $active;
+        $sub = '';
+        foreach ($kids as $k) {
+            $sub .= $item($k, $depth + 1);
+        }
+        return '<li><a href="' . e(shop_url('c/' . $c['slug'])) . '"'
+            . ($here ? ' class="on" aria-current="page"' : (in_array($c['id'], $trail, true) ? ' class="in"' : '')) . '>' . e($c['name']) . '</a>'
+            . ($sub !== '' ? '<ul>' . $sub . '</ul>' : '') . '</li>';
+    };
+    $li = '<li><a href="' . e(shop_url()) . '"' . ($active === 0 ? ' class="on" aria-current="page"' : '') . '>All products</a></li>';
+    foreach ($top as $c) {
+        $li .= $item($c, 1);
+    }
+    return '<nav class="shop-side-nav" aria-label="Categories"><h2 class="shop-side-title">Categories</h2><ul>' . $li . '</ul></nav>';
 }
 
 /* One dropdown open at a time; Escape or a click elsewhere closes it; the menu
@@ -1383,6 +1432,25 @@ function shop_css(): string
   .wren-shop .shop-drop-all{border:0;margin:0}
 }
 .wren-shop .shop-nav-end{display:flex;gap:1.1rem;white-space:nowrap}
+.wren-shop-side{display:none}
+.wren-shop .shop-side-title{font-size:.8em;font-weight:700;text-transform:uppercase;letter-spacing:.06em;opacity:.7;margin:0 0 .6rem}
+.wren-shop .shop-side-nav ul{list-style:none;margin:0;padding:0}
+.wren-shop .shop-side-nav li{margin:0}
+.wren-shop .shop-side-nav a{display:block;padding:.3rem .55rem;margin:0 -.55rem;border-radius:6px;color:inherit;font-weight:600;text-decoration:none;line-height:1.35}
+.wren-shop .shop-side-nav a:hover{color:var(--shop-acc);background:var(--paper,rgba(127,127,127,.08))}
+.wren-shop .shop-side-nav a.on{color:var(--shop-acc);background:var(--paper,rgba(127,127,127,.08))}
+.wren-shop .shop-side-nav a.in{color:var(--shop-acc)}
+.wren-shop .shop-side-nav ul ul{margin:.1rem 0 .3rem .55rem;padding-left:.6rem;border-left:1px solid var(--line,rgba(127,127,127,.3))}
+.wren-shop .shop-side-nav ul ul a{font-weight:400;font-size:.94em;padding-top:.2rem;padding-bottom:.2rem}
+@media (min-width:800px){
+  .wren-shop-layout{display:grid;grid-template-columns:14rem minmax(0,1fr);gap:22px;align-items:start}
+  .wren-shop-layout>article{margin:0;min-width:0}
+  .wren-shop-side{display:block;position:sticky;top:1rem;max-height:calc(100vh - 2rem);overflow-y:auto;border-radius:10px}
+  .wren-shop-side>article.shop-side-card{margin:0;padding:18px 20px}
+  .wren-shop .shop-with-side{justify-content:flex-end}
+  .wren-shop .shop-with-side .shop-cats,.wren-shop .shop-with-side .shop-menu-btn{display:none!important}
+  .wren-shop-layout .wren-shop .shop-grid{grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:1.25rem}
+}
 .wren-shop .shop-account-link{color:inherit;font-weight:600}
 .wren-shop .shop-account-link:hover{color:var(--shop-acc)}
 .wren-shop .shop-narrow{max-width:28rem}
@@ -4182,6 +4250,7 @@ function view_admin_settings(string $tab = 'general'): never
         switch (post('form')) {
             case 'shop':
                 set_setting('shop_title', post('shop_title') ?: 'Shop');
+                set_setting('cat_menu', post('cat_menu') === 'top' ? 'top' : 'side');
                 $per = post('per_page');
                 if (ctype_digit($per) && (int)$per >= 6 && (int)$per <= 96) {
                     set_setting('per_page', (string)(int)$per);
@@ -4468,6 +4537,9 @@ function view_admin_settings(string $tab = 'general'): never
           <input name="shop_title" value="' . e(setting('shop_title', 'Shop')) . '" maxlength="80"></label>
         <label>Products per page <span class="hint">(6 to 96; the shop and each category show this many at a time)</span>
           <input type="number" name="per_page" min="6" max="96" inputmode="numeric" value="' . per_page() . '" style="max-width:7rem;display:block"></label>
+        <fieldset style="border:0;padding:0;margin:1rem 0"><legend style="font-weight:600;padding:0">Categories menu</legend>
+          <label class="check"><input type="radio" name="cat_menu" value="side"' . (side_menu_on() ? ' checked' : '') . '> Down the side, in a card of its own <span class="hint">(on wide screens; along the top on phones and tablets)</span></label>
+          <label class="check"><input type="radio" name="cat_menu" value="top"' . (side_menu_on() ? '' : ' checked') . '> Along the top</label></fieldset>
         <button>Save</button></form>';
     $s['delivery'] .= '<h2 id="postage">Postage and collection</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="postage">
