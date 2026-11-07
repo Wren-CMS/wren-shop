@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.3.0 (6 November 2026)
+
+**Variety: products with two options, delivery that depends on weight and where it's going, trade accounts, and moving in from another shop.**
+
+- **Products with two options**, like Colour and Size: each combination has its own price, sale price, stock, SKU and weight, and one that isn't made can be switched off rather than deleted. **Make the combinations** adds every pair from two lists of values. The shop shows two menus; pairs that are sold out or switched off are greyed out. The CSV has `option2_name`, `choice2` and `choice_active` columns, and the WooCommerce converter maps two attributes to two options.
+- **Delivery methods**: as well as your own delivery and collection, add methods like next working day or a courier (or a second collection point). Each is priced as one price, by order value or by weight, with free delivery over an amount if you like; customers choose in the basket. **Zones** by postcode (with the usual UK ones in one click: Highlands and Islands, Northern Ireland, Isles of Scilly, Channel Islands and Isle of Man) can add a charge or take a method away; if the delivery postcode changes the price, the customer sees the new total before anything is placed. Orders, emails, packing slips and invoices name the method. **Weights** on products and choices appear once something is priced by weight.
+- **Trade accounts**: a customer group can have **fixed prices** on particular products or choices (as well as its percentage), see **prices without VAT** (VAT shown as its own line; the same total), need a **minimum order**, and pay its **own ways** (bank transfer for trade only, say). Customers can **apply for a trade account** from their account; you approve or decline in Customers → Trade applications, and they're emailed. A `group_prices` column in the CSV.
+- **Photo import**: a zip of photos (or the photos themselves) named by SKU or web address, `804501.jpg` then `804501-2.jpg`, checked first like the CSV; or photo web addresses in a `photos` column of the CSV. Either is done in batches with a progress page you can leave and come back to, and a photo already added is never added twice. A new product is shown once its first photo arrives.
+- **Moving in from another shop** (Customers → Import): customers, keeping their WordPress passwords until they next sign in (WordPress 6.8's and older formats); past orders, with their old numbers, as a record that never touches stock, sends emails or uses up codes; and the old shop's addresses (an `old_url` column), with redirect rules for the site's `.htaccess`, WooCommerce's category addresses included. `tools/woo-to-wren.php` makes all three from WooCommerce's exports and the old shop's sitemap.
+- **Related products**: "You might also like" on the product page, up to 8 chosen on the product form (or in a `related` CSV column), otherwise others from the same category.
+- **Sales reports** (Orders → Reports): sales by month (orders, goods, discounts, delivery, VAT, total, refunds), best sellers by quantity and by sales, and sales by category, for any dates; a chart drawn by the page itself; every table as a CSV. A month's report matches the orders CSV for that month to the penny.
+- **Fixed**: a shop with **Proxy or CDN: Cloudflare** switched on showed an error page for any request carrying Cloudflare's headers (all of them, in practice). This was in every version since 0.13.0; if you use Cloudflare mode, please upgrade.
+- A shop with one delivery price and nothing new set up looks exactly as it did in 1.2. Upgrading needs nothing but the new `index.php`.
+
 ## 1.2.0 (6 November 2026)
 
 **Catalogue foundations: Wren Shop for thousands of products, without making it harder for five.**

@@ -34,7 +34,7 @@ set_exception_handler(function (Throwable $e): void {
     echo 'Sorry, something went wrong. Please try again in a moment.';
 });
 
-const SHOP_VERSION    = '1.2.0';
+const SHOP_VERSION    = '1.3.0';
 const SHOP_HTACCESS   = "# Wren Shop: its own rewrite rules. Because this file turns RewriteEngine on,\n"
     . "# Apache uses these rules for everything under /shop/ and Wren's root rules never apply here.\n"
     . "Options -Indexes\nRewriteEngine On\nRewriteRule ^data(/|\$) - [F]\n"
@@ -641,6 +641,122 @@ function shop_migrate(PDO $pdo): void
             $pdo->exec("UPDATE products SET stock = 0, backorders = 'notify' WHERE slug = 'dot-grid-notebook'");
         }
         $pdo->exec("UPDATE settings SET value = '13' WHERE name = 'schema_version'");
+        $pdo->commit();
+    }
+    if ((int)$pdo->query("SELECT value FROM settings WHERE name = 'schema_version'")->fetchColumn() < 14) {
+        // 1.3.0: products with two options (Colour × Size): each choice is one combination,
+        // and one that isn't made can be switched off. Weights, for delivery priced by weight.
+        $pdo->beginTransaction();
+        $pdo->exec('
+            ALTER TABLE products ADD COLUMN option2_name TEXT NOT NULL DEFAULT "";
+            ALTER TABLE products ADD COLUMN weight_g INTEGER DEFAULT NULL;
+            ALTER TABLE variants ADD COLUMN name2 TEXT NOT NULL DEFAULT "";
+            ALTER TABLE variants ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE variants ADD COLUMN weight_g INTEGER DEFAULT NULL;
+        ');
+        // Delivery methods. The shop's own delivery price and collection stay in settings as the
+        // first two methods ("deliver" and "collect"); these tables add more methods, price bands
+        // and zones. Bands and zone rates name a method by its key: deliver, collect or m<id>.
+        $pdo->exec('
+            CREATE TABLE delivery_methods (
+                id              INTEGER PRIMARY KEY,
+                name            TEXT NOT NULL,
+                kind            TEXT NOT NULL DEFAULT "deliver",   -- deliver | collect
+                pricing         TEXT NOT NULL DEFAULT "flat",      -- flat | value | weight
+                price_pence     INTEGER DEFAULT NULL,
+                free_over_pence INTEGER DEFAULT NULL,
+                note            TEXT NOT NULL DEFAULT "",
+                position        INTEGER NOT NULL DEFAULT 0,
+                active          INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE delivery_bands (
+                id          INTEGER PRIMARY KEY,
+                method      TEXT NOT NULL,
+                up_to       INTEGER DEFAULT NULL,   -- pence or grams; NULL = anything above the last band
+                price_pence INTEGER NOT NULL
+            );
+            CREATE INDEX delivery_bands_method ON delivery_bands (method, up_to);
+            CREATE TABLE delivery_zones (
+                id       INTEGER PRIMARY KEY,
+                name     TEXT NOT NULL,
+                areas    TEXT NOT NULL DEFAULT "",
+                position INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE delivery_zone_rates (
+                method      TEXT NOT NULL,
+                zone_id     INTEGER NOT NULL,
+                available   INTEGER NOT NULL DEFAULT 1,
+                extra_pence INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (method, zone_id)
+            );
+            ALTER TABLE orders ADD COLUMN delivery_method TEXT NOT NULL DEFAULT "";
+            ALTER TABLE orders ADD COLUMN delivery_zone TEXT NOT NULL DEFAULT "";
+        ');
+        // Trade accounts: a group can show prices without VAT, need a minimum order and offer
+        // its own ways to pay; products (or choices) can have a fixed price for a group; and
+        // customers can apply to join the group the shop chooses.
+        $pdo->exec('
+            ALTER TABLE customer_groups ADD COLUMN ex_vat INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE customer_groups ADD COLUMN min_order_pence INTEGER DEFAULT NULL;
+            ALTER TABLE customer_groups ADD COLUMN pay_methods TEXT NOT NULL DEFAULT "";   -- "" = as everyone else
+            CREATE TABLE group_prices (
+                group_id    INTEGER NOT NULL REFERENCES customer_groups(id) ON DELETE CASCADE,
+                product_id  INTEGER NOT NULL,
+                variant_id  INTEGER NOT NULL DEFAULT 0,   -- 0 = the product itself
+                price_pence INTEGER NOT NULL,
+                PRIMARY KEY (group_id, product_id, variant_id)
+            );
+            CREATE INDEX group_prices_product ON group_prices (product_id);
+            CREATE TABLE trade_applications (
+                id          INTEGER PRIMARY KEY,
+                customer_id INTEGER NOT NULL,
+                group_id    INTEGER NOT NULL,
+                business    TEXT NOT NULL,
+                vat_number  TEXT NOT NULL DEFAULT "",
+                phone       TEXT NOT NULL DEFAULT "",
+                note        TEXT NOT NULL DEFAULT "",
+                status      TEXT NOT NULL DEFAULT "new",   -- new | approved | declined
+                created     TEXT NOT NULL,
+                decided     TEXT NOT NULL DEFAULT ""
+            );
+            CREATE INDEX trade_applications_customer ON trade_applications (customer_id);
+        ');
+        // Photo import: where each photo came from (so a re-run adds nothing twice), and
+        // imports that run in batches, so a big one never hits the host's time limit.
+        $pdo->exec('
+            ALTER TABLE photos ADD COLUMN source TEXT NOT NULL DEFAULT "";
+            CREATE INDEX photos_source ON photos (product_id, source);
+            CREATE TABLE import_jobs (
+                id       INTEGER PRIMARY KEY,
+                kind     TEXT NOT NULL,            -- zip | urls
+                label    TEXT NOT NULL DEFAULT "",
+                items    TEXT NOT NULL,            -- JSON: what to fetch, for which product
+                done     INTEGER NOT NULL DEFAULT 0,
+                added    INTEGER NOT NULL DEFAULT 0,
+                skipped  INTEGER NOT NULL DEFAULT 0,
+                errors   TEXT NOT NULL DEFAULT "[]",
+                replace_existing INTEGER NOT NULL DEFAULT 0,
+                dir      TEXT NOT NULL DEFAULT "",
+                created  TEXT NOT NULL,
+                finished TEXT NOT NULL DEFAULT ""
+            );
+        ');
+        // Moving in from another shop: past orders brought across (a record only), and the
+        // old shop's product addresses, for redirects.
+        $pdo->exec('
+            ALTER TABLE orders ADD COLUMN imported INTEGER NOT NULL DEFAULT 0;
+            CREATE TABLE redirects (
+                old_path   TEXT PRIMARY KEY,
+                product_id INTEGER NOT NULL
+            );
+            CREATE TABLE product_related (
+                product_id INTEGER NOT NULL,
+                related_id INTEGER NOT NULL,
+                position   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (product_id, related_id)
+            );
+        ');
+        $pdo->exec("UPDATE settings SET value = '14' WHERE name = 'schema_version'");
         $pdo->commit();
     }
 }
@@ -1281,6 +1397,7 @@ function shop_css(): string
 .wren-shop .shop-crumbs ol{display:flex;flex-wrap:wrap;margin:0 0 .5rem;padding:0;list-style:none;font-size:.85em;opacity:.85}
 .wren-shop .shop-crumbs li+li::before{content:"\203A";margin:0 .45em;opacity:.6}
 .wren-shop .shop-crumbs span[aria-current]{opacity:.8}
+.wren-shop .shop-related{margin-top:2.5rem}
 .wren-shop .shop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1.5rem;margin:1.5rem 0}
 .wren-shop .shop-listbar{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.5rem 1rem;margin:1rem 0 -.5rem}
 .wren-shop .shop-count{margin:0;font-size:.92em;opacity:.85}
@@ -1344,6 +1461,10 @@ function shop_css(): string
 .wren-shop .shop-code label{font-weight:600}
 .wren-shop .shop-code input{width:11rem;max-width:100%;text-transform:uppercase;padding:.45rem .6rem;font:inherit;
   border:1px solid var(--line,rgba(127,127,127,.45));border-radius:6px;background:var(--card,#fff);color:inherit}
+.wren-shop .shop-postcode{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .6rem;margin:1rem 0}
+.wren-shop .shop-postcode label{font-weight:600}
+.wren-shop .shop-postcode input{width:8rem;text-transform:uppercase;padding:.45rem .6rem;font:inherit;border:1px solid var(--line,rgba(127,127,127,.45));border-radius:6px;background:var(--card,#fff);color:inherit}
+.wren-shop .shop-postcode p{flex-basis:100%;margin:0}
 .wren-shop .shop-code-name{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.9em;letter-spacing:.03em}
 .wren-shop .shop-delivery{border:1px solid var(--line,rgba(127,127,127,.3));border-radius:8px;padding:.6rem 1rem .8rem;margin:0 0 1rem}
 .wren-shop .shop-delivery legend{font-weight:bold;padding:0 .3rem}
@@ -1543,9 +1664,12 @@ function price_sql(): string
         $rate = 'COALESCE(' . $at('p.category_id') . ', ' . $at($up('p.category_id')) . ', ' . $at($up($up('p.category_id'))) . ', ' . (int)$g['percent'] . ')';
     }
     // One price: the lower of its sale price (if on sale) and the full price less the group rate.
-    $own = fn(string $full, string $sale) => "MIN(CASE WHEN $on AND $sale IS NOT NULL AND $sale < $full THEN $sale ELSE $full END, ROUND($full * (100 - $rate) / 100.0))";
-    return 'COALESCE((SELECT MIN(CASE WHEN v.price_pence IS NULL THEN ' . $own('p.price_pence', 'p.sale_pence') . ' ELSE ' . $own('v.price_pence', 'v.sale_pence') . ' END)'
-         . ' FROM variants v WHERE v.product_id = p.id), ' . $own('p.price_pence', 'p.sale_pence') . ')';
+    // A fixed group price, where the group has one, instead of its percentage.
+    $fix = fn(string $vid) => $g ? '(SELECT gp.price_pence FROM group_prices gp WHERE gp.group_id = ' . (int)$g['id'] . ' AND gp.product_id = p.id AND gp.variant_id = ' . $vid . ')' : 'NULL';
+    $own = fn(string $full, string $sale, string $fixed) => "MIN(CASE WHEN $on AND $sale IS NOT NULL AND $sale < $full THEN $sale ELSE $full END, COALESCE($fixed, ROUND($full * (100 - $rate) / 100.0)))";
+    return 'COALESCE((SELECT MIN(CASE WHEN v.price_pence IS NULL THEN ' . $own('p.price_pence', 'p.sale_pence', 'COALESCE(' . $fix('v.id') . ', ' . $fix('0') . ')')
+         . ' ELSE ' . $own('v.price_pence', 'v.sale_pence', $fix('v.id')) . ' END)'
+         . ' FROM variants v WHERE v.product_id = p.id AND v.active = 1), ' . $own('p.price_pence', 'p.sale_pence', $fix('0')) . ')';
 }
 
 function sort_sql(string $sort): string
@@ -1624,13 +1748,15 @@ function product_cards(array $rows): string
     $vars = variants_for($ids);
     $cards = '';
     foreach ($rows as $p) {
-        $pv = $vars[(int)$p['id']] ?? [];
+        $all = $vars[(int)$p['id']] ?? [];
+        $pv = live_choices($all);
+        $off = $all && !$pv;   // every combination switched off
         $link = e(shop_url('p/' . $p['slug']));
         $ph = $photos[(int)$p['id']] ?? null;
         $img = $ph ? '<a href="' . $link . '" tabindex="-1" aria-hidden="true"><img src="' . e(media_url($ph['thumb']))
                    . '" alt="" width="400" height="400" loading="lazy"></a>' : '';
         $cards .= '<div class="shop-card">' . $img
-                . (sold_out($p, $pv) ? '<span class="shop-soldout">Sold out</span>' : (product_on_sale($p, $pv) ? '<span class="shop-sale">Sale</span>' : ''))
+                . ($off || sold_out($p, $pv) ? '<span class="shop-soldout">Sold out</span>' : (product_on_sale($p, $pv) ? '<span class="shop-sale">Sale</span>' : ''))
                 . '<div class="shop-card-text"><h2><a href="' . $link . '">' . e($p['name']) . '</a></h2>'
                 . '<p class="shop-price">' . shop_price_html($p, $pv) . '</p></div></div>';
     }
@@ -1723,7 +1849,8 @@ function view_product(string $slug): never
         view_404();
     }
     $photos = product_photos((int)$p['id']);
-    $vars = product_variants((int)$p['id']);
+    $allVars = product_variants((int)$p['id']);
+    $vars = live_choices($allVars);   // switched-off combinations are never offered
     $gallery = '';
     if ($photos) {
         $gallery = '<div><img class="shop-photo" id="shop-main" src="' . e(media_url($photos[0]['file'])) . '" alt="' . e($p['name']) . '">';
@@ -1739,10 +1866,10 @@ function view_product(string $slug): never
         }
         $gallery .= '</div>';
     }
-    $out = sold_out($p, $vars);
+    $out = ($allVars && !$vars) || sold_out($p, $vars);
     $choose = '';
     if ($vars && !$out) {
-        $label = $p['option_name'] !== '' ? $p['option_name'] : 'Option';
+        $label = option_title($p);
         $base = (int)$p['price_pence'];
         $opts = '<option value="">Choose ' . e(mb_strtolower($label)) . '</option>';
         foreach ($vars as $v) {
@@ -1752,7 +1879,8 @@ function view_product(string $slug): never
             $wait = !$gone && backorder_told($p) && $v['stock'] !== null && (int)$v['stock'] <= 0;
             $opts .= '<option value="' . (int)$v['id'] . '" data-price="' . e(own_price_html($p, $v)) . '" data-max="' . qty_max($p, $v) . '"'
                    . ' data-sku="' . e($v['sku'] !== '' ? $v['sku'] : $p['sku']) . '"'
-                   . ($gone ? ' disabled' : '') . '>' . e($v['name'])
+                   . ' data-a="' . e($v['name']) . '" data-b="' . e($v['name2'] ?? '') . '"'
+                   . ($gone ? ' disabled' : '') . '>' . e(choice_name($v))
                    . ($price !== $base || $own < $price ? ' – ' . money($own) : '') . ($gone ? ' – sold out' : '') . ($wait ? ' – on backorder' : '') . '</option>';
         }
         $choose = '<label class="shop-qty shop-opt"><span>' . e($label) . '</span> <select name="variant" id="shop-variant" required>'
@@ -1766,6 +1894,24 @@ function view_product(string $slug): never
           . '<label class="shop-qty"><span>Quantity</span> <input type="number" name="qty" id="shop-qty" value="1" min="1" max="' . $max
           . '" step="1" inputmode="numeric" required></label>'
           . '<button class="shop-button">Add to basket</button></form>';
+    if ($choose && ($p['option2_name'] ?? '') !== '' && array_filter($vars, fn($x) => ($x['name2'] ?? '') !== '')) {
+        // Two options: two menus that pick the combination in the single menu (which works on its own without JavaScript).
+        $buy .= '<script>(function(){var s=document.getElementById("shop-variant");if(!s)return;var w=s.closest("label"),N1=' . json_encode($p['option_name'] ?: 'Option')
+              . ',N2=' . json_encode($p['option2_name']) . ',o=[].slice.call(s.options).filter(function(x){return x.value;});'
+              . 'function uniq(k){var a=[];o.forEach(function(x){if(a.indexOf(x.dataset[k])<0)a.push(x.dataset[k]);});return a;}'
+              . 'function mk(n,vals){var l=document.createElement("label");l.className="shop-qty shop-opt";var sp=document.createElement("span");sp.textContent=n;'
+              . 'var sel=document.createElement("select");sel.required=true;var f=document.createElement("option");f.value="";f.textContent="Choose "+n.toLowerCase();sel.appendChild(f);'
+              . 'vals.forEach(function(v){var x=document.createElement("option");x.value=v;x.textContent=v;sel.appendChild(x);});l.appendChild(sp);l.appendChild(document.createTextNode(" "));l.appendChild(sel);return [l,sel];}'
+              . 'var A=mk(N1,uniq("a")),B=mk(N2,uniq("b"));w.hidden=true;s.required=false;w.parentNode.insertBefore(A[0],w);w.parentNode.insertBefore(B[0],w);'
+              . 'function find(a,b){for(var i=0;i<o.length;i++)if(o[i].dataset.a===a&&o[i].dataset.b===b)return o[i];return null;}'
+              . 'function sync(){var a=A[1].value;[].forEach.call(A[1].options,function(x){if(x.value)x.disabled=!o.some(function(y){return y.dataset.a===x.value&&!y.disabled;});});'
+              . '[].forEach.call(B[1].options,function(x){if(!x.value)return;var m=a?find(a,x.value):null;'
+              . 'x.disabled=a?(!m||m.disabled):!o.some(function(y){return y.dataset.b===x.value&&!y.disabled;});'
+              . 'x.textContent=x.value+(a&&!m?" \u2013 not available":(m&&m.disabled?" \u2013 sold out":""));});'
+              . 'if(B[1].value&&B[1].options[B[1].selectedIndex].disabled)B[1].value="";var m=A[1].value&&B[1].value?find(A[1].value,B[1].value):null;'
+              . 's.value=m&&!m.disabled?m.value:"";s.dispatchEvent(new Event("change"));}'
+              . 'A[1].addEventListener("change",sync);B[1].addEventListener("change",sync);sync();})();</script>';
+    }
     if ($choose) {
         // Show the chosen option's price, and let the quantity go only as high as its stock.
         $buy .= '<script>(function(){var s=document.getElementById("shop-variant"),p=document.getElementById("shop-price"),'
@@ -1811,7 +1957,8 @@ function view_product(string $slug): never
         . '<div class="post-body' . ($photos ? ' shop-product' : '') . '">' . $gallery
         . '<div><p class="shop-price" id="shop-price">' . shop_price_html($p, $vars) . '</p>'
         . $skuHtml . md_lite($p['description']) . $buy
-        . '<p><a href="' . e(shop_url($pc ? 'c/' . $pc['slug'] : '')) . '">&larr; ' . ($pc ? 'More ' . e($pc['name']) : 'Back to the shop') . '</a></p></div></div>',
+        . '<p><a href="' . e(shop_url($pc ? 'c/' . $pc['slug'] : '')) . '">&larr; ' . ($pc ? 'More ' . e($pc['name']) : 'Back to the shop') . '</a></p></div></div>'
+        . related_html($p),
         [
             'description' => plain_summary($p['description']),
             'route'       => 'p/' . $p['slug'],
@@ -1870,7 +2017,7 @@ function basket_item(string|int $key): ?array
     }
     foreach ($vars as $v) {
         if ((int)$v['id'] === $vid) {
-            return [$p, $v];
+            return (int)($v['active'] ?? 1) === 1 ? [$p, $v] : null;   // switched off since it was added
         }
     }
     return null;
@@ -1878,7 +2025,7 @@ function basket_item(string|int $key): ?array
 
 function item_name(array $p, ?array $v): string
 {
-    return $v ? $p['name'] . ' (' . ($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . $v['name'] . ')' : $p['name'];
+    return $v ? $p['name'] . ' (' . choice_label($p, $v) . ')' : $p['name'];
 }
 
 /* The most of a product, or of one of its choices, one basket may hold. */
@@ -1917,7 +2064,7 @@ function basket_add(): never
             }
         }
         if (!$v) {
-            flash('Please choose ' . mb_strtolower($p['option_name'] !== '' ? $p['option_name'] : 'an option') . ' first.');
+            flash('Please choose ' . mb_strtolower($p['option_name'] !== '' ? option_title($p) : 'an option') . ' first.');
             redirect(shop_url('p/' . $p['slug']) . '#shop-variant');
         }
     }
@@ -1972,8 +2119,17 @@ function basket_update(): never
     }
     $_SESSION['shop_basket'] = $basket;
     $how = str_in($_POST['delivery'] ?? '');
-    if ($how === 'deliver' || $how === 'collect') {
+    if ($how === 'deliver' || $how === 'collect' || preg_match('/^m\d+$/', $how)) {
         $_SESSION['shop_delivery'] = $how;
+    }
+    if (isset($_POST['postcode'])) {   // to see delivery to a zone before checkout
+        $pc = trim(str_in($_POST['postcode']));
+        $ok = $pc === '' ? '' : uk_postcode($pc);
+        if ($ok === null) {
+            $notes[] = 'That postcode doesn\'t look right. Try one like BS49 4AB.';
+        } else {
+            $_SESSION['shop_postcode'] = $ok;
+        }
     }
     $lines = basket_lines();
     $code = basket_discount_post(array_sum(array_map(fn($l) => $l['qty'] * $l['full'], $lines)));
@@ -2003,32 +2159,39 @@ function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0, 
 {
     $saleSub = $subtotal;
     $fullSub = $subtotal + $saleSaving;
-    $method = (string)($_SESSION['shop_delivery'] ?? '');
-    if ($method === 'collect' && !can_collect()) {
-        $method = '';
+    // Which way it's going: the method chosen in the basket if it can take this order,
+    // else the first that can. Weight and the delivery postcode's zone decide that.
+    $physical = basket_physical();
+    $grams = $physical ? basket_weight() : 0;
+    $zone = zone_for_postcode((string)($_SESSION['shop_postcode'] ?? ''));
+    $quotes = [];
+    $chosen = null;
+    foreach (delivery_methods() as $m) {
+        $quotes[$m['key']] = $m + ['quote' => method_quote($m, $saleSub, $grams, $zone)];
     }
-    if ($method === 'deliver' && !can_deliver()) {
-        $method = '';
+    $want = (string)($_SESSION['shop_delivery'] ?? '');
+    if (isset($quotes[$want]) && $quotes[$want]['quote']['ok']) {
+        $chosen = $quotes[$want];
     }
-    if ($method === '') {
-        $method = can_deliver() ? 'deliver' : (can_collect() ? 'collect' : 'deliver');
+    foreach ($chosen ? [] : $quotes as $q) {
+        if ($q['quote']['ok']) {
+            $chosen = $q;
+            break;
+        }
     }
-    if (!basket_physical()) {   // downloads only: nothing to post or collect
+    $chosen ??= $quotes[$want] ?? (reset($quotes) ?: null);
+    $unavailable = $chosen && !$chosen['quote']['ok'] && $physical ? $chosen['name'] . ': ' . $chosen['quote']['why'] : '';
+    $method = $chosen['kind'] ?? 'deliver';
+    if (!$physical) {   // downloads only: nothing to post or collect
         $method = 'none';
     }
     // Delivery for goods worth $sub: [price or null if not set up yet, how much more for free delivery].
-    $postFor = function (int $sub) use ($method): array {
-        if ($method === 'collect' || $method === 'none') {
-            return [0, null];
+    $postFor = function (int $sub) use ($method, $chosen, $grams, $zone): array {
+        if ($method === 'none' || !$chosen) {
+            return [$method === 'none' ? 0 : null, null];
         }
-        if (setting('postage_price') === '') {
-            return [null, null];
-        }
-        $over = setting('postage_free_over');
-        if ($over !== '' && $sub >= (int)$over) {
-            return [0, null];
-        }
-        return [(int)setting('postage_price'), $over !== '' ? (int)$over - $sub : null];
+        $q = method_quote($chosen, $sub, $grams, $zone);
+        return $q['ok'] ? [$q['price'], $q['to_free']] : [null, null];
     };
     [$postage, $toFree] = $postFor($saleSub);
     // A discount code comes off the goods at their full prices; free delivery from a
@@ -2071,6 +2234,9 @@ function basket_totals(int $subtotal, string $email = '', int $groupSaving = 0, 
     // Prices include VAT at 20%; delivery follows the goods' rate (standard).
     $vat = setting('vat_registered') === '1' ? (int)round($total / 6) : null;
     return ['subtotal' => $subtotal, 'method' => $method, 'postage' => $postage, 'to_free' => $toFree,
+            'method_key' => $method === 'none' ? '' : ($chosen['key'] ?? ''), 'method_name' => $method === 'none' ? '' : ($chosen['name'] ?? 'UK delivery'),
+            'method_note' => $chosen['note'] ?? '', 'methods' => $quotes, 'zone' => $method === 'deliver' && $zone ? $zone['name'] : '',
+            'unavailable' => $unavailable, 'grams' => $grams,
             'total' => $total, 'vat' => $vat, 'discount' => $disc['pence'], 'code' => $d['code'] ?? '',
             'discount_id' => $d ? (int)$d['id'] : null, 'discount_note' => $note, 'free_post' => $freePost,
             'group' => $groupSaving > 0 ? (customer_group()['name'] ?? '') : '', 'group_pence' => $groupSaving, 'code_beaten' => $beaten,
@@ -2123,7 +2289,7 @@ function view_basket(): never
             $price = unit_price($p, $v);
             $subtotal += $qty * $price;
             $ssave += $qty * ($full - $price);
-            $gsave += lines_group_saving([['p' => $p, 'qty' => $qty, 'price' => $price, 'full' => $full]]);
+            $gsave += lines_group_saving([['p' => $p, 'v' => $v, 'qty' => $qty, 'price' => $price, 'full' => $full]]);
             $draw[] = [$key, $p, $v, $qty, $price, $full, $max, $name, $photos[(int)$p['id']] ?? null];
         }
     }
@@ -2139,14 +2305,14 @@ function view_basket(): never
                 . '<td class="shop-item"><div>' . ($ph ? '<a href="' . $link . '" tabindex="-1" aria-hidden="true"><img src="'
                     . e(media_url($ph['thumb'])) . '" alt="" width="64" height="64"></a>' : '')
                 . '<span><a href="' . $link . '">' . e($p['name']) . '</a>'
-                . ($v ? '<small>' . e($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . e($v['name']) . '</small>' : '')
+                . ($v ? '<small>' . e(choice_label($p, $v)) . '</small>' : '')
                 . (($sku = $v && $v['sku'] !== '' ? $v['sku'] : $p['sku']) !== '' ? '<small class="shop-sku">' . e($sku) . '</small>' : '')
                 . ($bo ? '<small class="shop-backorder">' . backorder_note($bo, $qty) . '</small>' : '')
                 . '</span></div></td>'
-                . '<td class="shop-num" data-label="Price">' . money($unit) . ($unit < $full ? ' <s class="shop-was">' . money($full) . '</s>' : '') . '</td>'
+                . '<td class="shop-num" data-label="Price">' . shown_money($unit) . ($unit < $full ? ' <s class="shop-was">' . shown_money($full) . '</s>' : '') . '</td>'
                 . '<td class="shop-num" data-label="Quantity"><input type="number" name="qty[' . e((string)$key) . ']" value="' . $qty
                 . '" min="0" max="' . $max . '" step="1" inputmode="numeric" aria-label="Quantity of ' . e($name) . '"></td>'
-                . '<td class="shop-num" data-label="Total">' . money($line) . '</td>'
+                . '<td class="shop-num" data-label="Total">' . shown_money($line) . '</td>'
                 . '<td class="shop-num"><button class="shop-remove" name="remove" value="' . e((string)$key)
                 . '" aria-label="Remove ' . e($name) . '">Remove</button></td></tr>';
     }
@@ -2158,22 +2324,29 @@ function view_basket(): never
         if ($t['discount_note'] !== null && !str_contains($msg, $t['discount_note'])) {
             $body .= '<p class="shop-note" role="status">' . e($t['discount_note']) . '</p>';
         }
-        $collectNote = trim(setting('postage_collect_note'));
+        $collectNote = trim($t['method_note']);
         $choice = '';
-        if (can_deliver() && can_collect() && $t['method'] !== 'none') {
-            // What delivery would cost for this basket, whichever option is ticked now.
-            $over = setting('postage_free_over');
-            $dp = setting('postage_price');
-            $deliverFree = $dp !== '' && ((int)$dp === 0 || $over !== '' && $subtotal >= (int)$over);
-            $deliverLabel = 'UK delivery' . ($dp === '' ? '' : ($deliverFree ? ' (free)' : ' (' . money((int)$dp) . ')'));
-            $choice = '<fieldset class="shop-delivery"><legend>How would you like it?</legend>'
-                . '<label><input type="radio" name="delivery" value="deliver"' . ($t['method'] === 'deliver' ? ' checked' : '')
-                . ' onchange="this.form.requestSubmit(this.form.querySelector(\'.shop-default\'))"> ' . e($deliverLabel) . '</label>'
-                . '<label><input type="radio" name="delivery" value="collect"' . ($t['method'] === 'collect' ? ' checked' : '')
-                . ' onchange="this.form.requestSubmit(this.form.querySelector(\'.shop-default\'))"> Collect (free)</label></fieldset>';
+        if (count($t['methods']) > 1 && $t['method'] !== 'none') {
+            // Each way to get it, with what it would cost for this basket.
+            $choice = '<fieldset class="shop-delivery"><legend>How would you like it?</legend>';
+            foreach ($t['methods'] as $k => $m) {
+                $q = $m['quote'];
+                $label = $k === 'collect' ? 'Collect (free)'
+                       : $m['name'] . (!$q['ok'] ? ' – not available (' . $q['why'] . ')' : ($q['price'] === null ? '' : ($q['price'] === 0 ? ' (free)' : ' (' . money($q['price']) . ')')));
+                $choice .= '<label><input type="radio" name="delivery" value="' . e($k) . '"' . ($t['method_key'] === $k ? ' checked' : '') . ($q['ok'] ? '' : ' disabled')
+                    . ' onchange="this.form.requestSubmit(this.form.querySelector(\'.shop-default\'))"> ' . e($label) . '</label>';
+            }
+            $choice .= '</fieldset>';
         }
-        $postLabel = $t['method'] === 'collect' ? 'Collection' : ($t['method'] === 'none' ? '' : 'UK delivery');
-        $postCell = $t['postage'] === null ? 'Added at checkout' : ($t['postage'] === 0 ? 'Free' : money($t['postage']));
+        if (delivery_zones() && $t['method'] !== 'none' && array_filter($t['methods'], fn($m) => $m['kind'] === 'deliver')) {
+            $pc = (string)($_SESSION['shop_postcode'] ?? '');
+            $choice .= '<div class="shop-postcode"><label for="shop-pc">Delivery postcode <span class="shop-hint">(some areas cost more)</span></label>'
+                . '<input id="shop-pc" name="postcode" value="' . e($pc) . '" maxlength="10" autocomplete="shipping postal-code" autocapitalize="characters" class="shop-short">'
+                . '<button class="shop-update" name="update" value="1">Check</button>'
+                . ($t['zone'] !== '' ? '<p class="shop-hint">' . e($pc) . ' is in ' . e($t['zone']) . '.</p>' : '') . '</div>';
+        }
+        $postLabel = $t['method'] === 'none' ? '' : $t['method_name'];
+        $postCell = $t['postage'] === null ? ($t['unavailable'] !== '' ? 'Not available' : 'Added at checkout') : ($t['postage'] === 0 ? 'Free' : shown_money($t['postage']));
         $body .= '<form method="post" action="' . e(shop_url('basket/update')) . '">' . csrf_field()
             // Pressing Enter in a quantity box uses the form's first button, so it must be Update.
             . '<button class="shop-default" name="update" value="1" tabindex="-1" aria-hidden="true">Update basket</button>'
@@ -2181,15 +2354,17 @@ function view_basket(): never
             . '<th scope="col" class="shop-num">Quantity</th><th scope="col" class="shop-num">Total</th>'
             . '<th scope="col"><span class="shop-vh">Remove</span></th></tr></thead><tbody>' . $rows . '</tbody>'
             . '<tfoot>'
-            . '<tr class="shop-sub"><th scope="row" colspan="3">Subtotal</th><td class="shop-num shop-subtotal">' . money($t['subtotal']) . '</td><td></td></tr>'
+            . '<tr class="shop-sub"><th scope="row" colspan="3">Subtotal</th><td class="shop-num shop-subtotal">' . shown_money($t['subtotal']) . ex_vat_tag() . '</td><td></td></tr>'
             . ($t['code'] !== '' ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="3">Discount <span class="shop-code-name">' . e($t['code']) . '</span></th>'
-                . '<td class="shop-num">' . ($t['discount'] > 0 ? '−' . money($t['discount']) : 'Free delivery') . '</td>'
+                . '<td class="shop-num">' . ($t['discount'] > 0 ? '−' . shown_money($t['discount']) : 'Free delivery') . '</td>'
                 . '<td class="shop-num"><button class="shop-remove" name="discount_remove" value="1" aria-label="Remove discount code ' . e($t['code']) . '">Remove</button></td></tr>' : '')
             . ($t['group_pence'] > 0 ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="3">' . e($t['group']) . ' prices</th>'
-                . '<td class="shop-num">−' . money($t['group_pence']) . '</td><td></td></tr>' : '')
-            . ($postLabel !== '' ? '<tr class="shop-sub"><th scope="row" colspan="3">' . $postLabel . '</th><td class="shop-num shop-postage">' . $postCell . '</td><td></td></tr>' : '')
+                . '<td class="shop-num">−' . shown_money($t['group_pence']) . '</td><td></td></tr>' : '')
+            . ($postLabel !== '' ? '<tr class="shop-sub"><th scope="row" colspan="3">' . e($postLabel) . '</th><td class="shop-num shop-postage">' . $postCell . '</td><td></td></tr>' : '')
+            . (prices_ex_vat() ? '<tr class="shop-sub"><th scope="row" colspan="3">Total ex VAT</th><td class="shop-num shop-exvat-total">' . money(ex_vat($t['total'])) . '</td><td></td></tr>'
+                . '<tr class="shop-sub"><th scope="row" colspan="3">VAT at 20%</th><td class="shop-num shop-vat-line">' . money($t['total'] - ex_vat($t['total'])) . '</td><td></td></tr>' : '')
             . '<tr class="shop-grand"><th scope="row" colspan="3">Total</th><td class="shop-num shop-total">' . money($t['total']) . '</td><td></td></tr>'
-            . ($t['vat'] !== null ? '<tr class="shop-sub"><td colspan="4" class="shop-num shop-vat">Includes VAT of ' . money($t['vat']) . '</td><td></td></tr>' : '')
+            . ($t['vat'] !== null && !prices_ex_vat() ? '<tr class="shop-sub"><td colspan="4" class="shop-num shop-vat">Includes VAT of ' . money($t['vat']) . '</td><td></td></tr>' : '')
             . '</tfoot></table>'
             . '<div class="shop-basket-actions">'
             . ($t['code'] === '' && !empty($_SESSION['shop_discount']) ? '<div class="shop-code"><span>Discount code <span class="shop-code-name">'
@@ -2201,7 +2376,7 @@ function view_basket(): never
             . '<button class="shop-update" name="update" value="1">Update basket</button></div>'
             . $choice
             . ($t['method'] === 'collect' && $collectNote !== '' ? '<div class="shop-note shop-collect"><strong>Collection</strong><br>' . nl2br(e($collectNote)) . '</div>' : '')
-            . ($t['to_free'] !== null ? '<p class="shop-free">Spend ' . money($t['to_free']) . ' more for free UK delivery.</p>' : '')
+            . ($t['to_free'] !== null ? '<p class="shop-free">Spend ' . money($t['to_free']) . ' more for ' . ($t['method_name'] === 'UK delivery' ? 'free UK delivery.' : 'free delivery by ' . e($t['method_name']) . '.') . '</p>' : '')
             . '</form>';
         $why = checkout_blocked($t);
         $body .= $why === null
@@ -2515,11 +2690,13 @@ function admin_sections(): array
 {
     return [
         'orders'    => ['Orders', '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
-                        ['orders' => 'All orders', 'export' => 'Export']],
+                        ['orders' => 'All orders', 'reports' => 'Reports', 'export' => 'Export']],
         'products'  => ['Products', '<path d="M3 12V4h8l10 10-8 8z"/><circle cx="7.5" cy="8.5" r="1.5"/>',
                         ['' => 'All products', 'new' => 'Add a product', 'categories' => 'Categories', 'import' => 'Import and export']],
         'customers' => ['Customers', '<circle cx="12" cy="8" r="4"/><path d="M4 21c1-4 4-6 8-6s7 2 8 6"/>',
-                        ['customers' => 'Customers', 'groups' => 'Groups', 'licences' => 'Downloads and licences', 'privacy' => 'Find a person\'s data']],
+                        ['customers' => 'Customers', 'groups' => 'Groups']
+                        + (trade_group() || trade_new_count() || admin_where()[1] === 'trade' ? ['trade' => 'Trade applications' . (($n = trade_new_count()) ? ' (' . $n . ')' : '')] : [])
+                        + ['licences' => 'Downloads and licences', 'privacy' => 'Find a person\'s data', 'moving' => 'Import']],
         'discounts' => ['Discounts', '<path d="M19 5 5 19"/><circle cx="7" cy="7" r="2.5"/><circle cx="17" cy="17" r="2.5"/>',
                         ['discounts' => 'Discount codes', 'discount/new' => 'Add a code']],
         'settings'  => ['Settings', '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
@@ -2542,8 +2719,11 @@ function admin_where(): array
         'import'             => ['products', 'import'],
         'orders', 'order'    => ['orders', 'orders'],
         'export'             => ['orders', 'export'],
+        'reports'            => ['orders', 'reports'],
         'customers', 'customer' => ['customers', 'customers'],
         'groups', 'group'    => ['customers', 'groups'],
+        'trade'              => ['customers', 'trade'],
+        'moving'             => ['customers', 'moving'],
         'licences', 'licence' => ['customers', 'licences'],
         'privacy'            => ['customers', 'privacy'],
         'discounts'          => ['discounts', 'discounts'],
@@ -2728,8 +2908,22 @@ details { margin-top:1.2rem; } summary { cursor:pointer; color:var(--moss-d); fo
 .actions-row { display:flex; flex-wrap:wrap; gap:.6rem; align-items:center; margin-top:2rem; padding-top:1rem; border-top:1px solid var(--line); }
 .actions-row form { margin:0; }
 .optrows { margin-top:.6rem; }
-.optrow { display:grid; grid-template-columns:2fr 1fr 1fr 1fr 1.3fr; gap:.4rem; margin-top:.4rem; }
-@media (max-width: 40rem) { .optrows { overflow-x:auto; } .optrow { min-width:34rem; } }
+.optrow { display:grid; grid-template-columns:1.6fr 1.4fr 1fr 1fr 1fr 1.3fr 2.2rem; gap:.4rem; margin-top:.4rem; align-items:center; }
+.optrows.one .optrow { grid-template-columns:2fr 1fr 1fr 1fr 1.3fr 2.2rem; } .optrows.one .v2 { display:none; }
+.optrows.withw .optrow { grid-template-columns:1.6fr 1.4fr 1fr 1fr 1fr .9fr 1.3fr 2.2rem; } .optrows.withw.one .optrow { grid-template-columns:2fr 1fr 1fr 1fr .9fr 1.3fr 2.2rem; }
+.bandhead, .bandrow { display:grid; grid-template-columns:1fr 1fr; gap:.4rem; max-width:22rem; margin-top:.3rem; } .bandhead { font-size:.85rem; color:#6b7280; }
+.zonerow { display:grid; grid-template-columns:1.5fr auto 8rem; gap:.6rem; align-items:center; margin:.3rem 0; max-width:34rem; } .gptable { overflow-x:auto; } .gptable td, .gptable th { padding:.3rem .5rem .3rem 0; text-align:left; white-space:nowrap; } .gptable th { font-weight:600; font-size:.9rem; }
+.progress { height:.8rem; background:rgba(127,127,127,.18); border-radius:99px; overflow:hidden; margin:1rem 0 .5rem; max-width:40rem; } .progress span { display:block; height:100%; background:var(--moss); transition:width .3s; }
+.chart { width:100%; max-width:46rem; height:auto; margin:1rem 0; } .chart rect { fill:var(--moss); } .chart g:hover rect { opacity:.8; } .chart text { font-size:11px; fill:var(--quiet); }
+.rrange { display:flex; flex-wrap:wrap; gap:.6rem 1rem; align-items:end; } .rrange label { margin:0; } .rrange .muted a { margin-right:.2rem; }
+.rsum { display:flex; flex-wrap:wrap; gap:1rem 2.5rem; margin:1.4rem 0 .5rem; } .rsum div { color:var(--quiet); font-size:.9rem; } .rsum span { display:block; color:var(--ink); font-size:1.5rem; font-family:Georgia,serif; }
+.rwrap { overflow-x:auto; } .rtable { width:100%; border-collapse:collapse; } .rtable th, .rtable td { padding:.45rem .5rem; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; } .rtable .num { text-align:right; } .rtot td { font-weight:600; }
+.rcols { display:grid; grid-template-columns:repeat(auto-fit,minmax(18rem,1fr)); gap:0 2rem; } .rhead { display:flex; align-items:baseline; gap:1rem; flex-wrap:wrap; } .rhead .rcsv { font-size:.85rem; }
+.zonerow .check { margin:0; } .zonerow .price span { white-space:nowrap; }
+.row-actions { display:flex; gap:1rem; margin:.4rem 0 1rem; } .row-actions form { margin:0; } button.link { background:none; border:0; padding:0; color:inherit; text-decoration:underline; cursor:pointer; font:inherit; } button.link.danger { color:#b42318; }
+.optrow .on { margin:0; display:flex; justify-content:center; } .optrow .on input { width:1.2rem; height:1.2rem; margin:0; }
+.optnames { display:flex; gap:.6rem; flex-wrap:wrap; align-items:flex-end; } .optnames > * { flex:1 1 12rem; } .optnames button { flex:0 0 auto; }
+@media (max-width: 40rem) { .optrows { overflow-x:auto; } .optrow { min-width:40rem; } }
 .saledates { display:flex; gap:.6rem; flex-wrap:wrap; } .saledates label { flex:1 1 10rem; }
 table.cats th { text-align:left; font-size:.78rem; font-weight:600; color:var(--quiet); text-transform:uppercase; letter-spacing:.04em; padding:.3rem; border-bottom:1px solid var(--line); }
 table.cats td.mv form { gap:.25rem; } table.cats .nomove { display:inline-block; width:2.05rem; }
@@ -3001,14 +3195,15 @@ function uploaded_photos(): array
 
 /* Re-encodes every photo: whatever was uploaded, only a fresh JPEG made by GD
    is ever stored. Returns [file, thumb] relative to media/, or null + $err. */
-function photo_store(array $up, ?string &$err): ?array
+function photo_store(array $up, ?string &$err, bool $local = false): ?array
 {
     $name = $up['name'];
     if ($up['error'] === UPLOAD_ERR_INI_SIZE || $up['error'] === UPLOAD_ERR_FORM_SIZE) {
         $err = "$name is too big for this server. " . upload_limit_text();
         return null;
     }
-    if ($up['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($up['tmp']) && PHP_SAPI !== 'cli') {
+    // $local: a file the shop itself took from a zip or downloaded, not a browser upload.
+    if ($up['error'] !== UPLOAD_ERR_OK || !$local && !is_uploaded_file($up['tmp']) && PHP_SAPI !== 'cli') {
         $err = "$name didn't upload properly. Please try it again.";
         return null;
     }
@@ -3106,7 +3301,7 @@ function stock_low(array $p, array $vars): bool
 
 const ADMIN_PER_PAGE = 50;
 const ADMIN_SHOWS = ['' => 'All products', 'visible' => 'In the shop', 'hidden' => 'Hidden', 'low' => 'Low or sold out', 'out' => 'Sold out',
-                     'backorder' => 'On backorder', 'sale' => 'On sale'];
+                     'backorder' => 'On backorder', 'sale' => 'On sale', 'noweight' => 'No weight'];
 
 /* The product list's search and filters, from a query string or from the
    'back' value a quick form sends. Only these keys are ever passed around. */
@@ -3157,6 +3352,9 @@ function view_admin_products(): never
                        OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.stock IS NOT NULL AND v.stock <= $level))",
         'out'     => "p.backorders = 'no' AND ((NOT $hasV AND p.stock IS NOT NULL AND p.stock <= 0)
                        OR ($hasV AND NOT EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.stock IS NULL OR v.stock > 0))))",
+        // Something posted that counts as weighing nothing: no weight of its own, nor on every choice.
+        'noweight' => "p.kind != 'digital' AND ((NOT $hasV AND p.weight_g IS NULL)
+                       OR (p.weight_g IS NULL AND EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.active = 1 AND v.weight_g IS NULL)))",
         // Stock below zero: orders waiting for more to arrive.
         'backorder' => "((NOT $hasV AND p.stock < 0) OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.stock < 0))",
         'sale'    => (function () {
@@ -3220,6 +3418,9 @@ function view_admin_products(): never
         $cats .= '<option value="none"' . ($f['cat'] === 'none' ? ' selected' : '') . '>No category</option>';
         $shows = '';
         foreach (ADMIN_SHOWS as $k => $label) {
+            if ($k === 'noweight' && !weights_used() && $f['show'] !== 'noweight') {
+                continue;   // only matters to delivery priced by weight
+            }
             $shows .= '<option value="' . $k . '"' . ($f['show'] === $k ? ' selected' : '') . '>' . e($label) . '</option>';
         }
         $tools = '<form method="get" class="search">' . get_form_route()
@@ -3281,39 +3482,59 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         'visible' => (bool)$p['visible'], 'slug' => $p['slug'], 'sku' => $p['sku'],
         'extra_cats' => product_extra_cats((int)$p['id']), 'backorders' => $p['backorders'],
         'sale' => $p['sale_pence'] === null ? '' : price_input((int)$p['sale_pence']), 'sale_from' => $p['sale_from'], 'sale_to' => $p['sale_to'],
+        'weight' => weight_input($p['weight_g'] === null ? null : (int)$p['weight_g']),
     ] : ['name' => '', 'price' => '', 'description' => '', 'category_id' => '0', 'stock' => '', 'visible' => true, 'slug' => '',
-         'sku' => '', 'extra_cats' => [], 'backorders' => 'no', 'sale' => '', 'sale_from' => '', 'sale_to' => ''];
+         'sku' => '', 'extra_cats' => [], 'backorders' => 'no', 'sale' => '', 'sale_from' => '', 'sale_to' => '', 'weight' => ''];
     $v += ['new_category' => ''];
     if (!isset($v['opts'])) {   // from the database, unless a failed save is being shown again
         $v['opt_name'] = $p['option_name'] ?? '';
+        $v['opt_name2'] = $p['option2_name'] ?? '';
         $v['opts'] = [];
         foreach ($p ? product_variants((int)$p['id']) : [] as $x) {
-            $v['opts'][] = ['id' => (string)$x['id'], 'name' => $x['name'],
+            $v['opts'][] = ['id' => (string)$x['id'], 'name' => $x['name'], 'name2' => $x['name2'], 'on' => (int)$x['active'] === 1,
                             'price' => $x['price_pence'] === null ? '' : price_input((int)$x['price_pence']),
                             'stock' => $x['stock'] === null ? '' : (string)$x['stock'], 'sku' => $x['sku'],
-                            'sale' => $x['sale_pence'] === null ? '' : price_input((int)$x['sale_pence'])];
+                            'sale' => $x['sale_pence'] === null ? '' : price_input((int)$x['sale_pence']),
+                            'weight' => weight_input($x['weight_g'] === null ? null : (int)$x['weight_g'])];
         }
     }
+    $v += ['opt_name2' => '', 'grid_a' => '', 'grid_b' => ''];
+    $two = $v['opt_name2'] !== '';
     $hasOpts = (bool)array_filter($v['opts'], fn($r) => $r['name'] !== '');
     $optRows = '';
-    foreach (array_merge($v['opts'], array_fill(0, 3, ['id' => '', 'name' => '', 'price' => '', 'stock' => '', 'sku' => '', 'sale' => ''])) as $n => $r) {
+    $blank = ['id' => '', 'name' => '', 'name2' => '', 'on' => true, 'price' => '', 'stock' => '', 'sku' => '', 'sale' => '', 'weight' => ''];
+    // Weights only matter to delivery priced by weight, so they're only asked for then (or once set).
+    $useW = weights_used() || ($v['weight'] ?? '') !== '' || array_filter($v['opts'], fn($r) => ($r['weight'] ?? '') !== '');
+    foreach (array_merge($v['opts'], array_fill(0, 3, $blank)) as $n => $r) {
+        $r += $blank;
         $k = $n + 1;
-        $optRows .= '<div class="optrow"><input type="hidden" name="opt_id[]" value="' . e($r['id']) . '">'
-            . '<input name="opt_val[]" value="' . e($r['name']) . '" maxlength="60" placeholder="' . ($n === 0 ? 'e.g. Small' : '') . '" aria-label="Choice ' . $k . '">'
-            . '<input name="opt_price[]" value="' . e($r['price']) . '" inputmode="decimal" placeholder="same" aria-label="Price for choice ' . $k . '">'
-            . '<input name="opt_sale[]" value="' . e($r['sale'] ?? '') . '" inputmode="decimal" placeholder="—" aria-label="Sale price for choice ' . $k . '">'
-            . '<input type="number" name="opt_stock[]" value="' . e($r['stock']) . '" min="0" inputmode="numeric" placeholder="—" aria-label="Stock for choice ' . $k . '">'
-            . '<input name="opt_sku[]" value="' . e($r['sku'] ?? '') . '" maxlength="40" autocapitalize="characters" placeholder="—" aria-label="SKU for choice ' . $k . '"></div>';
+        // Rows are numbered so a switched-off row's empty On box still lines up with its other cells.
+        $optRows .= '<div class="optrow"><input type="hidden" name="opt_id[' . $n . ']" value="' . e($r['id']) . '">'
+            . '<input name="opt_val[' . $n . ']" value="' . e($r['name']) . '" maxlength="60" placeholder="' . ($n === 0 ? 'e.g. Small' : '') . '" aria-label="Choice ' . $k . '">'
+            . '<input class="v2" name="opt_val2[' . $n . ']" value="' . e($r['name2']) . '" maxlength="60" aria-label="Second option for choice ' . $k . '">'
+            . '<input name="opt_price[' . $n . ']" value="' . e($r['price']) . '" inputmode="decimal" placeholder="same" aria-label="Price for choice ' . $k . '">'
+            . '<input name="opt_sale[' . $n . ']" value="' . e($r['sale']) . '" inputmode="decimal" placeholder="—" aria-label="Sale price for choice ' . $k . '">'
+            . '<input type="number" name="opt_stock[' . $n . ']" value="' . e($r['stock']) . '" inputmode="numeric" placeholder="—" aria-label="Stock for choice ' . $k . '">'
+            . ($useW ? '<input name="opt_weight[' . $n . ']" value="' . e($r['weight']) . '" inputmode="decimal" placeholder="same" aria-label="Weight in kg for choice ' . $k . '">' : '')
+            . '<input name="opt_sku[' . $n . ']" value="' . e($r['sku']) . '" maxlength="40" autocapitalize="characters" placeholder="—" aria-label="SKU for choice ' . $k . '">'
+            . '<label class="on"><input type="checkbox" name="opt_on[' . $n . ']" value="1"' . ($r['on'] ? ' checked' : '') . ' aria-label="Choice ' . $k . ' on sale"></label></div>';
     }
     $optionsHtml = '<details class="opts" id="opts"' . ($hasOpts || $v['opt_name'] !== '' ? ' open' : '') . '>'
         . '<summary>Options <span class="hint">(optional, e.g. sizes or colours)</span></summary>'
-        . '<p class="muted">Use options when a customer has to choose, like a size. Each choice can have its own price '
-        . 'and its own stock. To remove a choice, clear its name.</p>'
-        . '<label>Option name <input name="opt_name" value="' . e($v['opt_name']) . '" maxlength="40" placeholder="e.g. Size"></label>'
-        . '<div class="optrows"><div class="optrow opthead"><span>Choice</span><span>Price <span class="hint">(blank: same)</span></span>'
-        . '<span>Sale price <span class="hint">(if it has its own price)</span></span>'
-        . '<span>Stock <span class="hint">(blank: not counted)</span></span><span>SKU <span class="hint">(optional)</span></span></div>' . $optRows . '</div>'
-        . '<p class="muted">Need more rows? Save, and three more empty ones appear.</p></details>';
+        . '<p class="muted">Use options when a customer has to choose, like a size, or a colour and a size. Each choice can have its own price, '
+        . 'stock and SKU. Untick <b>On</b> for a combination you don\'t make; to remove a choice, clear its name.</p>'
+        . '<div class="optnames"><label>Option name <input name="opt_name" value="' . e($v['opt_name']) . '" maxlength="40" placeholder="e.g. Size"></label>'
+        . '<label>Second option <span class="hint">(optional)</span><input name="opt_name2" id="opt_name2" value="' . e($v['opt_name2']) . '" maxlength="40" placeholder="e.g. Colour"></label></div>'
+        . '<div class="optgrid" id="optgrid"' . ($two ? '' : ' hidden') . '><p class="muted" style="margin:.8rem 0 .2rem">Type each option\'s values, separated by commas, to add every combination as a row:</p>'
+        . '<div class="optnames"><input name="grid_a" value="' . e($v['grid_a']) . '" placeholder="e.g. Small, Medium, Large" aria-label="Values for the first option">'
+        . '<input name="grid_b" value="' . e($v['grid_b']) . '" placeholder="e.g. Red, Blue" aria-label="Values for the second option">'
+        . '<button class="quiet small" name="op" value="grid" formnovalidate>Make the combinations</button></div></div>'
+        . '<div class="optrows' . ($two ? '' : ' one') . ($useW ? ' withw' : '') . '" id="optrows"><div class="optrow opthead"><span>Choice</span><span class="v2" id="v2head">' . e($v['opt_name2'] ?: 'Second') . '</span>'
+        . '<span>Price <span class="hint">(blank: same)</span></span><span>Sale price <span class="hint">(own price only)</span></span>'
+        . '<span>Stock <span class="hint">(blank: not counted)</span></span>' . ($useW ? '<span>Weight <span class="hint">(kg)</span></span>' : '') . '<span>SKU</span><span>On</span></div>' . $optRows . '</div>'
+        . '<p class="muted">Need more rows? Save, and three more empty ones appear.</p></details>'
+        . '<script>(function(){var n=document.getElementById("opt_name2"),r=document.getElementById("optrows"),g=document.getElementById("optgrid"),h=document.getElementById("v2head");'
+        . 'function t(){var on=n.value.trim()!=="";r.classList.toggle("one",!on);g.hidden=!on;h.textContent=n.value.trim()||"Second";}n.addEventListener("input",t);})();</script>';
 
     $photos = $p ? product_photos((int)$p['id']) : [];
     $ph = '';
@@ -3365,6 +3586,8 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         . '<label>Description <span class="hint">(optional)</span><textarea name="description" maxlength="5000">' . e($v['description']) . '</textarea></label>'
         . '<p class="muted" style="margin:.3rem 0 0">Leave a blank line between paragraphs. **bold**, *italic*, and lines starting "- " make a list.</p>'
         . $optionsHtml
+        . group_prices_html($p, $v)
+        . related_form_html($p, $v)
         . digital_fields_html($p, $v)
         . '</div><aside class="pside"><div class="pbox">'
         . '<label class="check"><input type="checkbox" name="visible" value="1"' . ($v['visible'] ? ' checked' : '') . '> Show in the shop</label>'
@@ -3384,6 +3607,8 @@ function view_product_form(?array $p, array $v = [], array $errors = []): never
         . '<label>When counted stock runs out <select name="backorders">'
         . implode('', array_map(fn($k, $l) => '<option value="' . $k . '"' . ($v['backorders'] === $k ? ' selected' : '') . '>' . e($l) . '</option>', array_keys(BACKORDER_CHOICES), BACKORDER_CHOICES))
         . '</select></label><p class="muted" style="margin:.3rem 0 0">Keep selling for things you can get more of: stock goes below zero and orders show how many were on backorder.</p>'
+        . ($useW ? '<label>Weight <span class="hint">(kg, packed, for delivery priced by weight' . ($hasOpts ? '; a choice can have its own' : '') . ')</span>'
+            . '<input name="weight" value="' . e($v['weight']) . '" inputmode="decimal" placeholder="0.5" style="max-width:8rem;display:block"></label>' : '')
         . (!$isNew ? '<details' . ($errors && $v['slug'] !== $p['slug'] ? ' open' : '') . '><summary>More</summary>'
             . '<label>Web address <span class="hint">(' . e(abs_shop_url('p/')) . '…) Changing it breaks old links.</span>'
             . '<input name="slug" value="' . e($v['slug']) . '" maxlength="80" autocapitalize="none"></label></details>' : '')
@@ -3472,8 +3697,12 @@ function admin_save(): never
         'backorders' => isset(BACKORDER_CHOICES[post('backorders')]) ? post('backorders') : 'no',
         'sale' => post('sale'), 'sale_from' => post('sale_from'), 'sale_to' => post('sale_to'),
         'extra_cats' => array_map('intval', array_filter(is_array($_POST['extra_cats'] ?? null) ? $_POST['extra_cats'] : [], 'is_string')),
+        'weight' => isset($_POST['weight']) ? post('weight') : weight_input(($p['weight_g'] ?? null) === null ? null : (int)$p['weight_g']),
     ];
     $errors = [];
+    if ($v['weight'] !== '' && parse_weight($v['weight']) === null) {
+        $errors[] = 'The weight should be in kg, like 0.5 or 2.';
+    }
     if (!sku_valid($v['sku'])) {
         $errors[] = 'A SKU can have letters, numbers, spaces and . _ / - in it.';
     } elseif (($who = sku_taken($v['sku'], (int)($p['id'] ?? 0))) !== null) {
@@ -3503,57 +3732,97 @@ function admin_save(): never
     } elseif ($sf !== '' && $stTo !== '' && $stTo < $sf) {
         $errors[] = 'The sale ends before it starts. Check the dates.';
     }
-    // Options: rows of choice / price / stock. Empty names are dropped.
+    // Options: rows of choice (and second option) / price / stock. Empty names are dropped.
     $v['opt_name'] = post('opt_name');
+    $v['opt_name2'] = mb_substr(post('opt_name2'), 0, 40);
+    $v['grid_a'] = post('grid_a');
+    $v['grid_b'] = post('grid_b');
     $v['opts'] = [];
-    $col = fn($k) => is_array($_POST[$k] ?? null) ? array_values($_POST[$k]) : [];
-    [$oid, $oval, $oprice, $ostock, $osku, $osale] = [$col('opt_id'), $col('opt_val'), $col('opt_price'), $col('opt_stock'), $col('opt_sku'), $col('opt_sale')];
+    $col = fn($k) => is_array($_POST[$k] ?? null) ? $_POST[$k] : [];
+    [$oid, $oval, $oval2, $oprice, $ostock, $osku, $osale, $oon, $owt] = [$col('opt_id'), $col('opt_val'), $col('opt_val2'), $col('opt_price'),
+        $col('opt_stock'), $col('opt_sku'), $col('opt_sale'), $col('opt_on'), $col('opt_weight')];
+    $wSent = isset($_POST['opt_weight']);   // weights are only on the form when delivery is priced by weight
+    $oldW = [];
+    foreach ($p ? product_variants((int)$p['id']) : [] as $x) {
+        $oldW[(string)$x['id']] = weight_input($x['weight_g'] === null ? null : (int)$x['weight_g']);
+    }
+    $onSent = isset($_POST['opt_on']) || isset($_POST['opt_val2']);   // forms before 1.3 had no On boxes: every choice is on
+    $str = fn(array $a, $i) => is_string($a[$i] ?? null) ? trim($a[$i]) : '';
     $seen = [];
     $skus = $v['sku'] !== '' ? [mb_strtolower($v['sku']) => true] : [];
     foreach ($oval as $i => $name) {
-        $r = ['id' => is_string($oid[$i] ?? null) ? $oid[$i] : '', 'name' => is_string($name) ? trim($name) : '',
-              'price' => is_string($oprice[$i] ?? null) ? trim($oprice[$i]) : '', 'stock' => is_string($ostock[$i] ?? null) ? trim($ostock[$i]) : '',
-              'sku' => is_string($osku[$i] ?? null) ? sku_clean($osku[$i]) : '', 'sale' => is_string($osale[$i] ?? null) ? trim($osale[$i]) : ''];
+        $r = ['id' => $str($oid, $i), 'name' => is_string($name) ? trim($name) : '', 'name2' => $v['opt_name2'] !== '' ? mb_substr($str($oval2, $i), 0, 60) : '',
+              'price' => $str($oprice, $i), 'stock' => $str($ostock, $i), 'sku' => sku_clean($str($osku, $i)), 'sale' => $str($osale, $i),
+              'on' => !$onSent || !empty($oon[$i])];
+        $r['weight'] = $wSent ? $str($owt, $i) : ($oldW[$r['id']] ?? '');
         if ($r['name'] === '') {
             continue;
         }
+        $label = choice_name($r);
+        if ($r['weight'] !== '' && parse_weight($r['weight']) === null) {
+            $errors[] = 'The weight for ' . $label . ' should be in kg, like 0.5.';
+        }
+        if ($v['opt_name2'] !== '' && $r['name2'] === '') {
+            $errors[] = 'Choose the ' . mb_strtolower($v['opt_name2']) . ' for ' . $r['name'] . ', or clear its name to remove it.';
+        }
         if (!sku_valid($r['sku'])) {
-            $errors[] = 'The SKU for ' . $r['name'] . ' can have letters, numbers, spaces and . _ / - in it.';
+            $errors[] = 'The SKU for ' . $label . ' can have letters, numbers, spaces and . _ / - in it.';
         } elseif ($r['sku'] !== '' && isset($skus[mb_strtolower($r['sku'])])) {
             $errors[] = 'The SKU ' . $r['sku'] . ' is used twice on this product.';
         } elseif (($who = sku_taken($r['sku'], (int)($p['id'] ?? 0))) !== null) {
-            $errors[] = 'The SKU ' . $r['sku'] . ' (for ' . $r['name'] . ') is already used by ' . $who . '.';
+            $errors[] = 'The SKU ' . $r['sku'] . ' (for ' . $label . ') is already used by ' . $who . '.';
         }
         if ($r['sku'] !== '') {
             $skus[mb_strtolower($r['sku'])] = true;
         }
         if ($r['price'] !== '' && parse_price($r['price']) === null) {
-            $errors[] = 'The price for ' . $r['name'] . ' isn\'t a price. Leave it blank to use the product\'s price.';
+            $errors[] = 'The price for ' . $label . ' isn\'t a price. Leave it blank to use the product\'s price.';
         }
         if ($r['stock'] !== '' && !preg_match('/^-?\d+$/', $r['stock'])) {
-            $errors[] = 'Stock for ' . $r['name'] . ' must be a whole number, or left empty.';
+            $errors[] = 'Stock for ' . $label . ' must be a whole number, or left empty.';
         } elseif ((int)$r['stock'] < 0 && $v['backorders'] === 'no') {
-            $errors[] = 'Stock for ' . $r['name'] . ' can only go below zero if the product keeps selling when it runs out.';
+            $errors[] = 'Stock for ' . $label . ' can only go below zero if the product keeps selling when it runs out.';
         }
         if ($r['sale'] !== '') {
             $sp = parse_price($r['sale']);
             $own = $r['price'] === '' ? null : parse_price($r['price']);
             if ($sp === null) {
-                $errors[] = 'The sale price for ' . $r['name'] . ' isn\'t a price.';
+                $errors[] = 'The sale price for ' . $label . ' isn\'t a price.';
             } elseif ($own === null) {
-                $errors[] = $r['name'] . ' has a sale price but no price of its own. Give it a price, or use the product\'s sale price.';
+                $errors[] = $label . ' has a sale price but no price of its own. Give it a price, or use the product\'s sale price.';
             } elseif ($sp >= $own) {
-                $errors[] = 'The sale price for ' . $r['name'] . ' should be less than its price.';
+                $errors[] = 'The sale price for ' . $label . ' should be less than its price.';
             }
         }
-        if (isset($seen[mb_strtolower($r['name'])])) {
-            $errors[] = 'There are two choices called ' . $r['name'] . '.';
+        if (isset($seen[mb_strtolower($label)])) {
+            $errors[] = 'There are two choices called ' . $label . '.';
         }
-        $seen[mb_strtolower($r['name'])] = true;
+        $seen[mb_strtolower($label)] = true;
         $v['opts'][] = $r;
     }
     if ($v['opts'] && $v['opt_name'] === '') {
         $errors[] = 'Give the options a name, like Size or Colour.';
+    }
+    // Make the combinations: add a row for each pair of values not already there, and show the form
+    // again to fill in (nothing is saved yet).
+    if (post('op') === 'grid') {
+        $vals = fn(string $s) => array_values(array_unique(array_filter(array_map(fn($x) => mb_substr(trim($x), 0, 60), explode(',', $s)), fn($x) => $x !== '')));
+        [$as, $bs] = [$vals($v['grid_a']), $v['opt_name2'] !== '' ? $vals($v['grid_b']) : ['']];
+        $have = array_flip(array_map(fn($r) => mb_strtolower($r['name'] . '|' . $r['name2']), $v['opts']));
+        $added = 0;
+        foreach ($as as $a) {
+            foreach ($bs ?: [''] as $b) {
+                if (!isset($have[mb_strtolower($a . '|' . $b)])) {
+                    $v['opts'][] = ['id' => '', 'name' => $a, 'name2' => $b, 'price' => '', 'stock' => '', 'sku' => '', 'sale' => '', 'on' => true, 'weight' => ''];
+                    $added++;
+                }
+            }
+        }
+        $v['grid_a'] = $v['grid_b'] = '';
+        flash($added ? $added . ' combination' . ($added === 1 ? '' : 's') . ' added below. Fill in any prices and stock, then save.'
+                       . (uploaded_photos() ? ' Please choose the new photos again.' : '')
+                     : 'Every combination of those values is already there.');
+        view_product_form($p, $v, []);
     }
     $uploads = uploaded_photos();
     $existing = $p ? product_photos((int)$p['id']) : [];
@@ -3566,6 +3835,10 @@ function admin_save(): never
         $op = '';
     }
     $dg = digital_input($p, $v, $errors);
+    $gpIn = group_prices_read($errors);
+    $relIn = isset($_POST['related']) ? related_parse(post('related'), (int)($p['id'] ?? 0), $errors) : null;
+    $v['related'] = isset($_POST['related']) ? post('related') : null;
+    $v['gp'] = is_array($_POST['gp'] ?? null) ? $_POST['gp'] : null;
     if ($errors) {
         view_product_form($p, $v, array_merge($errors, $dg['upload'] ? ['Please choose the files again.'] : ($uploads ? ['Please choose the new photos again.'] : [])));
     }
@@ -3602,8 +3875,8 @@ function admin_save(): never
         $pid = (int)$pdo->lastInsertId();
     }
     product_set_extra_cats($pid, $v['extra_cats'], $catId);
-    $pdo->prepare('UPDATE products SET backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ? WHERE id = ?')
-        ->execute([$v['backorders'], $salePence, $sf, $stTo, $pid]);
+    $pdo->prepare('UPDATE products SET backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ?, weight_g = ? WHERE id = ?')
+        ->execute([$v['backorders'], $salePence, $sf, $stTo, $v['weight'] === '' ? null : parse_weight($v['weight']), $pid]);
 
     // Choices: update the ones kept (by id), add new ones, delete the rest.
     $old = [];
@@ -3616,13 +3889,14 @@ function admin_save(): never
         $vs = $r['stock'] === '' ? null : (int)$r['stock'];
         $vsale = $r['sale'] === '' || $vp === null ? null : parse_price($r['sale']);
         $xid = (int)$r['id'];
+        $vw = ($r['weight'] ?? '') === '' ? null : parse_weight($r['weight']);
         if ($xid && isset($old[$xid])) {
-            $pdo->prepare('UPDATE variants SET name = ?, price_pence = ?, stock = ?, position = ?, sku = ?, sale_pence = ? WHERE id = ?')
-                ->execute([$r['name'], $vp, $vs, $n, $r['sku'], $vsale, $xid]);
+            $pdo->prepare('UPDATE variants SET name = ?, price_pence = ?, stock = ?, position = ?, sku = ?, sale_pence = ?, name2 = ?, active = ?, weight_g = ? WHERE id = ?')
+                ->execute([$r['name'], $vp, $vs, $n, $r['sku'], $vsale, $r['name2'], $r['on'] ? 1 : 0, $vw, $xid]);
             $kept[$xid] = true;
         } else {
-            $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sku, sale_pence) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                ->execute([$pid, $r['name'], $vp, $vs, $n, $r['sku'], $vsale]);
+            $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sku, sale_pence, name2, active, weight_g) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$pid, $r['name'], $vp, $vs, $n, $r['sku'], $vsale, $r['name2'], $r['on'] ? 1 : 0, $vw]);
         }
     }
     foreach ($old as $xid => $x) {
@@ -3631,9 +3905,13 @@ function admin_save(): never
         }
     }
     if ($v['opts']) {   // with choices, stock is only counted per choice
-        $pdo->prepare('UPDATE products SET option_name = ?, stock = NULL WHERE id = ?')->execute([$v['opt_name'], $pid]);
+        $pdo->prepare('UPDATE products SET option_name = ?, option2_name = ?, stock = NULL WHERE id = ?')->execute([$v['opt_name'], $v['opt_name2'], $pid]);
     } else {
-        $pdo->prepare("UPDATE products SET option_name = '' WHERE id = ?")->execute([$pid]);
+        $pdo->prepare("UPDATE products SET option_name = '', option2_name = '' WHERE id = ?")->execute([$pid]);
+    }
+    group_prices_save($pid, $gpIn);
+    if ($relIn !== null) {
+        related_save($pid, $relIn);
     }
 
     $msgs = [];
@@ -3718,15 +3996,21 @@ function admin_duplicate(): never
         ->execute([unique_slug('products', slugify($name)), $name, $p['price_pence'], $p['description'],
                    $p['category_id'], $p['stock'], $p['option_name'], now(), now()]);
     $nid = (int)$pdo->lastInsertId();
-    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, renew_pence = ?, update_months = ?, backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ? WHERE id = ?')
-        ->execute([$p['kind'], $p['licensed'], $p['renew_pence'], $p['update_months'], $p['backorders'], $p['sale_pence'], $p['sale_from'], $p['sale_to'], $nid]);
+    $pdo->prepare('UPDATE products SET kind = ?, licensed = ?, renew_pence = ?, update_months = ?, backorders = ?, sale_pence = ?, sale_from = ?, sale_to = ?, option2_name = ?, weight_g = ? WHERE id = ?')
+        ->execute([$p['kind'], $p['licensed'], $p['renew_pence'], $p['update_months'], $p['backorders'], $p['sale_pence'], $p['sale_from'], $p['sale_to'], $p['option2_name'], $p['weight_g'], $nid]);
     // Same categories; not the SKUs, which have to be different (the copy is usually the next size or colour).
     $pdo->prepare('INSERT INTO product_categories (product_id, category_id) SELECT ?, category_id FROM product_categories WHERE product_id = ?')
         ->execute([$nid, $p['id']]);
     foreach (product_variants((int)$p['id']) as $x) {
-        $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sale_pence) VALUES (?, ?, ?, ?, ?, ?)')
-            ->execute([$nid, $x['name'], $x['price_pence'], $x['stock'], $x['position'], $x['sale_pence']]);
+        $pdo->prepare('INSERT INTO variants (product_id, name, price_pence, stock, position, sale_pence, name2, active, weight_g) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            ->execute([$nid, $x['name'], $x['price_pence'], $x['stock'], $x['position'], $x['sale_pence'], $x['name2'], $x['active'], $x['weight_g']]);
+        $pdo->prepare('INSERT INTO group_prices (group_id, product_id, variant_id, price_pence) SELECT group_id, ?, ?, price_pence FROM group_prices WHERE product_id = ? AND variant_id = ?')
+            ->execute([$nid, (int)$pdo->lastInsertId(), $p['id'], $x['id']]);
     }
+    $pdo->prepare('INSERT INTO group_prices (group_id, product_id, variant_id, price_pence) SELECT group_id, ?, 0, price_pence FROM group_prices WHERE product_id = ? AND variant_id = 0')
+        ->execute([$nid, $p['id']]);
+    $pdo->prepare('INSERT INTO product_related (product_id, related_id, position) SELECT ?, related_id, position FROM product_related WHERE product_id = ?')
+        ->execute([$nid, $p['id']]);
     foreach (product_photos((int)$p['id']) as $ph) {
         $file = $ph['file'];
         $thumb = $ph['thumb'];
@@ -3768,6 +4052,8 @@ function admin_delete(): never
         }
         db()->prepare('DELETE FROM product_files WHERE product_id = ?')->execute([$p['id']]);
         db()->prepare('DELETE FROM products WHERE id = ?')->execute([$p['id']]);
+        db()->prepare('DELETE FROM group_prices WHERE product_id = ?')->execute([$p['id']]);
+        db()->prepare('DELETE FROM product_related WHERE product_id = ? OR related_id = ?')->execute([$p['id'], $p['id']]);
         flash($p['name'] . ' deleted.');
     }
     redirect(admin_url());
@@ -3912,15 +4198,21 @@ function view_admin_settings(string $tab = 'general'): never
             case 'postage':
                 $deliver = !empty($_POST['deliver']);
                 $collect = !empty($_POST['collect']);
-                $price = post('postage_price');
-                $over = post('postage_free_over');
+                // Priced by weight or value, the form has no price boxes: those stay as they are.
+                $priced = isset($_POST['postage_price']);
+                $price = $priced ? post('postage_price') : setting('postage_price');
+                $over = $priced ? post('postage_free_over') : setting('postage_free_over');
+                if (!$priced) {
+                    $price = $price === '' ? '' : price_input((int)$price);
+                    $over = $over === '' ? '' : price_input((int)$over);
+                }
                 $pp = $price === '' ? null : parse_price($price);
                 $op = $over === '' ? null : parse_price($over);
                 if (!$deliver && !$collect) {
                     flash('Customers need at least one way to get their order: delivery or collection. Nothing changed.');
                 } elseif ($price !== '' && $pp === null || $over !== '' && $op === null) {
                     flash('Prices need to be numbers like 3.95. Nothing changed.');
-                } elseif ($deliver && $pp === null) {
+                } elseif ($deliver && $pp === null && (setting('postage_pricing') ?: 'flat') === 'flat') {
                     flash('Set a delivery price to offer delivery (0 for free delivery). Nothing changed.');
                 } else {
                     set_setting('postage_delivery', $deliver ? '1' : '0');
@@ -4159,6 +4451,12 @@ function view_admin_settings(string $tab = 'general'): never
                     flash('Your password wasn\'t right, so two-factor is still on.');
                 }
                 break;
+            default:
+                if (($msg = delivery_admin_post(post('form'))) !== null) {
+                    flash($msg);
+                    redirect(settings_url('delivery', in_array(post('form'), ['zone', 'zone_delete', 'zone_presets'], true) ? 'zones'
+                        : (post('form') === 'deliver_pricing' ? 'pricing' : 'methods')));
+                }
         }
         redirect(settings_url(SETTINGS_FORMS[post('form')] ?? $tab));
     }
@@ -4173,15 +4471,18 @@ function view_admin_settings(string $tab = 'general'): never
         <button>Save</button></form>';
     $s['delivery'] .= '<h2 id="postage">Postage and collection</h2>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="postage">
-        <label class="check"><input type="checkbox" name="deliver" value="1"' . (can_deliver() ? ' checked' : '') . '> Offer UK delivery</label>
+        <label class="check"><input type="checkbox" name="deliver" value="1"' . (can_deliver() ? ' checked' : '') . '> Offer ' . e(delivery_methods(false)[0]['name']) . '</label>
+' . ((setting('postage_pricing') ?: 'flat') === 'flat' ? '
         <label>Delivery price <div class="price"><span>£</span><input name="postage_price" inputmode="decimal" placeholder="3.95" value="'
         . e(setting('postage_price') === '' ? '' : price_input((int)setting('postage_price'))) . '"></div></label>
         <label>Free delivery on orders over <span class="hint">(optional)</span><div class="price"><span>£</span><input name="postage_free_over" inputmode="decimal" placeholder="40" value="'
         . e(setting('postage_free_over') === '' ? '' : price_input((int)setting('postage_free_over'))) . '"></div></label>
+        ' : '<p class="muted">Priced ' . (setting('postage_pricing') === 'weight' ? 'by weight' : 'by order value') . ': ' . e(method_price_text(delivery_methods(false)[0]))
+            . '. <a href="#pricing">Change</a></p>') . '
         <label class="check"><input type="checkbox" name="collect" value="1"' . (can_collect() ? ' checked' : '') . '> Offer free collection</label>
         <label>Collection details <span class="hint">(where and when, shown to customers who choose collection)</span>
           <textarea name="postage_collect_note" maxlength="500" style="min-height:5rem">' . e(setting('postage_collect_note')) . '</textarea></label>
-        <button>Save postage</button></form>';
+        <button>Save postage</button></form>' . delivery_admin_html();
     $s['payments'] .= '<h2 id="payments">Payments</h2>
       <p class="muted">Switch on the ways customers can pay. Each is offered at checkout once it\'s set up.</p>
       <form method="post">' . csrf_field() . '<input type="hidden" name="form" value="payments">
@@ -4399,6 +4700,28 @@ function pay_enabled(string $m): bool
         'collection' => setting('pay_collection') === '1' && can_collect(),
         default      => false,
     };
+}
+
+/* Is a way to pay set up (its details filled in), whether or not it's offered to everyone? */
+function pay_ready(string $m): bool
+{
+    return match ($m) {
+        'paypal'     => setting('paypal_client_id') !== '' && setting('paypal_secret') !== '',
+        'bank'       => setting('bank_sort_code') !== '' && setting('bank_account') !== '',
+        'collection' => can_collect(),
+        default      => false,
+    };
+}
+
+/* Can this customer pay this way? A group with its own list of ways to pay uses that
+   list (any that are set up); everyone else gets what the shop offers. */
+function pay_allowed(string $m): bool
+{
+    $g = customer_group();
+    if ($g && ($g['pay_methods'] ?? '') !== '') {
+        return in_array($m, explode(',', $g['pay_methods']), true) && pay_ready($m);
+    }
+    return pay_enabled($m);
 }
 
 function order_by(string $col, string|int $val): ?array
@@ -4768,7 +5091,7 @@ function checkout_blocked(?array $t = null): ?string
     if (shop_demo() && !current_admin()) {
         return 'Checkout isn\'t switched on in the demo. In a live shop this button takes the customer to checkout.';
     }
-    if (!pay_enabled('paypal') && !pay_enabled('bank') && !pay_enabled('collection')) {
+    if (!pay_allowed('paypal') && !pay_allowed('bank') && !pay_allowed('collection')) {
         return 'This shop isn\'t taking orders online just yet.';
     }
     if (!accounts_on() && basket_digital()) {
@@ -4777,13 +5100,20 @@ function checkout_blocked(?array $t = null): ?string
     if (data_known_exposed()) {   // don't collect anyone's details until the owner fixes it
         return 'This shop isn\'t taking orders online just now. Please try again later.';
     }
+    if ($t && ($t['unavailable'] ?? '') !== '') {
+        return 'We can\'t send this order: ' . $t['unavailable'] . '. ' . (count($t['methods']) > 1 ? 'Choose another way in your basket, or get in touch with the shop.' : 'Please get in touch with the shop.');
+    }
     if ($t && $t['method'] === 'deliver' && $t['postage'] === null) {
         return 'Delivery prices aren\'t set up yet, so this order can\'t be placed online.';
+    }
+    if ($t && ($short = min_order_short($t)) !== null) {
+        $g = customer_group();
+        return $g['name'] . ' orders start at ' . money((int)$g['min_order_pence']) . ' of goods. Add ' . money($short) . ' more to check out.';
     }
     if ($t && $t['total'] <= 0) {
         return 'This order comes to ' . money(0) . ', which can\'t be paid online. Please get in touch with the shop.';
     }
-    if ($t && $t['method'] === 'deliver' && !pay_enabled('paypal') && !pay_enabled('bank')) {
+    if ($t && $t['method'] === 'deliver' && !pay_allowed('paypal') && !pay_allowed('bank')) {
         return 'Orders for delivery can\'t be paid online yet. Choose collection instead.';
     }
     return null;
@@ -4804,7 +5134,7 @@ function basket_lines(): array
             // price: what one costs before any group price or code (the sale price if on sale)
             $lines[] = ['key' => (string)$key, 'p' => $p, 'v' => $v, 'qty' => $qty, 'price' => unit_price($p, $v), 'full' => variant_price($p, $v),
                         'backorder' => backorder_qty($p, $v, $qty),
-                        'option' => $v ? ($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . $v['name'] : ''];
+                        'option' => $v ? choice_label($p, $v) : ''];
         }
     }
     return $lines;
@@ -4832,17 +5162,21 @@ function uk_postcode(string $s): ?string
 }
 
 function summary_table(string $rows, int $sub, ?int $post, string $postLabel, int $total, ?int $vat, bool $vatShown = true,
-                       string $code = '', int $disc = 0, string $group = '', int $gp = 0): string
+                       string $code = '', int $disc = 0, string $group = '', int $gp = 0, bool $ex = false): string
 {
+    // $ex: show the amounts without VAT, with the VAT as its own line (a trade group's view).
+    $m = fn(int $x) => money($ex ? ex_vat($x) : $x);
     $out = '<table class="shop-basket shop-summary"><tbody>' . $rows . '</tbody><tfoot>'
-         . '<tr class="shop-sub"><th scope="row" colspan="2">Subtotal</th><td class="shop-num">' . money($sub) . '</td></tr>'
+         . '<tr class="shop-sub"><th scope="row" colspan="2">Subtotal' . ($ex ? ' ex VAT' : '') . '</th><td class="shop-num">' . $m($sub) . '</td></tr>'
          . ($code !== '' ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="2">Discount <span class="shop-code-name">' . e($code) . '</span></th><td class="shop-num">'
-             . ($disc > 0 ? '−' . money($disc) : 'Free delivery') . '</td></tr>' : '')
-         . ($gp > 0 ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="2">' . e($group) . ' prices</th><td class="shop-num">−' . money($gp) . '</td></tr>' : '')
+             . ($disc > 0 ? '−' . $m($disc) : 'Free delivery') . '</td></tr>' : '')
+         . ($gp > 0 ? '<tr class="shop-sub shop-discount"><th scope="row" colspan="2">' . e($group) . ' prices</th><td class="shop-num">−' . $m($gp) . '</td></tr>' : '')
          . ($postLabel !== '' ? '<tr class="shop-sub"><th scope="row" colspan="2">' . e($postLabel) . '</th><td class="shop-num">'
-         . ($post === null ? 'Added at checkout' : ($post === 0 ? 'Free' : money($post))) . '</td></tr>' : '')
+         . ($post === null ? 'Added at checkout' : ($post === 0 ? 'Free' : $m($post))) . '</td></tr>' : '')
+         . ($ex ? '<tr class="shop-sub"><th scope="row" colspan="2">Total ex VAT</th><td class="shop-num">' . money(ex_vat($total)) . '</td></tr>'
+             . '<tr class="shop-sub"><th scope="row" colspan="2">VAT at 20%</th><td class="shop-num">' . money($total - ex_vat($total)) . '</td></tr>' : '')
          . '<tr class="shop-grand"><th scope="row" colspan="2">Total</th><td class="shop-num shop-total">' . money($total) . '</td></tr>';
-    if ($vat !== null && $vatShown) {
+    if ($vat !== null && $vatShown && !$ex) {
         $out .= '<tr class="shop-sub"><td colspan="3" class="shop-num shop-vat">Includes VAT of ' . money($vat) . '</td></tr>';
     }
     return $out . '</tfoot></table>';
@@ -4913,7 +5247,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
         redirect(shop_url('account/login') . '?next=checkout');
     }
     $methods = array_values(array_filter(['paypal', 'bank', 'collection'],
-        fn($m) => pay_enabled($m) && ($m !== 'collection' || $t['method'] === 'collect')));
+        fn($m) => pay_allowed($m) && ($m !== 'collection' || $t['method'] === 'collect')));
     if (!$methods) {
         flash('This order can\'t be paid online yet.');
         redirect(shop_url('basket'));
@@ -4929,7 +5263,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
     foreach ($lines as $l) {
         $rows .= '<tr><td>' . e($l['p']['name']) . ($l['option'] !== '' ? '<small> ' . e($l['option']) . '</small>' : '')
                . ($l['backorder'] && backorder_told($l['p']) ? '<small class="shop-backorder">' . backorder_note($l['backorder'], $l['qty']) . '</small>' : '') . '</td>'
-               . '<td class="shop-num">× ' . $l['qty'] . '</td><td class="shop-num">' . money($l['qty'] * line_unit($l, $t)) . '</td></tr>';
+               . '<td class="shop-num">× ' . $l['qty'] . '</td><td class="shop-num">' . shown_money($l['qty'] * line_unit($l, $t)) . '</td></tr>';
     }
     $payDesc = [
         'paypal'     => 'Pay with your PayPal account, or by card through PayPal.',
@@ -4943,7 +5277,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
               . '</strong><br><small>' . e($payDesc[$m]) . '</small></span></label>';
     }
     $terms = setting('terms_url') !== '' || setting('returns_url') !== '';
-    $collectNote = trim(setting('postage_collect_note'));
+    $collectNote = trim($t['method_note']);
 
     $f = flash();
     $body = '<h1 class="post-title">Checkout</h1><div class="post-body">'
@@ -4976,7 +5310,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
             . $field('ship_line2', '<span class="shop-vh">Address line 2</span>', 'autocomplete="shipping address-line2" maxlength="120" aria-label="Delivery address line 2"')
             . $field('ship_town', 'Town or city', 'autocomplete="shipping address-level2" maxlength="80"')
             . $field('ship_postcode', 'Postcode', 'autocomplete="shipping postal-code" maxlength="10" class="shop-short" autocapitalize="characters"')
-            . '</div><p class="shop-hint">We deliver to UK addresses.</p></fieldset>';
+            . '</div><p class="shop-hint">We deliver to UK addresses.' . (delivery_zones() ? ' Delivery to some areas costs more: if yours does, you\'ll see the new total before you pay.' : '') . '</p></fieldset>';
     } elseif ($t['method'] === 'none') {
         $body .= '';   // downloads only: nothing to deliver
     } else {
@@ -4993,7 +5327,7 @@ function view_checkout(array $errors = [], ?array $v = null): never
         . '<h2 class="shop-h2">Your order</h2>'
         . ($digital ? '<label class="shop-radio"><input type="checkbox" name="digital_ok" value="1" required> <span>I want my download'
             . ' straight away, and understand that once I\'ve started downloading I lose my right to cancel.</span></label>' : '')
-        . summary_table($rows, $t['subtotal'], $t['postage'], $deliver ? 'UK delivery' : ($t['method'] === 'none' ? '' : 'Collection'), $t['total'], $t['vat'], true, $t['code'], $t['discount'], $t['group'], $t['group_pence'])
+        . summary_table($rows, $t['subtotal'], $t['postage'], $t['method'] === 'none' ? '' : $t['method_name'] . ($t['zone'] !== '' ? ' (' . $t['zone'] . ')' : ''), $t['total'], $t['vat'], true, $t['code'], $t['discount'], $t['group'], $t['group_pence'], prices_ex_vat())
         . '<p class="shop-hint"><a href="' . e(shop_url('basket')) . '">Change your basket</a>'
         . ($t['code'] === '' && discounts_live() ? ' · Have a discount code? Add it in your basket.' : '') . '</p>'
         . seller_html()
@@ -5070,7 +5404,24 @@ function checkout_post(): never
             $v['ship_postcode'] = $sp;
         }
     }
-    $methodOk = pay_enabled($v['pay']) && ($v['pay'] !== 'collection' || $t['method'] === 'collect');
+    // Delivery can depend on the postcode's zone: if the price or method changes, the customer
+    // sees the new total before anything is placed.
+    if ($deliver && !$errors) {
+        $pcNow = $v['same'] === '1' ? $v['bill_postcode'] : $v['ship_postcode'];
+        $_SESSION['shop_postcode'] = $pcNow;
+        $t2 = basket_totals($sub, '', $gsave, $ssave);
+        $t2['discount_note'] ??= $t['discount_note'];   // the first pass may have dropped a used-up code and said why
+        if ($t2['unavailable'] !== '') {
+            $errors[] = 'We can\'t send this order to ' . $pcNow . ($t2['zone'] !== '' ? ' (' . $t2['zone'] . ')' : '') . ': ' . $t2['unavailable']
+                      . '. ' . (array_filter($t2['methods'], fn($m) => $m['kind'] === 'collect') ? 'You could choose collection in your basket, or get in touch with the shop.' : 'Please get in touch with the shop.');
+        } elseif ($t2['method_key'] !== $t['method_key'] || $t2['postage'] !== $t['postage']) {
+            $errors[] = ($t2['method_key'] !== $t['method_key'] ? $t['method_name'] . ' isn\'t available to ' . $pcNow . ', so it\'s ' . $t2['method_name'] . ' instead. ' : '')
+                      . $t2['method_name'] . ' to ' . $pcNow . ($t2['zone'] !== '' ? ' (' . $t2['zone'] . ')' : '') . ' is '
+                      . ($t2['postage'] ? money((int)$t2['postage']) : 'free') . ', so your total is now ' . money($t2['total']) . '. Please check it and place your order again.';
+        }
+        $t = $t2;
+    }
+    $methodOk = pay_allowed($v['pay']) && ($v['pay'] !== 'collection' || $t['method'] === 'collect');
     if ($digital && !$me) {
         flash('Please sign in or create an account to buy downloads.');
         redirect(shop_url('account/login') . '?next=checkout');
@@ -5163,15 +5514,15 @@ function checkout_post(): never
                    bill_name, bill_line1, bill_line2, bill_town, bill_postcode,
                    ship_name, ship_line1, ship_line2, ship_town, ship_postcode, same_address, customer_note,
                    subtotal_pence, postage_pence, total_pence, vat_pence, vat_number, created, updated, customer_id,
-                   discount_id, discount_code, discount_pence, group_name, group_pence, digital_consent)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                   discount_id, discount_code, discount_pence, group_name, group_pence, digital_consent, delivery_method, delivery_zone)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         ->execute([$number, $token, $status, $v['pay'], $t['method'], $v['email'], $v['phone'],
                    $v['bill_name'], $v['bill_line1'], $v['bill_line2'], $v['bill_town'], $v['bill_postcode'],
                    $deliver ? $v['ship_name'] : '', $deliver ? $v['ship_line1'] : '', $deliver ? $v['ship_line2'] : '',
                    $deliver ? $v['ship_town'] : '', $deliver ? $v['ship_postcode'] : '', (int)$v['same'], $v['note'],
                    $t['subtotal'], (int)$t['postage'], $t['total'], $t['vat'],
                    $t['vat'] !== null ? setting('vat_number') : '', now(), now(), $me ? (int)$me['id'] : null,
-                   $t['discount_id'], $t['code'], $t['discount'], $t['group'], $t['group_pence'], $digital ? now() : '']);
+                   $t['discount_id'], $t['code'], $t['discount'], $t['group'], $t['group_pence'], $digital ? now() : '', $t['method_name'], $t['zone']]);
     $oid = (int)$pdo->lastInsertId();
     foreach ($lines as $l) {
         // The part number as it was: the choice's own, else the product's.
@@ -5203,7 +5554,7 @@ function checkout_post(): never
         if (!$pp) {
             order_cancel($oid, 'Couldn\'t start the PayPal payment: ' . $err);
             view_checkout(['We couldn\'t reach PayPal just now, so nothing has been charged. Please try again in a moment'
-                . (pay_enabled('bank') ? ', or choose bank transfer.' : '.')], $v);
+                . (pay_allowed('bank') ? ', or choose bank transfer.' : '.')], $v);
         }
         db()->prepare('UPDATE orders SET paypal_order_id = ?, paypal_link = ? WHERE id = ?')->execute([$pp['id'], $pp['link'], $oid]);
         $_SESSION['shop_pending'] = $oid;
@@ -5329,7 +5680,7 @@ function view_order(string $token): never
         ? '<h2 class="shop-h2">Your downloads</h2><p>' . ($o['status'] === 'paid' ? 'Ready in your account: <a href="' . e(shop_url('account/licences')) . '">Downloads and licences</a>.'
             : 'They\'ll be in your account under Downloads and licences as soon as payment arrives.') . '</p>'
         : ($o['delivery'] === 'collect'
-        ? '<h2 class="shop-h2">Collection</h2>' . (trim(setting('postage_collect_note')) !== '' ? '<p>' . nl2br(e(setting('postage_collect_note'))) . '</p>' : '<p>We\'ll be in touch about collection.</p>')
+        ? '<h2 class="shop-h2">Collection</h2>' . (($cn = collect_note_for($o)) !== '' ? '<p>' . nl2br(e($cn)) . '</p>' : '<p>We\'ll be in touch about collection.</p>')
         : '<h2 class="shop-h2">Delivery address</h2><p>' . address_html('ship_', $o) . '</p>');
     $body = $head . '<div class="post-body">' . $bank
         . ($o['fulfilled'] === 'sent' ? '<p class="shop-note">Sent on ' . e(gmdate('j F Y', strtotime($o['fulfilled_at'] . ' UTC')))
@@ -5337,7 +5688,7 @@ function view_order(string $token): never
         . ($o['fulfilled'] === 'collected' ? '<p class="shop-note">Collected on ' . e(gmdate('j F Y', strtotime($o['fulfilled_at'] . ' UTC'))) . '.</p>' : '')
         . '<h2 class="shop-h2">Your order</h2>'
         . summary_table(order_rows($o), (int)$o['subtotal_pence'], (int)$o['postage_pence'],
-                        $o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? '' : 'UK delivery'), (int)$o['total_pence'],
+                        order_post_label($o) . ($o['delivery_zone'] !== '' ? ' (' . $o['delivery_zone'] . ')' : ''), (int)$o['total_pence'],
                         $o['vat_pence'] === null ? null : (int)$o['vat_pence'], true, $o['discount_code'], (int)$o['discount_pence'], $o['group_name'], (int)$o['group_pence'])
         . '<p class="shop-hint">' . (in_array($o['status'], ['paid', 'refunded'], true) ? 'Paid by: ' : 'Paying by: ') . method_label($o['payment_method'])
         . ' · Placed ' . e(gmdate('j F Y, H:i', strtotime($o['created'] . ' UTC'))) . ' UTC'
@@ -5370,6 +5721,9 @@ function status_pill(array $o): string
         $out .= '<span class="pill">' . (['sent' => 'Sent', 'digital' => 'Download'][$o['fulfilled']] ?? 'Collected') . '</span>';
     } elseif ($o['status'] === 'paid') {
         $out .= '<span class="pill out">' . ($o['delivery'] === 'collect' ? 'To collect' : 'To send') . '</span>';
+    }
+    if ((int)($o['imported'] ?? 0)) {
+        $out .= '<span class="pill">Old shop</span>';
     }
     return $out;
 }
@@ -5456,6 +5810,9 @@ function view_admin_order(int $id): never
                 . '<input type="hidden" name="do" value="resend"><input type="hidden" name="email_id" value="' . (int)$m['id'] . '"><button class="quiet small">'
                 . ($m['status'] === 'sent' ? 'Send again' : 'Try now') . '</button></form>' : '') . '</td></tr>';
     }
+    if ((int)$o['imported']) {   // a record from the old shop: nothing to do with it here
+        $actions = '<p class="flash">Brought across from your old shop. It\'s a record only: it can\'t be changed or refunded here.</p>';
+    }
     $mails = '<h2>Emails</h2>' . ($mails !== '' ? '<table>' . $mails . '</table>'
         : '<p class="muted">' . (mail_ready() ? 'None yet.' : 'None: email isn\'t set up. <a href="' . e(settings_url('email')) . '">Set it up in Settings</a>.') . '</p>');
     $items = '';
@@ -5469,7 +5826,7 @@ function view_admin_order(int $id): never
             . ($o['discount_code'] !== '' ? '<tr><td colspan="2">Discount <a href="' . e(admin_url('discount/' . (int)$o['discount_id'])) . '"><code>' . e($o['discount_code']) . '</code></a></td><td style="text-align:right">'
                 . ((int)$o['discount_pence'] > 0 ? '−' . money((int)$o['discount_pence']) : 'Free delivery') . '</td></tr>' : '')
             . ((int)$o['group_pence'] > 0 ? '<tr><td colspan="2">' . e($o['group_name']) . ' prices</td><td style="text-align:right">−' . money((int)$o['group_pence']) . '</td></tr>' : '')
-            . '<tr><td colspan="2">' . ($o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? 'Delivery (download)' : 'UK delivery')) . '</td><td style="text-align:right">'
+            . '<tr><td colspan="2">' . ($o['delivery'] === 'none' ? 'Delivery (download)' : e(order_post_label($o) . ($o['delivery_zone'] !== '' ? ' (' . $o['delivery_zone'] . ')' : ''))) . '</td><td style="text-align:right">'
             . ((int)$o['postage_pence'] ? money((int)$o['postage_pence']) : 'Free') . '</td></tr>'
             . '<tr><td colspan="2"><b>Total</b></td><td style="text-align:right"><b>' . money((int)$o['total_pence']) . '</b></td></tr>'
             . ($o['vat_pence'] !== null ? '<tr><td colspan="3" class="muted" style="text-align:right">Includes VAT of ' . money((int)$o['vat_pence']) . '</td></tr>' : '');
@@ -5509,6 +5866,10 @@ function admin_order_action(int $id): never
         redirect(admin_url('orders'));
     }
     $oid = (int)$o['id'];
+    if ((int)$o['imported']) {
+        flash('Orders from your old shop are a record only.');
+        redirect(admin_url('order/' . $oid));
+    }
     switch (post('do')) {
         case 'paid':
             if (order_mark_paid($oid, '', method_label($o['payment_method']) . ', marked by the shop')) {
@@ -5969,14 +6330,14 @@ function mail_order_table(array $o): array
         $text .= (int)$it['qty'] . ' × ' . $name . '  ' . money($line) . "\n";
     }
     $post = (int)$o['postage_pence'];
-    $postLabel = $o['delivery'] === 'collect' ? 'Collection' : ($o['delivery'] === 'none' ? '' : 'UK delivery');
+    $postLabel = order_post_label($o) . ($o['delivery_zone'] !== '' ? ' (' . $o['delivery_zone'] . ')' : '');
     $sum = fn(string $l, string $v, bool $b = false) => '<tr><td colspan="2" style="padding:6px 0;text-align:right' . ($b ? ';font-weight:700' : '') . '">' . $l
         . '</td><td style="padding:6px 0 6px 12px;text-align:right;white-space:nowrap' . ($b ? ';font-weight:700' : '') . '">' . $v . '</td></tr>';
     $disc = $o['discount_code'] !== '' ? ((int)$o['discount_pence'] > 0 ? '−' . money((int)$o['discount_pence']) : 'Free delivery') : '';
     $rows .= $sum('Subtotal', money((int)$o['subtotal_pence']))
            . ($disc !== '' ? $sum('Discount (' . e($o['discount_code']) . ')', $disc) : '')
            . ((int)$o['group_pence'] > 0 ? $sum(e($o['group_name']) . ' prices', '−' . money((int)$o['group_pence'])) : '')
-           . ($postLabel !== '' ? $sum($postLabel, $post ? money($post) : 'Free') : '')
+           . ($postLabel !== '' ? $sum(e($postLabel), $post ? money($post) : 'Free') : '')
            . $sum('Total', money((int)$o['total_pence']), true);
     $text .= "\nSubtotal  " . money((int)$o['subtotal_pence'])
            . ($disc !== '' ? "\nDiscount (" . $o['discount_code'] . ")  " . $disc : '')
@@ -6022,7 +6383,7 @@ function mail_order_event(int $oid, string $event): ?int
         ? ['Your downloads', [in_array($o['status'], ['paid'], true) ? 'Ready in your account: ' . abs_shop_url('account/licences')
                                                                     : 'In your account under Downloads and licences as soon as payment arrives.']]
         : ($collect
-        ? ['Collection', trim(setting('postage_collect_note')) !== '' ? explode("\n", trim(str_replace("\r", '', setting('postage_collect_note')))) : ['We\'ll be in touch about collection.']]
+        ? ['Collection', collect_note_for($o) !== '' ? explode("\n", str_replace("\r", '', collect_note_for($o))) : ['We\'ll be in touch about collection.']]
         : ['Delivery address', mail_address_lines('ship_', $o)]);
     $whereHtml = '<h2 style="font-size:16px;margin:22px 0 6px">' . $where[0] . '</h2><p style="margin:0">' . implode('<br>', array_map('e', $where[1])) . '</p>';
     $whereText = "\n" . strtoupper($where[0]) . "\n" . implode("\n", $where[1]) . "\n";
@@ -6162,7 +6523,7 @@ button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #111;bac
 @media print{body{background:#fff;padding:0}.page{padding:0;max-width:none}.bar{display:none}}
 </style></head><body><div class="bar"><button onclick="window.print()">Print</button></div><div class="page">
 <div class="top"><div><h1>Order #' . (int)$o['number'] . '</h1><div class="muted">Placed ' . e(gmdate('j F Y', strtotime($o['created'] . ' UTC')))
-        . ' · ' . ($o['delivery'] === 'collect' ? 'Collection' : 'Delivery') . '</div></div>
+        . ' · ' . e(order_kind_label($o)) . '</div></div>
 <div class="to">' . implode('<br>', array_map('e', $to)) . '</div></div>
 <table><thead><tr><th></th><th>Qty</th><th>Item</th>' . ($skus ? '<th>SKU</th>' : '') . '</tr></thead><tbody>' . $rows . '</tbody></table>'
         . ($o['customer_note'] !== '' ? '<p class="note"><strong>Customer\'s note:</strong> ' . nl2br(e($o['customer_note'])) . '</p>' : '')
@@ -6477,9 +6838,9 @@ function view_account_login(): never
             $c = customer_by_email($email);
             $pass = str_in($_POST['password'] ?? '');
             // compare against something even when there's no account, so timing gives nothing away
-            $ok = password_verify($pass, $c['password'] ?? dummy_hash());
+            $ok = customer_password_ok($pass, $c);   // also takes a password brought across from WordPress
             if ($c && $ok) {
-                if (password_needs_rehash($c['password'], PASSWORD_DEFAULT)) {
+                if (!str_starts_with($c['password'], 'wp:') && password_needs_rehash($c['password'], PASSWORD_DEFAULT)) {
                     db()->prepare('UPDATE customers SET password = ? WHERE id = ?')->execute([password_hash($pass, PASSWORD_DEFAULT), $c['id']]);
                 }
                 customer_sign_in($c, !empty($_POST['remember']));
@@ -6723,7 +7084,7 @@ function customer_claim_orders(int $cid, string $email): void
 function customer_orders(array $c): array
 {
     $st = db()->prepare("SELECT * FROM orders WHERE status != 'pending' AND (customer_id = ?
-                         OR (? AND customer_id IS NULL AND email = ? COLLATE NOCASE)) ORDER BY id DESC");
+                         OR (? AND customer_id IS NULL AND email = ? COLLATE NOCASE)) ORDER BY created DESC, id DESC");
     $st->execute([$c['id'], $c['verified_at'] !== '' ? 1 : 0, $c['email']]);
     return $st->fetchAll();
 }
@@ -6758,6 +7119,7 @@ function view_account(): never
     $g = customer_group();
     account_page('Your account', $verify
         . ($g ? '<p class="shop-note">You get <strong>' . e($g['name']) . ' prices</strong> while you\'re signed in: ' . e(lcfirst(group_offer($g))) . '.</p>' : '')
+        . trade_account_link($c)
         . '<p>Signed in as <strong>' . e($c['name'] ?: $c['email']) . '</strong>' . ($c['name'] !== '' ? ' (' . e($c['email']) . ')' : '') . '.</p>'
         . '<h2 class="shop-h2">Your orders</h2>'
         . ($rows !== '' ? '<table class="shop-basket shop-orders"><thead><tr><th>Order</th><th>Date</th><th>Status</th><th class="shop-num">Total</th></tr></thead><tbody>'
@@ -6808,7 +7170,7 @@ function view_account_details(): never
             account_slowdown('cacct:' . mb_strtolower($c['email']));
             if (throttled('clogin:' . client_ip(), 10, 900) || throttled('cemail:' . $c['id'], 5, 3600)) {
                 $errors[] = 'Too many attempts. Please wait a while and try again.';
-            } elseif (!password_verify(str_in($_POST['password'] ?? ''), $c['password'])) {
+            } elseif (!customer_password_ok(str_in($_POST['password'] ?? ''), $c)) {
                 throttle_hit('cacct:' . mb_strtolower($c['email']));
                 throttle_hit('clogin:' . client_ip());
                 throttle_hit('clogin:' . client_ip());
@@ -6854,7 +7216,7 @@ function view_account_password(): never
         account_slowdown('cacct:' . mb_strtolower($c['email']));
         if (throttled('clogin:' . client_ip(), 10, 900)) {
             $errors[] = 'Too many attempts. Please wait 15 minutes and try again.';
-        } elseif (!password_verify(str_in($_POST['current'] ?? ''), $c['password'])) {
+        } elseif (!customer_password_ok(str_in($_POST['current'] ?? ''), $c)) {
             throttle_hit('cacct:' . mb_strtolower($c['email']));
             throttle_hit('clogin:' . client_ip());
             throttle_hit('clogin:' . client_ip());
@@ -6987,7 +7349,7 @@ function view_account_delete(): never
         account_slowdown('cacct:' . mb_strtolower($c['email']));
         if (throttled('clogin:' . client_ip(), 10, 900)) {
             $err = 'Too many attempts. Please wait 15 minutes and try again.';
-        } elseif (!password_verify(str_in($_POST['password'] ?? ''), $c['password'])) {
+        } elseif (!customer_password_ok(str_in($_POST['password'] ?? ''), $c)) {
             throttle_hit('clogin:' . client_ip());
             throttle_hit('cacct:' . mb_strtolower($c['email']));
             $err = 'Your password wasn\'t right, so nothing was deleted.';
@@ -7576,7 +7938,7 @@ function low_stock_check(int $oid): void
     $hit = [];
     foreach (order_items($oid) as $it) {
         if ($it['variant_id'] !== null) {
-            $st = db()->prepare('SELECT v.stock, v.name AS vname, p.name, p.option_name, p.id AS pid, p.backorders FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = ?');
+            $st = db()->prepare('SELECT v.stock, v.name AS vname, v.name2 AS vname2, p.name, p.option_name, p.option2_name, p.id AS pid, p.backorders FROM variants v JOIN products p ON p.id = v.product_id WHERE v.id = ?');
             $st->execute([$it['variant_id']]);
         } else {
             $st = db()->prepare('SELECT stock, name, id AS pid, backorders FROM products WHERE id = ?');
@@ -7588,7 +7950,7 @@ function low_stock_check(int $oid): void
         }
         $now = (int)$r['stock'];
         if ($now + (int)$it['qty'] > $level && $now <= $level) {
-            $hit[] = ['name' => $r['name'] . ($it['variant_id'] !== null ? ' (' . ($r['option_name'] ?: 'Option') . ': ' . $r['vname'] . ')' : ''),
+            $hit[] = ['name' => $r['name'] . ($it['variant_id'] !== null ? ' (' . choice_label($r, ['name' => $r['vname'], 'name2' => $r['vname2']]) . ')' : ''),
                       'left' => $now, 'pid' => (int)$r['pid']];
         }
     }
@@ -7676,10 +8038,48 @@ function group_rate(?array $g, array $p): int
     return (int)$g['percent'];
 }
 
-/* What the group takes off one of these, at this price. */
-function group_unit_saving(array $p, int $unit): int
+/* A group's fixed prices, "product:choice" => pence (choice 0 = the product itself). */
+function group_fixed_prices(int $gid): array
 {
-    $rate = group_rate(customer_group(), $p);
+    static $all = [];
+    if (!isset($all[$gid])) {
+        $all[$gid] = [];
+        $st = db()->prepare('SELECT product_id, variant_id, price_pence FROM group_prices WHERE group_id = ?');
+        $st->execute([$gid]);
+        foreach ($st->fetchAll() as $r) {
+            $all[$gid][$r['product_id'] . ':' . $r['variant_id']] = (int)$r['price_pence'];
+        }
+    }
+    return $all[$gid];
+}
+
+/* The group's fixed price for one, if it has one: the choice's own, else the
+   product's (for a choice at the product's price). */
+function group_fixed(?array $g, array $p, ?array $v): ?int
+{
+    if (!$g) {
+        return null;
+    }
+    $f = group_fixed_prices((int)$g['id']);
+    if ($v && isset($f[$p['id'] . ':' . $v['id']])) {
+        return $f[$p['id'] . ':' . $v['id']];
+    }
+    if (!$v || $v['price_pence'] === null) {
+        return $f[$p['id'] . ':0'] ?? null;
+    }
+    return null;
+}
+
+/* What the group takes off one of these at its full price $unit: down to a fixed
+   price where one is set, else the group's percentage. Never a price rise. */
+function group_unit_saving(array $p, int $unit, ?array $v = null): int
+{
+    $g = customer_group();
+    $fixed = group_fixed($g, $p, $v);
+    if ($fixed !== null) {
+        return max(0, $unit - $fixed);
+    }
+    $rate = group_rate($g, $p);
     return $rate > 0 ? (int)round($unit * $rate / 100) : 0;
 }
 
@@ -7690,7 +8090,7 @@ function lines_group_saving(array $lines): int
     $s = 0;
     foreach ($lines as $l) {
         $full = $l['full'] ?? $l['price'];
-        $s += $l['qty'] * max(0, $l['price'] - ($full - group_unit_saving($l['p'], $full)));
+        $s += $l['qty'] * max(0, $l['price'] - ($full - group_unit_saving($l['p'], $full, $l['v'] ?? null)));
     }
     return $s;
 }
@@ -7742,6 +8142,10 @@ function group_offer(array $g): string
             $bits[] = ((int)$g['percent'] > 0 ? 'except ' : '') . implode(', ', $names);
         }
     }
+    $fixed = (int)db()->query('SELECT COUNT(DISTINCT product_id) FROM group_prices WHERE group_id = ' . (int)$g['id'])->fetchColumn();
+    if ($fixed) {
+        $bits[] = ($bits ? 'and ' : '') . 'fixed prices on ' . $fixed . ' product' . ($fixed === 1 ? '' : 's');
+    }
     return $bits ? implode(' ', $bits) : 'No discount set';
 }
 
@@ -7774,7 +8178,9 @@ function view_admin_group(string $which): never
     }
     $cats = cat_tree();
     $errors = [];
-    $v = ['name' => $g['name'] ?? '', 'percent' => $g ? (string)(int)$g['percent'] : '', 'rates' => []];
+    $v = ['name' => $g['name'] ?? '', 'percent' => $g ? (string)(int)$g['percent'] : '', 'rates' => [],
+          'ex_vat' => (bool)($g['ex_vat'] ?? false), 'min_order' => isset($g['min_order_pence']) ? price_input((int)$g['min_order_pence']) : '',
+          'pay' => $g && $g['pay_methods'] !== '' ? explode(',', $g['pay_methods']) : [], 'apply' => $g && (int)setting('trade_apply_group') === (int)$g['id']];
     foreach ($cats as $c) {
         $v['rates'][(int)$c['id']] = isset($g['rates'][(int)$c['id']]) ? (string)$g['rates'][(int)$c['id']] : '';
     }
@@ -7783,11 +8189,23 @@ function view_admin_group(string $which): never
         if ($g && post('do') === 'delete') {
             db()->prepare('UPDATE customers SET group_id = NULL WHERE group_id = ?')->execute([$g['id']]);
             db()->prepare('DELETE FROM customer_groups WHERE id = ?')->execute([$g['id']]);
+            db()->prepare('DELETE FROM group_prices WHERE group_id = ?')->execute([$g['id']]);
+            if ((int)setting('trade_apply_group') === (int)$g['id']) {
+                set_setting('trade_apply_group', '0');
+            }
             flash('Group ' . $g['name'] . ' deleted. Its customers pay normal prices now.');
             redirect(admin_url('groups'));
         }
         $v['name'] = trim(mb_substr(post('name'), 0, 40));
         $v['percent'] = trim(post('percent'));
+        $v['ex_vat'] = !empty($_POST['ex_vat']);
+        $v['min_order'] = post('min_order');
+        $v['pay'] = array_values(array_intersect(array_keys(PAY_LABELS), is_array($_POST['pay'] ?? null) ? $_POST['pay'] : []));
+        $v['apply'] = !empty($_POST['apply']);
+        $minP = $v['min_order'] === '' ? null : parse_price($v['min_order']);
+        if ($v['min_order'] !== '' && $minP === null) {
+            $errors[] = 'The minimum order should be an amount, like 100.';
+        }
         $in = is_array($_POST['rate'] ?? null) ? $_POST['rate'] : [];
         foreach ($cats as $c) {
             $v['rates'][(int)$c['id']] = is_string($in[$c['id']] ?? null) ? trim($in[$c['id']]) : '';
@@ -7825,6 +8243,13 @@ function view_admin_group(string $which): never
                 $pdo->prepare('INSERT INTO customer_groups (name, percent, created) VALUES (?, ?, ?)')->execute([$v['name'], (int)$v['percent'], now()]);
                 $gid = (int)$pdo->lastInsertId();
             }
+            $pdo->prepare('UPDATE customer_groups SET ex_vat = ?, min_order_pence = ?, pay_methods = ? WHERE id = ?')
+                ->execute([$v['ex_vat'] ? 1 : 0, $minP ?: null, implode(',', $v['pay']), $gid]);
+            if ($v['apply']) {
+                set_setting('trade_apply_group', (string)$gid);
+            } elseif ((int)setting('trade_apply_group') === $gid) {
+                set_setting('trade_apply_group', '0');
+            }
             $pdo->prepare('DELETE FROM group_rates WHERE group_id = ?')->execute([$gid]);
             foreach ($cats as $c) {
                 $r = $v['rates'][(int)$c['id']];
@@ -7861,7 +8286,19 @@ function view_admin_group(string $which): never
         . ($cats ? '<h2>Different rates for some categories <span class="hint" style="font-family:inherit;font-size:.85rem">(optional)</span></h2>'
             . '<p class="muted">Leave a category empty to use the rate above (or the rate of the category it sits in). Put 0 to keep a category at full price. To discount only certain categories, set the rate above to 0 and fill in just those.</p>'
             . '<table>' . $rows . '</table>' : '')
-        . '<p class="muted">The discount comes off the goods, not delivery. If a customer also has a discount code, they get whichever saves them more, never both.</p>'
+        . '<p class="muted">The discount comes off the goods, not delivery. If a customer also has a discount code, they get whichever saves them more, never both. '
+        . 'For a fixed price on a particular product instead, open the product and use Group prices.</p>'
+        . '<h2>Trade settings <span class="hint" style="font-family:inherit;font-size:.85rem">(optional)</span></h2>'
+        . '<label class="check"><input type="checkbox" name="ex_vat" value="1"' . ($v['ex_vat'] ? ' checked' : '') . '> Show this group prices without VAT</label>'
+        . '<p class="muted" style="margin-top:0">' . (setting('vat_registered') === '1' ? 'Prices show "ex VAT", with the VAT added as its own line in the basket. They pay the same total.'
+            : 'Only once you\'re VAT-registered (Settings → Business and VAT): until then prices show as they are.') . '</p>'
+        . '<label>Minimum order <span class="hint">(goods, after their prices; empty for none)</span><div class="price" style="max-width:10rem"><span>£</span><input name="min_order" inputmode="decimal" placeholder="100" value="' . e($v['min_order']) . '"></div></label>'
+        . '<fieldset class="paypick"><legend>Ways to pay</legend><p class="muted" style="margin-top:0">Leave all unticked to pay the same ways as everyone else. Tick to choose this group\'s own, '
+        . 'for example bank transfer for trade only. Each needs its details filled in under Settings → Payments, even if it\'s switched off for everyone else.</p>'
+        . implode('', array_map(fn($m) => '<label class="check"><input type="checkbox" name="pay[]" value="' . $m . '"' . (in_array($m, $v['pay'], true) ? ' checked' : '') . '> '
+            . PAY_LABELS[$m] . (pay_ready($m) ? '' : ' <span class="hint">(not set up yet)</span>') . '</label>', array_keys(PAY_LABELS))) . '</fieldset>'
+        . '<label class="check"><input type="checkbox" name="apply" value="1"' . ($v['apply'] ? ' checked' : '') . '> Customers can apply to join this group</label>'
+        . '<p class="muted" style="margin-top:0">Adds "Apply for a ' . e($v['name'] ?: 'trade') . ' account" to customers\' accounts. You approve each one in Customers → Trade applications. One group at a time takes applications.</p>'
         . '<button>' . ($g ? 'Save group' : 'Add group') . '</button></form>'
         . ($g ? '<h2>Customers in this group</h2>' . ($members !== '' ? '<table>' . $members . '</table>' : '<p class="muted">None yet. Open a customer in Customers to add them.</p>')
             . '<form method="post" onsubmit="return confirm(\'Delete the ' . e($g['name']) . ' group? Its customers go back to normal prices.\')">' . csrf_field()
@@ -7949,8 +8386,15 @@ function ready_items(array $u): array
          'UK law expects online sellers to show these. They appear at checkout, on orders and in emails.', settings_url('business', 'business'), true);
     $visible = (int)db()->query('SELECT COUNT(*) FROM products WHERE visible = 1')->fetchColumn();
     $add('At least one product in the shop', $visible > 0, 'Add a product with a name, a price and a photo.', admin_url('new'), true);
-    $add('Delivery or collection set up', !(can_deliver() && setting('postage_price') === '') && (can_deliver() || can_collect()),
+    $add('Delivery or collection set up', delivery_ready(),
          'Set a delivery price (0 for free) or offer collection.', settings_url('delivery'), true);
+    if (weights_used()) {   // a product with no weight would go for the price of an empty parcel
+        $hasV = 'EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id)';
+        $nw = (int)db()->query("SELECT COUNT(*) FROM products p WHERE p.visible = 1 AND p.kind != 'digital' AND ((NOT $hasV AND p.weight_g IS NULL)
+                 OR (p.weight_g IS NULL AND EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND v.active = 1 AND v.weight_g IS NULL)))")->fetchColumn();
+        $add('Weights on products', $nw === 0, $nw . ' product' . ($nw === 1 ? ' has' : 's have') . ' no weight, so ' . ($nw === 1 ? 'it counts' : 'they count')
+             . ' as weighing nothing for delivery priced by weight.', url_with(admin_url(), ['show' => 'noweight']), false);
+    }
     $any = pay_enabled('paypal') || pay_enabled('bank') || pay_enabled('collection');
     $add('A way to pay', $any, 'Switch on PayPal, bank transfer or pay on collection, and fill in its details.', settings_url('payments'), true);
     if (setting('pay_paypal') === '1') {
@@ -8044,12 +8488,17 @@ function view_admin_ready(): never
    address. The shop only believes the proxy's note of the visitor's real address
    (and of https) when the request really came from a proxy the owner trusts. */
 
-const CLOUDFLARE_RANGES = [
-    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
-    '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
-    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
-    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
-];
+/* A function, not a constant: the session is set up (and asks whether the request is
+   https, which can depend on these) before a constant this far down would exist. */
+function cloudflare_ranges(): array
+{
+    return [
+        '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18',
+        '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+        '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+        '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32', '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+    ];
+}
 
 function ip_in_cidr(string $ip, string $cidr): bool
 {
@@ -8071,7 +8520,7 @@ function ip_in_cidr(string $ip, string $cidr): bool
 function proxy_ranges(): array
 {
     return match (setting('proxy_mode')) {
-        'cloudflare' => CLOUDFLARE_RANGES,
+        'cloudflare' => cloudflare_ranges(),
         'other'      => array_values(array_filter(array_map('trim', preg_split('/[\s,]+/', setting('proxy_ips'))))),
         default      => [],
     };
@@ -9187,7 +9636,7 @@ function sku_taken(string $sku, int $productId = 0): ?string
         return null;
     }
     $st = db()->prepare("SELECT name FROM products WHERE sku = ? COLLATE NOCASE AND id != ?
-                         UNION ALL SELECT p.name || ' (' || v.name || ')' FROM variants v JOIN products p ON p.id = v.product_id
+                         UNION ALL SELECT p.name || ' (' || v.name || CASE WHEN v.name2 != '' THEN ' / ' || v.name2 ELSE '' END || ')' FROM variants v JOIN products p ON p.id = v.product_id
                          WHERE v.sku = ? COLLATE NOCASE AND v.product_id != ? LIMIT 1");
     $st->execute([$sku, $productId, $sku, $productId]);
     $n = $st->fetchColumn();
@@ -9240,7 +9689,7 @@ function own_price(array $p, ?array $v): array
 {
     $full = variant_price($p, $v);
     $sale = sale_unit($p, $v);
-    $grp = $full - group_unit_saving($p, $full);
+    $grp = $full - group_unit_saving($p, $full, $v);
     if ($sale !== null && $sale <= $grp) {
         return [$sale, $full, 'sale'];
     }
@@ -9251,9 +9700,9 @@ function own_price_html(array $p, ?array $v, string $prefix = ''): string
 {
     [$own, $full, $why] = own_price($p, $v);
     if ($why === '') {
-        return $prefix . money($full);
+        return $prefix . shown_money($full) . ex_vat_tag();
     }
-    return $prefix . money($own) . ' <s class="shop-was">' . money($full) . '</s> '
+    return $prefix . shown_money($own) . ex_vat_tag() . ' <s class="shop-was">' . shown_money($full) . '</s> '
          . ($why === 'group' ? '<small class="shop-yours">' . e(customer_group()['name'] ?? '') . ' price</small>' : '<small class="shop-sale-tag">Sale</small>');
 }
 
@@ -9324,6 +9773,37 @@ function product_tells_backorders(int $pid): bool
     }
     return $cache[$pid];
 }
+
+/* ------------------------------------------------------- options (1.3.0) */
+/* A product can have one option (Size) or two (Colour and Size). Each choice
+   (a row in variants) is one value, or one combination of two; a combination
+   that isn't made can be switched off (active = 0) and is never sold. */
+
+/* "Size", or "Colour / Size". */
+function option_title(array $p): string
+{
+    $one = $p['option_name'] !== '' ? $p['option_name'] : 'Option';
+    return ($p['option2_name'] ?? '') !== '' ? $one . ' / ' . $p['option2_name'] : $one;
+}
+
+/* A choice's short name: "Large", or "Red / Large". */
+function choice_name(array $v): string
+{
+    return $v['name'] . (($v['name2'] ?? '') !== '' ? ' / ' . $v['name2'] : '');
+}
+
+/* A choice as a basket or order line shows it: "Size: Large", or "Colour: Red, Size: Large". */
+function choice_label(array $p, array $v): string
+{
+    $one = ($p['option_name'] !== '' ? $p['option_name'] : 'Option') . ': ' . $v['name'];
+    return ($v['name2'] ?? '') !== '' ? $one . ', ' . (($p['option2_name'] ?? '') !== '' ? $p['option2_name'] : 'Option') . ': ' . $v['name2'] : $one;
+}
+
+/* The choices that can be bought (switched-off combinations left out). */
+function live_choices(array $vars): array
+{
+    return array_values(array_filter($vars, fn($v) => (int)($v['active'] ?? 1) === 1));
+}
 /* ================================================ product import and export */
 /* 1.2.0. A spreadsheet of products, for bulk price and stock changes from a
    supplier's list, or for moving in from another shop. Export writes one row per
@@ -9336,7 +9816,8 @@ function product_tells_backorders(int $pid): bool
    is one transaction too, so it all goes in or none of it does. */
 
 const PRODUCT_CSV_COLUMNS = ['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'stock', 'backorders', 'visible',
-                             'main_category', 'categories', 'option_name', 'choice', 'choice_sku', 'choice_price', 'choice_sale_price', 'description'];
+                             'main_category', 'categories', 'option_name', 'option2_name', 'choice', 'choice2', 'choice_sku', 'choice_price', 'choice_sale_price',
+                             'choice_active', 'weight', 'choice_weight', 'group_prices', 'photos', 'old_url', 'related', 'description'];
 const IMPORT_MAX_ROWS = 20000;
 const IMPORT_SHOW_CHANGES = 50;
 
@@ -9362,6 +9843,23 @@ function admin_export_products(): never
     }
     $num = fn($x) => $x === null ? '' : (string)(int)$x;
     $money = fn($x) => $x === null ? '' : price_input((int)$x);
+    $kg = fn($x) => weight_input($x === null ? null : (int)$x);
+    $gnames = array_column(all_groups(), 'name', 'id');
+    $gp = [];
+    foreach (db()->query('SELECT * FROM group_prices ORDER BY group_id') as $r) {
+        if (isset($gnames[$r['group_id']])) {
+            $gp[$r['product_id'] . ':' . $r['variant_id']][] = $gnames[$r['group_id']] . '=' . price_input((int)$r['price_pence']);
+        }
+    }
+    $gpc = fn(string $k) => implode(' | ', $gp[$k] ?? []);
+    $rel = [];
+    foreach (db()->query('SELECT r.product_id, x.sku, x.slug FROM product_related r JOIN products x ON x.id = r.related_id ORDER BY r.product_id, r.position') as $r) {
+        $rel[(int)$r['product_id']][] = $r['sku'] !== '' ? $r['sku'] : $r['slug'];
+    }
+    $old = [];
+    foreach (db()->query('SELECT product_id, old_path FROM redirects ORDER BY old_path') as $r) {
+        $old[(int)$r['product_id']][] = $r['old_path'];
+    }
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="products-' . gmdate('Y-m-d') . '.csv"');
     header('Cache-Control: no-store');
@@ -9369,14 +9867,16 @@ function admin_export_products(): never
     foreach (db()->query('SELECT * FROM products ORDER BY id') as $p) {
         $base = [$p['sku'], $p['slug'], $p['name'], price_input((int)$p['price_pence']), $money($p['sale_pence']), $p['sale_from'], $p['sale_to'],
                  $num($p['stock']), $p['backorders'], (int)$p['visible'], (int)$p['category_id'] && cat_by_id((int)$p['category_id']) ? cat_csv_path((int)$p['category_id']) : '',
-                 $cats(array_diff($extra[(int)$p['id']] ?? [], [(int)$p['category_id']])), $p['option_name']];
+                 $cats(array_diff($extra[(int)$p['id']] ?? [], [(int)$p['category_id']])), $p['option_name'], $p['option2_name']];
         $rows = [];
         foreach ($vars[(int)$p['id']] ?? [] as $v) {   // a row per choice; stock is the choice's own
             $r = $base;
             $r[7] = $num($v['stock']);
-            $rows[] = array_merge($r, [$v['name'], $v['sku'], $money($v['price_pence']), $money($v['sale_pence']), $p['description']]);
+            $rows[] = array_merge($r, [$v['name'], $v['name2'], $v['sku'], $money($v['price_pence']), $money($v['sale_pence']), (int)$v['active'],
+                                       $kg($p['weight_g']), $kg($v['weight_g']),
+                                       $gpc($p['id'] . ':' . ($v['price_pence'] === null && !isset($gp[$p['id'] . ':' . $v['id']]) ? 0 : $v['id'])), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $p['description']]);
         }
-        $rows = $rows ?: [array_merge($base, ['', '', '', '', $p['description']])];
+        $rows = $rows ?: [array_merge($base, ['', '', '', '', '', '', $kg($p['weight_g']), '', $gpc($p['id'] . ':0'), '', implode(' | ', $old[(int)$p['id']] ?? []), implode(' | ', $rel[(int)$p['id']] ?? []), $p['description']])];
         foreach ($rows as $r) {
             echo implode(',', array_map('csv_cell', $r)), "\r\n";
         }
@@ -9510,7 +10010,10 @@ function import_cat(string $path, array &$made, ?string &$err): int
 function import_run(array $rows, bool $apply): array
 {
     $pdo = db();
-    $rep = ['new' => 0, 'changed' => 0, 'same' => 0, 'choices' => 0, 'cats' => [], 'changes' => [], 'errors' => [], 'warnings' => [], 'hidden' => 0];
+    $rep = ['new' => 0, 'changed' => 0, 'same' => 0, 'choices' => 0, 'cats' => [], 'changes' => [], 'errors' => [], 'warnings' => [], 'hidden' => 0,
+            'photo_items' => [], 'later' => 0];
+    $queued = [];   // product|address, so a photo listed twice is fetched once
+    $relLater = [];
     $pdo->exec('BEGIN IMMEDIATE');
     try {
         $touched = [];   // product id => 'new' | 'changed' | 'same'
@@ -9577,7 +10080,7 @@ function import_run(array $rows, bool $apply): array
             $touched[$pid] ??= $isNew ? 'new' : 'same';
             // ---- the product's own fields (every row for a product must agree on these)
             $set = [];
-            foreach (['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'backorders', 'visible', 'main_category', 'categories', 'option_name', 'description'] as $f) {
+            foreach (['sku', 'slug', 'name', 'price', 'sale_price', 'sale_from', 'sale_to', 'backorders', 'visible', 'main_category', 'categories', 'option_name', 'option2_name', 'weight', 'description'] as $f) {
                 if ($g($f) === '') {
                     continue;
                 }
@@ -9681,6 +10184,17 @@ function import_run(array $rows, bool $apply): array
             if (isset($set['option_name'])) {
                 $upd['option_name'] = [$p['option_name'], $set['option_name'] === '-' ? '' : mb_substr($set['option_name'], 0, 40), 'option name'];
             }
+            if (isset($set['option2_name'])) {
+                $upd['option2_name'] = [$p['option2_name'], $set['option2_name'] === '-' ? '' : mb_substr($set['option2_name'], 0, 40), 'second option name'];
+            }
+            if (isset($set['weight'])) {
+                $w = $set['weight'] === '-' ? null : parse_weight($set['weight']);
+                if ($set['weight'] !== '-' && $w === null) {
+                    $err($n, 'The weight ' . $set['weight'] . ' should be in kg, like 0.5, or - for none.');
+                } else {
+                    $upd['weight_g'] = [$p['weight_g'], $w, 'weight'];
+                }
+            }
             if (isset($set['description'])) {
                 $upd['description'] = [$p['description'], $set['description'] === '-' ? '' : $set['description'], 'description'];
             }
@@ -9715,6 +10229,7 @@ function import_run(array $rows, bool $apply): array
             $vupd = [];
             if ($isChoice) {
                 $cname = mb_substr($g('choice'), 0, 60);
+                $c2 = mb_substr($g('choice2'), 0, 60);
                 $csku = sku_clean($g('choice_sku'));
                 $vars = product_variants($pid);
                 foreach ($vars as $x) {
@@ -9722,11 +10237,30 @@ function import_run(array $rows, bool $apply): array
                         $vrow = $x;
                     }
                 }
-                foreach ($vrow ? [] : $vars as $x) {
-                    if (mb_strtolower($x['name']) === mb_strtolower($cname)) {
-                        $vrow = $x;
+                if (!$vrow) {   // by name, and by the second choice when given
+                    $same = array_values(array_filter($vars, fn($x) => mb_strtolower($x['name']) === mb_strtolower($cname)
+                        && ($c2 === '' || mb_strtolower($x['name2']) === mb_strtolower($c2 === '-' ? '' : $c2))));
+                    if (count($same) > 1 && $c2 === '') {
+                        $err($n, $p['name'] . ' has several choices called ' . $cname . '. Fill in choice2 to say which.');
                     }
+                    $vrow = $same[0] ?? null;
                 }
+                $opt2 = $upd['option2_name'][1] ?? $p['option2_name'];
+                $n2 = $c2 === '' ? ($vrow['name2'] ?? '') : ($c2 === '-' ? '' : $c2);
+                if ($opt2 !== '' && $n2 === '') {
+                    $err($n, 'Fill in choice2 for ' . $cname . ': ' . $p['name'] . ' has a second option (' . $opt2 . ').');
+                }
+                $cw = $g('choice_weight');
+                $cweight = $cw === '' ? ($vrow['weight_g'] ?? null) : ($cw === '-' ? null : parse_weight($cw));
+                if ($cw !== '' && $cw !== '-' && $cweight === null) {
+                    $err($n, 'The choice weight ' . $cw . ' should be in kg, like 0.5, or - for none.');
+                }
+                $active = $g('choice_active') === '' ? (int)($vrow['active'] ?? 1) : import_bool($g('choice_active'));
+                if ($active === null) {
+                    $err($n, 'choice_active should be 1 or 0 (or yes or no).');
+                }
+                $cname0 = $cname;
+                $cname = choice_name(['name' => $cname, 'name2' => $opt2 !== '' ? $n2 : '']);
                 if ($csku !== '' && $csku !== '-') {
                     if (!sku_valid($csku)) {
                         $err($n, 'The choice SKU ' . $csku . ' can only have letters, numbers, spaces and . _ / - in it.');
@@ -9756,13 +10290,14 @@ function import_run(array $rows, bool $apply): array
                     $err($n, 'Stock for ' . $cname . ' should be a whole number (below zero only for a product that keeps selling), or - to stop counting.');
                 }
                 if (count($rep['errors']) === $before) {
-                    $vals = ['name' => $cname, 'sku' => $csku === '' ? ($vrow['sku'] ?? '') : ($csku === '-' ? '' : $csku),
+                    $vals = ['name' => $cname0, 'name2' => $opt2 !== '' ? $n2 : '', 'active' => (int)$active, 'weight_g' => $cweight === null ? null : (int)$cweight, 'sku' => $csku === '' ? ($vrow['sku'] ?? '') : ($csku === '-' ? '' : $csku),
                              'price_pence' => $own, 'sale_pence' => $csale,
                              'stock' => $g('stock') === '' ? ($vrow['stock'] ?? null) : ($g('stock') === '-' ? null : (int)$g('stock'))];
                     if (!$vrow) {
                         $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), -1) + 1 FROM variants WHERE product_id = ' . $pid)->fetchColumn();
-                        $pdo->prepare('INSERT INTO variants (product_id, name, sku, price_pence, sale_pence, stock, position) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                            ->execute([$pid, $vals['name'], $vals['sku'], $vals['price_pence'], $vals['sale_pence'], $vals['stock'], $pos]);
+                        $pdo->prepare('INSERT INTO variants (product_id, name, name2, active, weight_g, sku, price_pence, sale_pence, stock, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+                            ->execute([$pid, $vals['name'], $vals['name2'], $vals['active'], $vals['weight_g'], $vals['sku'], $vals['price_pence'], $vals['sale_pence'], $vals['stock'], $pos]);
+                        $vrow = ['id' => (int)$pdo->lastInsertId()] + $vals;
                         $rep['choices']++;
                         $note($pid, $label, 'choice ' . $cname, '', 'added');
                         if (!$vars) {   // its first choice: stock is counted per choice from now on
@@ -9774,10 +10309,10 @@ function import_run(array $rows, bool $apply): array
                     } else {
                         foreach ($vals as $k => $x) {
                             $was = $vrow[$k];
-                            $fmt = in_array($k, ['price_pence', 'sale_pence'], true) ? $money : fn($y) => $y === null ? '' : (string)$y;
+                            $fmt = in_array($k, ['price_pence', 'sale_pence'], true) ? $money : ($k === 'weight_g' ? fn($y) => $y === null ? '' : weight_text((int)$y) : fn($y) => $y === null ? '' : (string)$y);
                             if ($fmt($was) !== $fmt($x)) {
                                 $vupd[$k] = $x;
-                                $note($pid, $label, $cname . ' ' . ['name' => 'name', 'sku' => 'SKU', 'price_pence' => 'price', 'sale_pence' => 'sale price', 'stock' => 'stock'][$k], $fmt($was), $fmt($x));
+                                $note($pid, $label, $cname . ' ' . ['name' => 'name', 'name2' => $opt2 !== '' ? mb_strtolower($opt2) : 'second choice', 'active' => 'on sale', 'weight_g' => 'weight', 'sku' => 'SKU', 'price_pence' => 'price', 'sale_pence' => 'sale price', 'stock' => 'stock'][$k], $fmt($was), $fmt($x));
                             }
                         }
                         if ($vupd) {
@@ -9787,16 +10322,44 @@ function import_run(array $rows, bool $apply): array
                     }
                 }
             }
+            // ---- photos by web address: fetched in batches once the import is done
+            $photosHere = false;
+            if (($ph = $g('photos')) !== '' && $ph !== '-') {
+                $have = photo_sources($pid);
+                foreach (array_values(array_unique(array_filter(array_map('trim', explode('|', $ph))))) as $k => $url) {
+                    if (!preg_match('#^https?://[^\s]+$#i', $url)) {
+                        $err($n, 'The photo address ' . $url . ' should start with http:// or https://.');
+                        continue;
+                    }
+                    $photosHere = true;
+                    if (isset($have['url:' . $url]) || isset($queued[$pid . '|' . $url])) {
+                        continue;   // added by an earlier import
+                    }
+                    $queued[$pid . '|' . $url] = true;
+                    $rep['photo_items'][] = ['pid' => $pid, 'pos' => $k + 1, 'url' => $url, 'source' => 'url:' . $url,
+                                             'name' => basename((string)parse_url($url, PHP_URL_PATH)) ?: 'photo', 'show' => import_bool($g('visible')) === 1];
+                }
+            }
+            // ---- related products: set once every row is in (they may be further down the file)
+            if ($g('related') !== '') {
+                $relLater[$pid] = [$n, $g('related'), $label];
+            }
+            // ---- the old shop's addresses for it, for redirects
+            foreach ($g('old_url') === '' ? [] : array_filter(array_map('trim', explode('|', $g('old_url')))) as $ou) {
+                if (($e = redirect_set($ou, $pid)) !== null) {
+                    $err($n, $e);
+                }
+            }
             if (count($rep['errors']) !== $before) {
                 continue;
             }
             // ---- save the product's changes
             $fmt = fn($k, $x) => $x === null ? '' : (in_array($k, ['price_pence', 'sale_pence'], true) ? $money($x)
-                 : ($k === 'category_id' ? ((int)$x ? cat_csv_path((int)$x) : '') : ($k === 'visible' ? ((int)$x ? 'yes' : 'no') : (string)$x)));
+                 : ($k === 'weight_g' ? weight_text((int)$x) : ($k === 'category_id' ? ((int)$x ? cat_csv_path((int)$x) : '') : ($k === 'visible' ? ((int)$x ? 'yes' : 'no') : (string)$x))));
             $changes = [];
             if (isset($upd['visible']) && (int)$upd['visible'][1] === 1 && !(int)$p['visible'] && !product_photos($pid)) {
                 unset($upd['visible']);   // never on sale without a photo
-                $rep['hidden']++;
+                $photosHere ? $rep['later']++ : $rep['hidden']++;   // ...shown once its photo arrives, if it has one coming
             }
             foreach ($upd as $k => [$was, $now, $what]) {
                 if ($fmt($k, $was) !== $fmt($k, $now)) {
@@ -9814,8 +10377,64 @@ function import_run(array $rows, bool $apply): array
                 $note($pid, $label, 'also in', implode(' | ', array_map('cat_csv_path', $extraNow)), implode(' | ', array_map('cat_csv_path', $extraNew)));
                 product_set_extra_cats($pid, $extraNew, $main);
             }
+            // ---- group prices: "Trade=8.50 | Reseller=9"; on a choice's row, for that choice
+            // (or, for a choice at the product's price, the product's), else the product's.
+            if (($gpc = $g('group_prices')) !== '') {
+                $gvid = $isChoice && $vrow && (($vupd['price_pence'] ?? $vrow['price_pence']) !== null) ? (int)$vrow['id'] : 0;
+                $grpByName = [];
+                foreach (all_groups() as $gr) {
+                    $grpByName[mb_strtolower($gr['name'])] = $gr;
+                }
+                $gset = [];
+                $bad = false;
+                foreach ($gpc === '-' ? [] : array_filter(array_map('trim', explode('|', $gpc))) as $pair) {
+                    [$gname, $gval] = array_map('trim', explode('=', $pair, 2)) + [1 => ''];
+                    $gr = $grpByName[mb_strtolower($gname)] ?? null;
+                    $gpp = parse_price($gval);
+                    if (!$gr) {
+                        $err($n, 'There\'s no customer group called ' . $gname . '. Add it in Customers → Groups first.');
+                        $bad = true;
+                    } elseif ($gpp === null) {
+                        $err($n, 'The ' . $gname . ' price ' . $gval . ' isn\'t a price.');
+                        $bad = true;
+                    } else {
+                        $gset[(int)$gr['id']] = $gpp;
+                    }
+                }
+                if (!$bad) {
+                    $st = $pdo->prepare('SELECT group_id, price_pence FROM group_prices WHERE product_id = ? AND variant_id = ?');
+                    $st->execute([$pid, $gvid]);
+                    $now = array_map('intval', array_column($st->fetchAll(), 'price_pence', 'group_id'));
+                    ksort($now);
+                    ksort($gset);
+                    if ($now !== $gset) {
+                        $pdo->prepare('DELETE FROM group_prices WHERE product_id = ? AND variant_id = ?')->execute([$pid, $gvid]);
+                        foreach ($gset as $gid => $gpp) {
+                            $pdo->prepare('INSERT INTO group_prices (group_id, product_id, variant_id, price_pence) VALUES (?, ?, ?, ?)')->execute([$gid, $pid, $gvid, $gpp]);
+                        }
+                        $byId = array_column(all_groups(), 'name', 'id');
+                        $show = fn(array $a) => implode(' | ', array_map(fn($k, $x) => ($byId[$k] ?? '') . '=' . price_input($x), array_keys($a), $a));
+                        $note($pid, $label, ($gvid ? choice_name($vrow) . ' ' : '') . 'group prices', $show($now), $show($gset));
+                    }
+                }
+            }
             if ($touched[$pid] === 'same' && isset($rep['changes'][$pid])) {
                 $touched[$pid] = 'changed';
+            }
+        }
+        foreach ($relLater as $pid => [$n, $list, $label]) {
+            $errs = [];
+            $ids = $list === '-' ? [] : related_parse($list, $pid, $errs);
+            foreach ($errs as $e) {
+                $err($n, $e);
+            }
+            if (!$errs && $ids !== related_ids($pid)) {
+                $show = fn(array $a) => implode(' | ', array_map(fn($i) => related_ref(product_by_id($i) ?? ['sku' => '', 'slug' => '?']), $a));
+                $note($pid, $label, 'related', $show(related_ids($pid)), $show($ids));
+                related_save($pid, $ids);
+                if ($touched[$pid] === 'same') {
+                    $touched[$pid] = 'changed';
+                }
             }
         }
         foreach ($touched as $pid => $how) {
@@ -9852,14 +10471,26 @@ function view_admin_import(): never
     if (($_GET['export'] ?? '') === 'products') {
         admin_export_products();
     }
+    $seg = $GLOBALS['shop_seg'] ?? [];
+    if (($seg[2] ?? '') === 'job' && isset($seg[3])) {
+        view_photo_job((int)$seg[3]);
+    }
     foreach (glob(data_dir() . '/import-*.csv') ?: [] as $old) {   // checked but never applied
         if (filemtime($old) < time() - 86400) {
             @unlink($old);
         }
     }
+    foreach (glob(data_dir() . '/photos-*', GLOB_ONLYDIR) ?: [] as $old) {   // photos checked but never added
+        if (filemtime($old) < time() - 86400 && !db()->query("SELECT 1 FROM import_jobs WHERE finished = '' AND dir = " . db()->quote($old))->fetchColumn()) {
+            photo_dir_remove($old);
+        }
+    }
     $report = '';
     if (is_post()) {
         csrf_check();
+        $report = photo_import_post() ?? '';
+    }
+    if (is_post() && $report === '') {
         if (post('do') === 'apply') {
             $token = (string)($_SESSION['shop_import'] ?? '');
             if ($token === '' || !hash_equals($token, post('token')) || !is_file(import_file($token))) {
@@ -9874,6 +10505,12 @@ function view_admin_import(): never
             if ($errors || $rep['errors']) {
                 flash('The file has problems now, so nothing was imported. Please check it again.');
                 redirect(admin_url('import'));
+            }
+            if ($rep['photo_items']) {
+                $items = photo_items_mark_first($rep['photo_items']);
+                $id = photo_job_create('urls', count($items) . ' photo' . (count($items) === 1 ? '' : 's') . ' from the web, ' . date('j M H:i'), $items, !empty($_POST['replace']));
+                flash('Imported: ' . import_counts($rep) . '. Now fetching the photos.');
+                redirect(admin_url('import/job/' . $id));
             }
             flash('Imported: ' . import_counts($rep) . '.' . ($rep['new'] ? ' New products are hidden until you add photos and show them.' : ''));
             redirect(url_with(admin_url(), $rep['new'] ? ['show' => 'hidden'] : []));
@@ -9907,6 +10544,13 @@ function view_admin_import(): never
         . '<tr><td><code>categories</code></td><td>Other categories it shows in, separated by <code>|</code>.</td></tr>'
         . '<tr><td><code>option_name</code>, <code>choice</code>, <code>choice_sku</code>, <code>choice_price</code>, <code>choice_sale_price</code></td>'
         . '<td>For a product with options (like sizes), one row per choice. Leave choice_price empty for the product\'s price.</td></tr>'
+        . '<tr><td><code>option2_name</code>, <code>choice2</code></td><td>A second option, like Colour as well as Size: each row is one pair, like Large and Red.</td></tr>'
+        . '<tr><td><code>weight</code>, <code>choice_weight</code></td><td>Weight in kg, like 0.5, for delivery priced by weight. A choice\'s own weight, if it differs.</td></tr>'
+        . '<tr><td><code>group_prices</code></td><td>Fixed prices for customer groups, like <code>Trade=8.50 | Reseller=9</code>. On a choice\'s row, for that choice. - clears them.</td></tr>'
+        . '<tr><td><code>choice_active</code></td><td>1 to sell that choice, 0 to stop selling it (for a pair you don\'t make).</td></tr>'
+        . '<tr><td><code>photos</code></td><td>Web addresses of its photos, separated by <code>|</code>. They\'re fetched after the import, in batches; one fetched before isn\'t fetched again.</td></tr>'
+        . '<tr><td><code>old_url</code></td><td>Its address in your old shop, like <code>/product/wishbone-front/</code>, so it can redirect here (see Customers → Import).</td></tr>'
+        . '<tr><td><code>related</code></td><td>Up to 8 related products ("You might also like"), by SKU or web address, separated by <code>|</code>. - clears them.</td></tr>'
         . '<tr><td><code>description</code></td><td>Paragraphs and lists as in the product form.</td></tr></table>';
     admin_shell('Import and export', '<h1>Import and export products</h1>' . $report
         . ($report === '' ? '<h2>Export</h2>
@@ -9921,7 +10565,7 @@ function view_admin_import(): never
         <label>CSV file <input type="file" name="file" accept=".csv,text/csv" required></label>
         <button>Check this file</button></form>
       <p class="muted">You\'ll see what would change before anything does. This server accepts files up to ' . e(import_limit_text()) . '.</p>
-      <details><summary>The columns</summary>' . $cols . '</details>' : ''));
+      <details><summary>The columns</summary>' . $cols . '</details>' . photo_import_section() : ''));
 }
 
 /* "2M (about 6,000 products)": the upload limit, for a file of products (about 300 bytes a row). */
@@ -9969,12 +10613,18 @@ function import_report_html(array $rep, int $rows, string $name, string $token, 
     foreach ($rep['warnings'] as $w) {
         $out .= '<p class="muted">' . e($w) . '</p>';
     }
+    if ($n = count($rep['photo_items'] ?? [])) {
+        $out .= '<p class="flash">' . $n . ' photo' . ($n === 1 ? '' : 's') . ' to fetch from the web for ' . count(array_unique(array_column($rep['photo_items'], 'pid'))) . ' product'
+              . (count(array_unique(array_column($rep['photo_items'], 'pid'))) === 1 ? '' : 's') . '. They\'re fetched in batches after the import, with a page showing how it\'s going.'
+              . (($rep['later'] ?? 0) ? ' ' . $rep['later'] . ' product' . ($rep['later'] === 1 ? '' : 's') . ' will be shown once ' . ($rep['later'] === 1 ? 'its' : 'their') . ' first photo arrives.' : '') . '</p>';
+    }
     if ($rep['hidden']) {
         $out .= '<p class="muted">' . $rep['hidden'] . ' product' . ($rep['hidden'] === 1 ? '' : 's') . ' will stay hidden: a product needs a photo before it can be shown.</p>';
     }
-    if (!$rep['errors'] && ($rep['new'] || $rep['changed'])) {
-        $out .= '<form method="post" class="actions-row" style="margin-top:1rem;border:0;padding:0">' . csrf_field()
+    if (!$rep['errors'] && ($rep['new'] || $rep['changed'] || !empty($rep['photo_items']))) {
+        $out .= '<form method="post" class="actions-row" style="margin-top:1rem;border:0;padding:0;flex-wrap:wrap">' . csrf_field()
               . '<input type="hidden" name="do" value="apply"><input type="hidden" name="token" value="' . e($token) . '">'
+              . (!empty($rep['photo_items']) ? '<label class="check" style="flex-basis:100%"><input type="checkbox" name="replace" value="1"> The photos replace each product\'s existing photos</label>' : '')
               . '<button>Apply these changes</button> <a href="' . e(admin_url('import')) . '">Cancel</a></form>';
     } else {
         $out .= '<p><a class="btn quiet" href="' . e(admin_url('import')) . '">Check another file</a></p>';
@@ -10033,8 +10683,8 @@ function search_fts(): bool
 function search_fingerprint(): string
 {
     return (string)db()->query("SELECT
-        (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + LENGTH(description) + LENGTH(option_name)) || ':' || IFNULL(MAX(updated), '') || ':' || TOTAL(category_id) FROM products)
-        || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + product_id) FROM variants)
+        (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(sku) + LENGTH(description) + LENGTH(option_name) + LENGTH(option2_name)) || ':' || IFNULL(MAX(updated), '') || ':' || TOTAL(category_id) FROM products)
+        || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + LENGTH(name2) + LENGTH(sku) + product_id + active) FROM variants)
         || '|' || (SELECT COUNT(*) || ':' || TOTAL(LENGTH(name) + parent_id) FROM categories)
         || '|' || (SELECT COUNT(*) || ':' || TOTAL(category_id * 7 + product_id) FROM product_categories)")->fetchColumn();
 }
@@ -10054,11 +10704,11 @@ function search_index_fresh(): void
             $extra[(int)$r['product_id']][] = (int)$r['category_id'];
         }
         $vars = [];
-        foreach ($pdo->query('SELECT product_id, name, sku FROM variants') as $v) {
+        foreach ($pdo->query('SELECT product_id, name || \' \' || name2 AS name, sku FROM variants') as $v) {
             $vars[(int)$v['product_id']][] = $v;
         }
         $ins = $pdo->prepare('INSERT INTO products_fts (rowid, name, sku, cats, body) VALUES (?, ?, ?, ?, ?)');
-        foreach ($pdo->query('SELECT id, name, sku, description, option_name, category_id FROM products') as $p) {
+        foreach ($pdo->query('SELECT id, name, sku, description, option_name || \' \' || option2_name AS option_name, category_id FROM products') as $p) {
             $id = (int)$p['id'];
             $cats = [];
             foreach (array_merge([(int)$p['category_id']], $extra[$id] ?? []) as $c) {
@@ -10140,7 +10790,7 @@ function search_sql(string $s): array
         foreach ($alts as $w) {
             $like = '%' . strtr($w, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']) . '%';
             $any[] = "(p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR p.description LIKE ? ESCAPE '\\'
-                      OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.sku LIKE ? ESCAPE '\\' OR v.name LIKE ? ESCAPE '\\'))
+                      OR EXISTS (SELECT 1 FROM variants v WHERE v.product_id = p.id AND (v.sku LIKE ? ESCAPE '\\' OR (v.name || ' ' || v.name2) LIKE ? ESCAPE '\\'))
                       OR EXISTS (SELECT 1 FROM categories c WHERE c.name LIKE ? ESCAPE '\\' AND (c.id IN $inCats)))";
             array_push($args, $like, $like, $like, $like, $like, $like);
             $inName[] = 'p.name LIKE ' . db()->quote($like) . " ESCAPE '\\'";
@@ -10219,7 +10869,7 @@ function invoice_lines(array $o): array
         $lines[] = [$o['group_name'] . ' prices', 'Customer group discount', 1, -(int)$o['group_pence']];
     }
     if ((int)$o['postage_pence'] > 0) {
-        $lines[] = [$o['delivery'] === 'collect' ? 'Collection' : 'Delivery', '', 1, (int)$o['postage_pence']];
+        $lines[] = [order_kind_label($o), '', 1, (int)$o['postage_pence']];
     }
     // Anything an older order recorded differently: a line that makes it add up, never a wrong total.
     $diff = (int)$o['total_pence'] - array_sum(array_column($lines, 3));
@@ -10363,6 +11013,2127 @@ function view_invoice_public(string $token): never
     echo invoice_html($o, shop_url('order/' . $token));
     exit;
 }
+
+/* ================================================================ delivery
+   Delivery methods (1.3). The shop's own delivery price and collection, from
+   1.2's settings, are the first two methods, "deliver" and "collect"; more live
+   in delivery_methods as m<id>. Each method is priced flat, by order value or by
+   weight, and postcode zones can add a charge or take a method away. A shop with
+   one price and no zones works exactly as it did. */
+
+const DELIVERY_PRICING = ['flat' => 'One price', 'value' => 'By order value', 'weight' => 'By weight'];
+
+/* Zones the owner can add in one go. Couriers draw these lines a little
+   differently, so they're a starting point to edit. */
+const ZONE_PRESETS = [
+    'Highlands and Islands'          => 'IV KW HS ZE PA20-49 PA60-78 PH17-26 PH30-44 PH49-50 KA27-28',
+    'Northern Ireland'               => 'BT',
+    'Isles of Scilly'                => 'TR21-25',
+    'Channel Islands and Isle of Man' => 'GY JE IM',
+];
+
+/* Every delivery method, in the order customers see them: the shop's own delivery,
+   any others, then collection. $live: only those switched on. */
+function delivery_methods(bool $live = true): array
+{
+    static $extra = null;
+    $extra ??= db()->query('SELECT * FROM delivery_methods ORDER BY position, id')->fetchAll();
+    $p = setting('postage_price');
+    $o = setting('postage_free_over');
+    $all = [['key' => 'deliver', 'name' => setting('postage_name') !== '' ? setting('postage_name') : 'UK delivery', 'kind' => 'deliver',
+             'pricing' => setting('postage_pricing') ?: 'flat', 'price' => $p === '' ? null : (int)$p, 'free_over' => $o === '' ? null : (int)$o,
+             'note' => '', 'active' => can_deliver(), 'own' => true]];
+    foreach ($extra as $m) {
+        $all[] = ['key' => 'm' . $m['id'], 'id' => (int)$m['id'], 'name' => $m['name'], 'kind' => $m['kind'], 'pricing' => $m['pricing'],
+                  'price' => $m['price_pence'] === null ? null : (int)$m['price_pence'],
+                  'free_over' => $m['free_over_pence'] === null ? null : (int)$m['free_over_pence'],
+                  'note' => $m['note'], 'active' => (int)$m['active'] === 1, 'own' => false];
+    }
+    $all[] = ['key' => 'collect', 'name' => 'Collection', 'kind' => 'collect', 'pricing' => 'flat', 'price' => 0, 'free_over' => null,
+              'note' => setting('postage_collect_note'), 'active' => can_collect(), 'own' => true];
+    return $live ? array_values(array_filter($all, fn($m) => $m['active'])) : $all;
+}
+
+function delivery_method(string $key, bool $live = true): ?array
+{
+    foreach (delivery_methods($live) as $m) {
+        if ($m['key'] === $key) {
+            return $m;
+        }
+    }
+    return null;
+}
+
+/* A method's price bands, lowest first, the open-ended one (up_to NULL) last. */
+function delivery_bands(string $key): array
+{
+    static $all = null;
+    if ($all === null) {
+        $all = [];
+        foreach (db()->query('SELECT * FROM delivery_bands ORDER BY up_to IS NULL, up_to, id') as $b) {
+            $all[$b['method']][] = ['up_to' => $b['up_to'] === null ? null : (int)$b['up_to'], 'price' => (int)$b['price_pence']];
+        }
+    }
+    return $all[$key] ?? [];
+}
+
+function delivery_zones(): array
+{
+    static $z = null;
+    return $z ??= db()->query('SELECT * FROM delivery_zones ORDER BY position, id')->fetchAll();
+}
+
+function zone_rate(string $key, int $zoneId): ?array
+{
+    static $r = null;
+    if ($r === null) {
+        $r = [];
+        foreach (db()->query('SELECT * FROM delivery_zone_rates') as $x) {
+            $r[$x['method'] . ':' . $x['zone_id']] = ['available' => (int)$x['available'] === 1, 'extra' => (int)$x['extra_pence']];
+        }
+    }
+    return $r[$key . ':' . $zoneId] ?? null;
+}
+
+/* Does a postcode fall in a zone's areas? Areas are postcode areas (IV), districts
+   (PA20) or district ranges (PA20-49), separated by spaces or commas. */
+function postcode_in_areas(string $postcode, string $areas): bool
+{
+    $out = strtoupper(explode(' ', trim($postcode))[0] ?? '');
+    if (!preg_match('/^([A-Z]{1,2})(\d{1,2})[A-Z]?$/', $out, $m)) {
+        return false;
+    }
+    [$area, $district] = [$m[1], (int)$m[2]];
+    foreach (preg_split('/[\s,]+/', strtoupper(trim($areas)), -1, PREG_SPLIT_NO_EMPTY) as $tok) {
+        if (preg_match('/^([A-Z]{1,2})(?:(\d{1,2})(?:-(?:[A-Z]{1,2})?(\d{1,2}))?)?$/', $tok, $t)) {
+            if ($t[1] !== $area) {
+                continue;
+            }
+            if (!isset($t[2]) || $t[2] === '') {
+                return true;
+            }
+            $lo = (int)$t[2];
+            $hi = isset($t[3]) && $t[3] !== '' ? (int)$t[3] : $lo;
+            if ($district >= $lo && $district <= $hi) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Area tokens that aren't postcode areas, districts or ranges, for the admin to fix. */
+function zone_areas_bad(string $areas): array
+{
+    return array_values(array_filter(preg_split('/[\s,]+/', strtoupper(trim($areas)), -1, PREG_SPLIT_NO_EMPTY),
+        fn($t) => !preg_match('/^[A-Z]{1,2}(\d{1,2}(-([A-Z]{1,2})?\d{1,2})?)?$/', $t)));
+}
+
+/* The first zone a postcode is in, or null for everywhere else. */
+function zone_for_postcode(string $postcode): ?array
+{
+    if ($postcode === '') {
+        return null;
+    }
+    foreach (delivery_zones() as $z) {
+        if (postcode_in_areas($postcode, $z['areas'])) {
+            return $z;
+        }
+    }
+    return null;
+}
+
+/* What one of something weighs, in grams: its choice's weight, else the product's. */
+function item_weight(array $p, ?array $v): int
+{
+    if ($v && ($v['weight_g'] ?? null) !== null) {
+        return (int)$v['weight_g'];
+    }
+    return (int)($p['weight_g'] ?? 0);
+}
+
+/* What the basket weighs, in grams (downloads weigh nothing). */
+function basket_weight(): int
+{
+    $g = 0;
+    foreach ($_SESSION['shop_basket'] ?? [] as $key => $qty) {
+        $item = basket_item((string)$key);
+        if ($item && !is_digital($item[0])) {
+            $g += (int)$qty * item_weight($item[0], $item[1]);
+        }
+    }
+    return $g;
+}
+
+function weight_text(int $g): string
+{
+    if ($g < 1000) {
+        return $g . ' g';
+    }
+    return rtrim(rtrim(number_format($g / 1000, 3, '.', ''), '0'), '.') . ' kg';
+}
+
+/* A weight as typed: "1.5" or "1.5 kg" (kilograms), or "500 g". Null if it isn't one. */
+function parse_weight(string $s): ?int
+{
+    $s = strtolower(str_replace(',', '.', trim($s)));
+    if (!preg_match('/^(\d{1,5}(?:\.\d{1,3})?)\s*(kg|g)?$/', $s, $m)) {
+        return null;
+    }
+    return ($m[2] ?? '') === 'g' ? (int)round((float)$m[1]) : (int)round((float)$m[1] * 1000);
+}
+
+/* For a form box: grams as kilograms, "" for none. */
+function weight_input(?int $g): string
+{
+    return $g === null ? '' : rtrim(rtrim(number_format($g / 1000, 3, '.', ''), '0'), '.');
+}
+
+/* What a method costs for goods worth $sub weighing $grams going to $zone:
+   ok (can be used), price (null: no price set yet), to_free (how much more for free
+   delivery), why (when it can't be used). */
+function method_quote(array $m, int $sub, int $grams, ?array $zone): array
+{
+    $q = ['ok' => true, 'price' => null, 'to_free' => null, 'why' => '', 'extra' => 0];
+    if ($m['kind'] === 'collect') {
+        $q['price'] = $m['price'] ?? 0;
+        return $q;
+    }
+    $rate = $zone ? zone_rate($m['key'], (int)$zone['id']) : null;
+    if ($rate && !$rate['available']) {
+        return ['ok' => false, 'price' => null, 'to_free' => null, 'why' => 'not to ' . $zone['name'], 'extra' => 0];
+    }
+    if ($m['pricing'] === 'flat') {
+        $q['price'] = $m['price'];
+    } else {
+        $n = $m['pricing'] === 'weight' ? $grams : $sub;
+        $found = null;
+        foreach (delivery_bands($m['key']) as $b) {
+            // Value bands run up to (not including) the amount; weight bands include it.
+            if ($b['up_to'] === null || ($m['pricing'] === 'weight' ? $n <= $b['up_to'] : $n < $b['up_to'])) {
+                $found = $b;
+                break;
+            }
+        }
+        if ($found === null) {
+            $bands = delivery_bands($m['key']);
+            if (!$bands) {
+                return $q;   // no bands yet: like a price that isn't set
+            }
+            $top = end($bands)['up_to'];
+            return ['ok' => false, 'price' => null, 'to_free' => null, 'extra' => 0,
+                    'why' => $m['pricing'] === 'weight' ? 'not over ' . weight_text($top) : 'not for orders of ' . money($top) . ' or more'];
+        }
+        $q['price'] = $found['price'];
+    }
+    if ($q['price'] !== null && $m['free_over'] !== null) {
+        if ($sub >= $m['free_over']) {
+            $q['price'] = 0;
+        } elseif ($q['price'] > 0) {
+            $q['to_free'] = $m['free_over'] - $sub;
+        }
+    }
+    if ($q['price'] !== null && $rate && $rate['extra'] > 0) {
+        $q['price'] += $rate['extra'];
+        $q['extra'] = $rate['extra'];
+        $q['to_free'] = null;   // it's never free there, so don't promise it
+    }
+    return $q;
+}
+
+/* How an order's delivery is labelled: the method's name, as it was when ordered. */
+function order_post_label(array $o): string
+{
+    if ($o['delivery'] === 'none') {
+        return '';
+    }
+    if (($o['delivery_method'] ?? '') !== '') {
+        return $o['delivery_method'];
+    }
+    return $o['delivery'] === 'collect' ? 'Collection' : 'UK delivery';
+}
+
+/* "Delivery" or "Collection", with the method's name when the shop has named it:
+   "Delivery: Next working day". For packing slips and invoices. */
+function order_kind_label(array $o): string
+{
+    $name = $o['delivery_method'] ?? '';
+    if ($o['delivery'] === 'collect') {
+        return $name !== '' && $name !== 'Collection' ? 'Collection: ' . $name : 'Collection';
+    }
+    return 'Delivery' . ($name !== '' && $name !== 'UK delivery' ? ': ' . $name : '') . (($o['delivery_zone'] ?? '') !== '' ? ' (' . $o['delivery_zone'] . ')' : '');
+}
+
+/* Where and when to collect an order: its method's details, else the shop's. */
+function collect_note_for(array $o): string
+{
+    foreach (delivery_methods(false) as $m) {
+        if ($m['kind'] === 'collect' && !$m['own'] && $m['name'] === ($o['delivery_method'] ?? '') && trim($m['note']) !== '') {
+            return trim($m['note']);
+        }
+    }
+    return trim(setting('postage_collect_note'));
+}
+
+/* Is any method that's switched on priced by weight? */
+function weights_used(): bool
+{
+    foreach (delivery_methods() as $m) {
+        if ($m['kind'] === 'deliver' && $m['pricing'] === 'weight') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Is delivery set up enough to take orders? A method on with no price is not. */
+function delivery_ready(): bool
+{
+    $live = delivery_methods();
+    if (!$live) {
+        return false;
+    }
+    foreach ($live as $m) {
+        if ($m['kind'] === 'deliver' && ($m['pricing'] === 'flat' ? $m['price'] === null : !delivery_bands($m['key']))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* -------------------------------------------------------------- admin */
+
+/* A short description of how a method is priced, for the list. */
+function method_price_text(array $m): string
+{
+    if ($m['kind'] === 'collect') {
+        return $m['price'] ? money($m['price']) : 'Free';
+    }
+    if ($m['pricing'] === 'flat') {
+        $t = $m['price'] === null ? 'No price yet' : ($m['price'] === 0 ? 'Free' : money($m['price']));
+    } else {
+        $bands = delivery_bands($m['key']);
+        $t = !$bands ? 'No bands yet' : (DELIVERY_PRICING[$m['pricing']] . ': ' . implode(', ', array_map(function ($b) use ($m) {
+            $p = $b['price'] === 0 ? 'free' : money($b['price']);
+            if ($b['up_to'] === null) {
+                return 'more: ' . $p;
+            }
+            return ($m['pricing'] === 'weight' ? 'to ' . weight_text($b['up_to']) : 'under ' . money($b['up_to'])) . ' ' . $p;
+        }, $bands)));
+    }
+    return $t . ($m['free_over'] !== null ? '; free over ' . money($m['free_over']) : '');
+}
+
+/* The price fields of a method's form: how it's priced, the price or bands, free over. */
+function method_price_fields(array $m): string
+{
+    $bands = delivery_bands($m['key']);
+    $rows = '';
+    $n = max(4, count($bands) + 2);
+    for ($i = 0; $i < $n; $i++) {
+        $b = $bands[$i] ?? null;
+        $up = $b === null ? '' : ($b['up_to'] === null ? 'more' : ($m['pricing'] === 'weight' ? weight_input($b['up_to']) : price_input($b['up_to'])));
+        $rows .= '<div class="bandrow"><input name="band_up[' . $i . ']" value="' . e($up) . '" aria-label="Up to, band ' . ($i + 1) . '" placeholder="'
+               . ($i === 0 ? '2' : ($i === 1 ? '10' : '')) . '">'
+               . '<div class="price"><span>£</span><input name="band_price[' . $i . ']" inputmode="decimal" value="'
+               . e($b === null ? '' : price_input($b['price'])) . '" aria-label="Price, band ' . ($i + 1) . '"></div></div>';
+    }
+    $sel = '';
+    foreach (DELIVERY_PRICING as $k => $label) {
+        $sel .= '<option value="' . $k . '"' . ($m['pricing'] === $k ? ' selected' : '') . '>' . $label . '</option>';
+    }
+    return '<label>Priced <select name="pricing" class="pricing">' . $sel . '</select></label>'
+        . '<div class="flat"' . ($m['pricing'] === 'flat' ? '' : ' hidden') . '><label>Price <div class="price"><span>£</span><input name="price" inputmode="decimal" placeholder="3.95" value="'
+        . e($m['price'] === null ? '' : price_input($m['price'])) . '"></div></label></div>'
+        . '<div class="bands"' . ($m['pricing'] === 'flat' ? ' hidden' : '') . '><p class="muted">One band a line: '
+        . '<span class="by-weight"' . ($m['pricing'] === 'weight' ? '' : ' hidden') . '>the heaviest basket, in kg (2, or 0.5), and its price. Baskets heavier than the last band can\'t use this method, unless the last band says <code>more</code>.</span>'
+        . '<span class="by-value"' . ($m['pricing'] === 'value' ? '' : ' hidden') . '>orders under this much (in £), and the price. Put <code>more</code> in the last band for anything above.</span></p>'
+        . '<div class="bandhead"><span>Up to</span><span>Price</span></div>' . $rows . '</div>'
+        . '<label>Free on orders over <span class="hint">(optional)</span><div class="price"><span>£</span><input name="free_over" inputmode="decimal" value="'
+        . e($m['free_over'] === null ? '' : price_input($m['free_over'])) . '"></div></label>';
+}
+
+/* Read and check the price fields. Returns [values, error or null]. */
+function method_price_post(string $pricing): array
+{
+    $pricing = isset(DELIVERY_PRICING[$pricing]) ? $pricing : 'flat';
+    $price = post('price');
+    $over = post('free_over');
+    $vals = ['pricing' => $pricing, 'price' => $price === '' ? null : parse_price($price), 'free_over' => $over === '' ? null : parse_price($over), 'bands' => []];
+    if ($price !== '' && $vals['price'] === null || $over !== '' && $vals['free_over'] === null) {
+        return [$vals, 'Prices need to be numbers like 3.95.'];
+    }
+    if ($pricing === 'flat') {
+        return [$vals, null];
+    }
+    $ups = is_array($_POST['band_up'] ?? null) ? $_POST['band_up'] : [];
+    $prices = is_array($_POST['band_price'] ?? null) ? $_POST['band_price'] : [];
+    $seen = [];
+    foreach ($ups as $i => $up) {
+        $up = is_string($up) ? trim($up) : '';
+        $bp = is_string($prices[$i] ?? null) ? trim($prices[$i]) : '';
+        if ($up === '' && $bp === '') {
+            continue;
+        }
+        $pp = parse_price($bp);
+        if ($pp === null) {
+            return [$vals, 'Each band needs a price (0 for free).'];
+        }
+        if (in_array(strtolower($up), ['more', 'over', 'above', 'any', ''], true)) {
+            $u = null;
+        } else {
+            $u = $pricing === 'weight' ? parse_weight($up) : parse_price($up);
+            if ($u === null || $u <= 0) {
+                return [$vals, $pricing === 'weight' ? '"' . $up . '" isn\'t a weight. Use kg, like 2 or 0.5.' : '"' . $up . '" isn\'t an amount, like 20.'];
+            }
+        }
+        $k = $u ?? 'more';
+        if (isset($seen[$k])) {
+            return [$vals, 'Two bands have the same upper limit.'];
+        }
+        $seen[$k] = true;
+        $vals['bands'][] = ['up_to' => $u, 'price' => $pp];
+    }
+    if (!$vals['bands']) {
+        return [$vals, 'Add at least one band, like ' . ($pricing === 'weight' ? 'up to 2 (kg) for £4.50.' : 'under 20 (£) for £3.95.')];
+    }
+    return [$vals, null];
+}
+
+function method_bands_save(string $key, array $bands): void
+{
+    $pdo = db();
+    $pdo->prepare('DELETE FROM delivery_bands WHERE method = ?')->execute([$key]);
+    foreach ($bands as $b) {
+        $pdo->prepare('INSERT INTO delivery_bands (method, up_to, price_pence) VALUES (?, ?, ?)')->execute([$key, $b['up_to'], $b['price']]);
+    }
+}
+
+/* Handle a Delivery tab form. Returns the message to show, or null if it wasn't one of these. */
+function delivery_admin_post(string $form): ?string
+{
+    $pdo = db();
+    switch ($form) {
+        case 'deliver_pricing':   // the shop's own delivery: its name and how it's priced
+            [$vals, $err] = method_price_post(post('pricing'));
+            if ($err) {
+                return $err . ' Nothing changed.';
+            }
+            if ($vals['pricing'] === 'flat' && $vals['price'] === null && can_deliver()) {
+                return 'Set a delivery price to offer delivery (0 for free delivery). Nothing changed.';
+            }
+            set_setting('postage_name', mb_substr(post('name'), 0, 60) === 'UK delivery' ? '' : mb_substr(post('name'), 0, 60));
+            set_setting('postage_pricing', $vals['pricing'] === 'flat' ? '' : $vals['pricing']);
+            set_setting('postage_price', $vals['price'] === null ? '' : (string)$vals['price']);
+            set_setting('postage_free_over', $vals['free_over'] === null ? '' : (string)$vals['free_over']);
+            method_bands_save('deliver', $vals['bands']);
+            return 'Delivery saved.';
+        case 'method':
+            $id = (int)post('id');
+            $name = mb_substr(post('name'), 0, 60);
+            $kind = post('kind') === 'collect' ? 'collect' : 'deliver';
+            [$vals, $err] = $kind === 'collect' ? [['pricing' => 'flat', 'price' => post('price') === '' ? 0 : parse_price(post('price')), 'free_over' => null, 'bands' => []], null]
+                                                : method_price_post(post('pricing'));
+            if ($name === '') {
+                return 'Give the method a name customers will understand, like Next working day. Nothing changed.';
+            }
+            if ($err || $vals['price'] === null && $kind === 'collect') {
+                return ($err ?? 'Prices need to be numbers like 3.95.') . ' Nothing changed.';
+            }
+            if ($kind === 'deliver' && $vals['pricing'] === 'flat' && $vals['price'] === null) {
+                return 'Set a price for ' . $name . ' (0 for free). Nothing changed.';
+            }
+            $active = !empty($_POST['active']) ? 1 : 0;
+            if ($id) {
+                $pdo->prepare('UPDATE delivery_methods SET name = ?, kind = ?, pricing = ?, price_pence = ?, free_over_pence = ?, note = ?, active = ? WHERE id = ?')
+                    ->execute([$name, $kind, $vals['pricing'], $vals['price'], $vals['free_over'], mb_substr(post('note'), 0, 500), $active, $id]);
+            } else {
+                $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), 0) + 1 FROM delivery_methods')->fetchColumn();
+                $pdo->prepare('INSERT INTO delivery_methods (name, kind, pricing, price_pence, free_over_pence, note, active, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                    ->execute([$name, $kind, $vals['pricing'], $vals['price'], $vals['free_over'], mb_substr(post('note'), 0, 500), $active, $pos]);
+                $id = (int)$pdo->lastInsertId();
+            }
+            method_bands_save('m' . $id, $vals['bands']);
+            return $name . ' saved.' . ($active ? '' : ' It\'s switched off, so customers don\'t see it yet.');
+        case 'method_delete':
+            $id = (int)post('id');
+            $pdo->prepare('DELETE FROM delivery_methods WHERE id = ?')->execute([$id]);
+            $pdo->prepare('DELETE FROM delivery_bands WHERE method = ?')->execute(['m' . $id]);
+            $pdo->prepare('DELETE FROM delivery_zone_rates WHERE method = ?')->execute(['m' . $id]);
+            return 'Delivery method deleted. Past orders keep its name.';
+        case 'method_move':
+            $ids = $pdo->query('SELECT id FROM delivery_methods ORDER BY position, id')->fetchAll(PDO::FETCH_COLUMN);
+            $i = array_search((int)post('id'), array_map('intval', $ids), true);
+            $j = $i === false ? false : $i + (post('dir') === 'up' ? -1 : 1);
+            if ($j !== false && isset($ids[$j])) {
+                [$ids[$i], $ids[$j]] = [$ids[$j], $ids[$i]];
+                foreach ($ids as $pos => $mid) {
+                    $pdo->prepare('UPDATE delivery_methods SET position = ? WHERE id = ?')->execute([$pos, $mid]);
+                }
+            }
+            return 'Order changed.';
+        case 'zone':
+            $id = (int)post('id');
+            $name = mb_substr(post('name'), 0, 60);
+            $areas = strtoupper(trim(preg_replace('/[\s,]+/', ' ', mb_substr(post('areas'), 0, 2000))));
+            if ($name === '' || $areas === '') {
+                return 'A zone needs a name and at least one postcode area, like IV or PA20-49. Nothing changed.';
+            }
+            if ($bad = zone_areas_bad($areas)) {
+                return 'These aren\'t postcode areas or districts: ' . implode(', ', $bad) . '. Use areas like IV, districts like PA20, or ranges like PA20-49. Nothing changed.';
+            }
+            $rates = [];
+            foreach (delivery_methods(false) as $m) {
+                if ($m['kind'] !== 'deliver') {
+                    continue;
+                }
+                $x = str_in($_POST['extra'][$m['key']] ?? '');
+                $xp = $x === '' ? 0 : parse_price($x);
+                if ($xp === null) {
+                    return 'Extra charges need to be numbers like 5.00. Nothing changed.';
+                }
+                $rates[$m['key']] = [!empty($_POST['avail'][$m['key']]) ? 1 : 0, $xp];
+            }
+            if ($id) {
+                $pdo->prepare('UPDATE delivery_zones SET name = ?, areas = ? WHERE id = ?')->execute([$name, $areas, $id]);
+            } else {
+                $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), 0) + 1 FROM delivery_zones')->fetchColumn();
+                $pdo->prepare('INSERT INTO delivery_zones (name, areas, position) VALUES (?, ?, ?)')->execute([$name, $areas, $pos]);
+                $id = (int)$pdo->lastInsertId();
+            }
+            foreach ($rates as $key => [$avail, $extra]) {
+                $pdo->prepare('INSERT OR REPLACE INTO delivery_zone_rates (method, zone_id, available, extra_pence) VALUES (?, ?, ?, ?)')
+                    ->execute([$key, $id, $avail, $extra]);
+            }
+            return $name . ' saved.';
+        case 'zone_delete':
+            $id = (int)post('id');
+            $pdo->prepare('DELETE FROM delivery_zones WHERE id = ?')->execute([$id]);
+            $pdo->prepare('DELETE FROM delivery_zone_rates WHERE zone_id = ?')->execute([$id]);
+            return 'Zone deleted. Those postcodes now pay the usual prices.';
+        case 'zone_presets':
+            $have = array_map(fn($z) => mb_strtolower($z['name']), delivery_zones());
+            $n = 0;
+            foreach (ZONE_PRESETS as $name => $areas) {
+                if (!in_array(mb_strtolower($name), $have, true)) {
+                    $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), 0) + 1 FROM delivery_zones')->fetchColumn();
+                    $pdo->prepare('INSERT INTO delivery_zones (name, areas, position) VALUES (?, ?, ?)')->execute([$name, $areas, $pos]);
+                    $n++;
+                }
+            }
+            return $n ? $n . ' zones added. They cost the same as everywhere else until you set an extra charge or switch a method off for them.'
+                      : 'The usual UK zones are already there.';
+    }
+    return null;
+}
+
+/* The Delivery tab's sections below the postage form. */
+function delivery_admin_html(): string
+{
+    $all = delivery_methods(false);
+    $own = $all[0];
+    $extra = array_values(array_filter($all, fn($m) => !$m['own']));
+    $zones = delivery_zones();
+    $script = '<script>document.querySelectorAll("form.method").forEach(function(f){var s=f.querySelector(".pricing");if(!s)return;'
+        . 'function t(){var v=s.value;f.querySelector(".flat").hidden=v!=="flat";f.querySelector(".bands").hidden=v==="flat";'
+        . 'f.querySelector(".by-weight").hidden=v!=="weight";f.querySelector(".by-value").hidden=v!=="value";}s.addEventListener("change",t);'
+        . 'var k=f.querySelector("[name=kind]");if(k){function u(){f.querySelectorAll(".deliver-only").forEach(function(x){x.hidden=k.value==="collect";});'
+        . 'f.querySelectorAll(".collect-only").forEach(function(x){x.hidden=k.value!=="collect";});}k.addEventListener("change",u);u();}});</script>';
+
+    // The shop's own delivery: its name, and priced by weight or value.
+    $out = '<details class="opts" id="pricing"' . ($own['pricing'] !== 'flat' || setting('postage_name') !== '' ? ' open' : '') . '><summary>'
+        . e($own['name']) . ': name, and pricing by weight or order value</summary>'
+        . '<form method="post" class="method">' . csrf_field() . '<input type="hidden" name="form" value="deliver_pricing">'
+        . '<label>Name shown to customers <input name="name" maxlength="60" value="' . e($own['name']) . '"></label>'
+        . method_price_fields($own) . '<button>Save</button></form></details>';
+
+    // More methods.
+    $list = '';
+    foreach ($extra as $i => $m) {
+        $list .= '<details class="opts method-item"><summary>' . e($m['name']) . ' <span class="muted">· ' . e(method_price_text($m)) . '</span>'
+            . ($m['active'] ? '' : ' <span class="pill out">Off</span>') . '</summary>'
+            . method_form_html($m)
+            . '<div class="row-actions">'
+            . ($i > 0 ? '<form method="post">' . csrf_field() . '<input type="hidden" name="form" value="method_move"><input type="hidden" name="id" value="' . $m['id'] . '"><input type="hidden" name="dir" value="up"><button class="link">Move up</button></form>' : '')
+            . ($i < count($extra) - 1 ? '<form method="post">' . csrf_field() . '<input type="hidden" name="form" value="method_move"><input type="hidden" name="id" value="' . $m['id'] . '"><input type="hidden" name="dir" value="down"><button class="link">Move down</button></form>' : '')
+            . '<form method="post" onsubmit="return confirm(\'Delete ' . e(addslashes($m['name'])) . '?\')">' . csrf_field() . '<input type="hidden" name="form" value="method_delete"><input type="hidden" name="id" value="' . $m['id'] . '"><button class="link danger">Delete</button></form>'
+            . '</div></details>';
+    }
+    $out .= '<h2 id="methods">More ways to deliver</h2>'
+        . '<p class="muted">For example next working day, a courier for big items, or a second collection point. Customers choose in their basket. '
+        . 'Order of display: ' . e($own['name']) . ' first, these next, collection last.</p>'
+        . $list
+        . '<details class="opts"' . ($extra ? '' : '') . '><summary>Add a delivery method</summary>'
+        . method_form_html(['key' => 'm0', 'id' => 0, 'name' => '', 'kind' => 'deliver', 'pricing' => 'flat', 'price' => null, 'free_over' => null, 'note' => '', 'active' => true, 'own' => false])
+        . '</details>';
+
+    // Zones.
+    $deliverers = array_values(array_filter($all, fn($m) => $m['kind'] === 'deliver'));
+    $zlist = '';
+    foreach ($zones as $z) {
+        $zlist .= '<details class="opts"><summary>' . e($z['name']) . ' <span class="muted">· ' . e($z['areas']) . '</span></summary>'
+            . zone_form_html($z, $deliverers)
+            . '<form method="post" class="row-actions" onsubmit="return confirm(\'Delete this zone?\')">' . csrf_field() . '<input type="hidden" name="form" value="zone_delete"><input type="hidden" name="id" value="' . (int)$z['id'] . '"><button class="link danger">Delete zone</button></form>'
+            . '</details>';
+    }
+    $out .= '<h2 id="zones">Zones</h2>'
+        . '<p class="muted">Charge more to some postcodes, or don\'t offer a method there. The checkout works out the zone from the delivery postcode, and shows the new price before the customer pays. '
+        . 'Postcodes in no zone pay the usual prices.</p>'
+        . $zlist
+        . '<details class="opts"><summary>Add a zone</summary>' . zone_form_html(['id' => 0, 'name' => '', 'areas' => ''], $deliverers) . '</details>'
+        . (count(array_intersect(array_map('mb_strtolower', array_keys(ZONE_PRESETS)), array_map(fn($z) => mb_strtolower($z['name']), $zones))) < count(ZONE_PRESETS)
+            ? '<form method="post">' . csrf_field() . '<input type="hidden" name="form" value="zone_presets"><button class="secondary">Add the usual UK zones</button>'
+              . ' <span class="hint">Highlands and Islands, Northern Ireland, Isles of Scilly, Channel Islands and Isle of Man</span></form>' : '');
+    return $out . $script;
+}
+
+function method_form_html(array $m): string
+{
+    $new = !$m['id'];
+    return '<form method="post" class="method">' . csrf_field() . '<input type="hidden" name="form" value="method"><input type="hidden" name="id" value="' . (int)$m['id'] . '">'
+        . '<label>Name shown to customers <input name="name" maxlength="60" required placeholder="Next working day" value="' . e($m['name']) . '"></label>'
+        . '<label>Kind <select name="kind"><option value="deliver"' . ($m['kind'] === 'deliver' ? ' selected' : '') . '>Delivery to the customer\'s address</option>'
+        . '<option value="collect"' . ($m['kind'] === 'collect' ? ' selected' : '') . '>Collection</option></select></label>'
+        . '<div class="deliver-only"' . ($m['kind'] === 'collect' ? ' hidden' : '') . '>' . method_price_fields($m) . '</div>'
+        . '<div class="collect-only"' . ($m['kind'] === 'collect' ? '' : ' hidden') . '><label>Where and when <span class="hint">(shown to customers who choose it)</span>'
+        . '<textarea name="note" maxlength="500" style="min-height:4rem">' . e($m['note']) . '</textarea></label></div>'
+        . '<label class="check"><input type="checkbox" name="active" value="1"' . ($m['active'] ? ' checked' : '') . '> Offer it to customers</label>'
+        . '<button>' . ($new ? 'Add method' : 'Save') . '</button></form>';
+}
+
+function zone_form_html(array $z, array $deliverers): string
+{
+    $grid = '';
+    foreach ($deliverers as $m) {
+        $r = $z['id'] ? zone_rate($m['key'], (int)$z['id']) : null;
+        $grid .= '<div class="zonerow"><span>' . e($m['name']) . ($m['active'] ? '' : ' <span class="muted">(off)</span>') . '</span>'
+            . '<label class="check"><input type="checkbox" name="avail[' . e($m['key']) . ']" value="1"' . (!$r || $r['available'] ? ' checked' : '') . '> Offered</label>'
+            . '<div class="price"><span>+£</span><input name="extra[' . e($m['key']) . ']" inputmode="decimal" placeholder="0" aria-label="Extra charge for ' . e($m['name'])
+            . '" value="' . e($r && $r['extra'] ? price_input($r['extra']) : '') . '"></div></div>';
+    }
+    return '<form method="post">' . csrf_field() . '<input type="hidden" name="form" value="zone"><input type="hidden" name="id" value="' . (int)$z['id'] . '">'
+        . '<label>Zone name <input name="name" maxlength="60" required placeholder="Highlands and Islands" value="' . e($z['name']) . '"></label>'
+        . '<label>Postcodes <span class="hint">(areas like IV, districts like PA20, ranges like PA20-49)</span>'
+        . '<textarea name="areas" maxlength="2000" style="min-height:3rem" required>' . e($z['areas']) . '</textarea></label>'
+        . '<p class="muted">For each delivery method: is it offered here, and any extra charge (added even when delivery is otherwise free).</p>'
+        . $grid . '<button>' . ($z['id'] ? 'Save zone' : 'Add zone') . '</button></form>';
+}
+
+/* ================================================================== trade
+   Trade accounts (1.3): a customer group can see prices without VAT, need a
+   minimum order and pay its own ways (see pay_allowed). Customers can apply to
+   join the group the shop picks; approving puts them in it in one click.
+   Fixed prices per product live in group_prices (see group_unit_saving). */
+
+const PAY_LABELS = ['paypal' => 'PayPal', 'bank' => 'Bank transfer', 'collection' => 'Pay on collection'];
+
+/* Does this customer see prices without VAT? Only in a VAT-registered shop. */
+function prices_ex_vat(): bool
+{
+    $g = customer_group();
+    return $g && (int)($g['ex_vat'] ?? 0) === 1 && setting('vat_registered') === '1';
+}
+
+/* A price that includes VAT at 20%, without it. */
+function ex_vat(int $pence): int
+{
+    return $pence - (int)round($pence / 6);
+}
+
+/* A price as this customer sees it: without VAT for a group that wants that. */
+function shown_money(int $pence): string
+{
+    return money(prices_ex_vat() ? ex_vat($pence) : $pence);
+}
+
+function ex_vat_tag(): string
+{
+    return prices_ex_vat() ? ' <small class="shop-exvat">ex VAT</small>' : '';
+}
+
+/* How much more this basket needs to reach the group's minimum order, or null if it's fine. */
+function min_order_short(?array $t): ?int
+{
+    $g = customer_group();
+    if (!$g || $g['min_order_pence'] === null || !$t) {
+        return null;
+    }
+    $goods = $t['subtotal'] - $t['discount'] - $t['group_pence'];
+    $short = (int)$g['min_order_pence'] - $goods;
+    return $short > 0 ? $short : null;
+}
+
+/* The group customers can apply to join, or null if applications are off. */
+function trade_group(): ?array
+{
+    $id = (int)setting('trade_apply_group');
+    return $id ? group_by_id($id) : null;
+}
+
+function trade_application_of(int $cid): ?array
+{
+    $st = db()->prepare('SELECT * FROM trade_applications WHERE customer_id = ? ORDER BY id DESC LIMIT 1');
+    $st->execute([$cid]);
+    return $st->fetch() ?: null;
+}
+
+/* The account page's line about trade accounts. */
+function trade_account_link(array $c): string
+{
+    $g = trade_group();
+    if (!$g || $c['group_id'] !== null) {
+        return '';
+    }
+    $a = trade_application_of((int)$c['id']);
+    if ($a && $a['status'] === 'new') {
+        return '<p class="shop-note">Thanks for applying for a ' . e($g['name']) . ' account. We\'ll email you once we\'ve looked at it.</p>';
+    }
+    return '<p><a href="' . e(shop_url('account/trade')) . '">Apply for a ' . e($g['name']) . ' account</a> <span class="shop-hint">for businesses</span></p>';
+}
+
+function view_account_trade(): never
+{
+    $c = require_customer('account/trade');
+    $g = trade_group();
+    if (!$g || $c['group_id'] !== null) {
+        redirect(shop_url('account'));
+    }
+    $a = trade_application_of((int)$c['id']);
+    $v = ['business' => '', 'vat_number' => '', 'phone' => $c['phone'], 'note' => ''];
+    $errors = [];
+    if (is_post() && !($a && $a['status'] === 'new')) {
+        csrf_check();
+        foreach ($v as $k => $_) {
+            $v[$k] = mb_substr(post($k), 0, $k === 'note' ? 1000 : 120);
+        }
+        $vat = strtoupper(preg_replace('/[\s.-]/', '', $v['vat_number']));
+        if ($v['business'] === '') {
+            $errors[] = 'Enter your business name.';
+        }
+        if ($vat !== '' && !preg_match('/^(GB|XI)?(\d{9}|\d{12})$/', $vat)) {
+            $errors[] = 'That doesn\'t look like a UK VAT number (like GB123456789). Leave it empty if you\'re not registered.';
+        }
+        if ($c['verified_at'] === '') {
+            $errors[] = 'Please confirm your email address first: we\'ve sent you a link.';
+        }
+        if (!$errors && throttled('trade:' . $c['id'], 3, 86400)) {
+            $errors[] = 'You\'ve applied a few times today. Please get in touch with the shop instead.';
+        }
+        if (!$errors) {
+            throttle_hit('trade:' . $c['id']);
+            db()->prepare('INSERT INTO trade_applications (customer_id, group_id, business, vat_number, phone, note, created) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$c['id'], $g['id'], $v['business'], $vat === '' ? '' : 'GB' . preg_replace('/^(GB|XI)/', '', $vat), $v['phone'], $v['note'], now()]);
+            trade_notify_shop($c, $g, $v);
+            flash('Thanks, your application has been sent. We\'ll email you once we\'ve looked at it.');
+            redirect(shop_url('account'));
+        }
+    }
+    $field = fn(string $k, string $label, string $attrs = '', string $hint = '') => '<label>' . $label . ($hint !== '' ? ' <span class="shop-hint">' . $hint . '</span>' : '')
+        . '<input name="' . $k . '" value="' . e($v[$k]) . '" ' . $attrs . '></label>';
+    account_page('Apply for a ' . $g['name'] . ' account',
+        ($errors ? '<div class="shop-note shop-errors" role="alert"><strong>Please check:</strong><ul>' . implode('', array_map(fn($x) => '<li>' . e($x) . '</li>', $errors)) . '</ul></div>' : '')
+        . ($a && $a['status'] === 'new' ? '<p class="shop-note">You\'ve already applied. We\'ll email you once we\'ve looked at it.</p>'
+        : '<p>For businesses buying from us. Once we\'ve approved it, you\'ll see your ' . e($g['name']) . ' prices whenever you\'re signed in.</p>'
+            . '<form class="shop-form" method="post">' . csrf_field()
+            . $field('business', 'Business name', 'required maxlength="120" autocomplete="organization"')
+            . $field('vat_number', 'VAT number', 'maxlength="20" autocapitalize="characters"', '(if you\'re registered)')
+            . $field('phone', 'Phone', 'type="tel" maxlength="40" autocomplete="tel"', '(optional)')
+            . '<label>Anything we should know <span class="shop-hint">(optional: what you sell, your website)</span><textarea name="note" maxlength="1000" rows="4">' . e($v['note']) . '</textarea></label>'
+            . '<button class="shop-button">Send application</button></form>'),
+        [['Your account', 'account'], ['Trade account', null]]);
+}
+
+function trade_notify_shop(array $c, array $g, array $v): void
+{
+    $to = setting('mail_notify') !== '' ? setting('mail_notify') : setting('business_email');
+    if ($to === '' || !mail_ready()) {
+        return;
+    }
+    [$foot, $footText] = mail_footer();
+    $url = abs_shop_url('admin/trade');
+    $paras = [e($c['name'] ?: $c['email']) . ' (' . e($c['email']) . ') has applied for a ' . e($g['name']) . ' account.',
+              '<strong>' . e($v['business']) . '</strong>' . ($v['vat_number'] !== '' ? ', VAT number ' . e($v['vat_number']) : '') . ($v['phone'] !== '' ? ', phone ' . e($v['phone']) : '')
+              . ($v['note'] !== '' ? '<br>' . nl2br(e($v['note'])) : '')];
+    $html = mail_layout('New trade application', $paras, '', $url, 'Look at it', $foot);
+    $text = "New trade application\n\n" . html_entity_decode(strip_tags(implode("\n\n", $paras)), ENT_QUOTES, 'UTF-8') . "\n\nLook at it: $url\n\n" . $footText . "\n";
+    mail_queue(null, 'trade_application', $to, 'Trade application from ' . $v['business'], $text, $html);
+}
+
+function trade_tell_customer(array $c, array $g, bool $yes): void
+{
+    if (!mail_ready()) {
+        return;
+    }
+    [$foot, $footText] = mail_footer();
+    $name = $c['name'] !== '' ? $c['name'] : 'there';
+    $heading = $yes ? 'Your ' . $g['name'] . ' account is ready' : 'Your trade application';
+    $paras = $yes ? ['Hello ' . e($name) . ', we\'ve approved your application. You\'ll see your ' . e($g['name']) . ' prices whenever you\'re signed in to your account.']
+                  : ['Hello ' . e($name) . ', thanks for applying for a ' . e($g['name']) . ' account. We\'re not able to offer you one at the moment, but you\'re very welcome to keep shopping with your account as it is.'];
+    $html = mail_layout(e($heading), $paras, '', $yes ? abs_shop_url() : '', $yes ? 'Go to the shop' : '', $foot);
+    $text = $heading . "\n\n" . html_entity_decode(strip_tags(implode("\n\n", $paras)), ENT_QUOTES, 'UTF-8') . "\n\n" . $footText . "\n";
+    mail_queue(null, $yes ? 'trade_approved' : 'trade_declined', $c['email'], $heading, $text, $html);
+}
+
+/* Customers → Trade applications. */
+function view_admin_trade(): never
+{
+    require_admin();
+    if (is_post()) {
+        csrf_check();
+        $st = db()->prepare("SELECT * FROM trade_applications WHERE id = ? AND status = 'new'");
+        $st->execute([(int)post('id')]);
+        $a = $st->fetch();
+        $c = $a ? customer_by_id((int)$a['customer_id']) : null;
+        $g = $a ? group_by_id((int)$a['group_id']) : null;
+        if (!$a || !$c || !$g) {
+            flash('That application has already been dealt with, or its customer or group has gone.');
+        } elseif (post('do') === 'approve') {
+            db()->prepare('UPDATE customers SET group_id = ? WHERE id = ?')->execute([$g['id'], $c['id']]);
+            db()->prepare("UPDATE trade_applications SET status = 'approved', decided = ? WHERE id = ?")->execute([now(), $a['id']]);
+            trade_tell_customer($c, $g, true);
+            flash(($c['name'] ?: $c['email']) . ' is now in ' . $g['name'] . '. We\'ve emailed to let them know.');
+        } elseif (post('do') === 'decline') {
+            db()->prepare("UPDATE trade_applications SET status = 'declined', decided = ? WHERE id = ?")->execute([now(), $a['id']]);
+            if (!empty($_POST['tell'])) {
+                trade_tell_customer($c, $g, false);
+            }
+            flash('Application from ' . $a['business'] . ' declined.');
+        }
+        mail_send_later();
+        redirect(admin_url('trade'));
+    }
+    $g = trade_group();
+    $rows = db()->query("SELECT a.*, c.name, c.email, c.verified_at, g.name AS gname FROM trade_applications a
+                         LEFT JOIN customers c ON c.id = a.customer_id LEFT JOIN customer_groups g ON g.id = a.group_id
+                         ORDER BY a.status = 'new' DESC, a.id DESC LIMIT 200")->fetchAll();
+    $list = '';
+    foreach ($rows as $a) {
+        $new = $a['status'] === 'new';
+        $list .= '<li><div class="pname"><strong>' . e($a['business']) . '</strong>'
+            . '<small>' . ($a['name'] !== null ? '<a href="' . e(admin_url('customer/' . $a['customer_id'])) . '">' . e($a['name'] ?: $a['email']) . '</a> · ' . e($a['email']) : 'Customer deleted')
+            . ($a['vat_number'] !== '' ? ' · VAT ' . e($a['vat_number']) : '') . ($a['phone'] !== '' ? ' · ' . e($a['phone']) : '') . '</small>'
+            . ($a['note'] !== '' ? '<small>' . nl2br(e($a['note'])) . '</small>' : '')
+            . '<small class="muted">For ' . e($a['gname'] ?? 'a deleted group') . ' · ' . e(gmdate('j M Y', strtotime($a['created'] . ' UTC'))) . '</small></div>'
+            . ($new && $a['name'] !== null
+                ? '<div class="row-actions"><form method="post">' . csrf_field() . '<input type="hidden" name="id" value="' . (int)$a['id'] . '"><button name="do" value="approve">Approve</button></form>'
+                  . '<form method="post">' . csrf_field() . '<input type="hidden" name="id" value="' . (int)$a['id'] . '"><label class="check" style="margin:0 .6rem 0 0"><input type="checkbox" name="tell" value="1" checked> Email them</label><button class="quiet" name="do" value="decline">Decline</button></form></div>'
+                : '<span class="pill' . ($a['status'] === 'approved' ? ' ok' : '') . '">' . ($a['status'] === 'approved' ? 'Approved' : ($new ? 'New' : 'Declined')) . '</span>')
+            . '</li>';
+    }
+    admin_shell('Trade applications', '<h1>Trade applications</h1>'
+        . ($g ? '<p class="lede">Customers apply from their account. Approving puts them in <a href="' . e(admin_url('group/' . $g['id'])) . '">' . e($g['name']) . '</a> and emails them.</p>'
+              : '<p class="flash">Applications are switched off. To take them, tick "Customers can apply to join" on a group in Groups.</p>')
+        . ($list !== '' ? '<ul class="plist">' . $list . '</ul>' : '<p class="muted">No applications yet.</p>'));
+}
+
+function trade_new_count(): int
+{
+    return (int)db()->query("SELECT COUNT(*) FROM trade_applications WHERE status = 'new'")->fetchColumn();
+}
+
+/* ------------------------------------------------- group prices on a product */
+
+/* The product form's Group prices section: a fixed price per group, for the product
+   and (for a product with choices) for each choice that has a price of its own. */
+function group_prices_html(?array $p, array $v): string
+{
+    $groups = all_groups();
+    if (!$groups || !$p) {
+        return $groups ? '<p class="muted">Fixed group prices can be set once the product is saved.</p>' : '';
+    }
+    $have = [];
+    $st = db()->prepare('SELECT group_id, variant_id, price_pence FROM group_prices WHERE product_id = ?');
+    $st->execute([$p['id']]);
+    foreach ($st->fetchAll() as $r) {
+        $have[$r['group_id']][$r['variant_id']] = price_input((int)$r['price_pence']);
+    }
+    $posted = $v['gp'] ?? null;
+    $val = fn(int $gid, int $vid) => is_array($posted) ? (string)($posted[$gid][$vid] ?? '') : ($have[$gid][$vid] ?? '');
+    $vars = array_values(array_filter(product_variants((int)$p['id']), fn($x) => $x['price_pence'] !== null));
+    $rows = [[0, $vars ? 'Choices at the product\'s price' : 'This product', (int)$p['price_pence']]];
+    foreach ($vars as $x) {
+        $rows[] = [(int)$x['id'], choice_name($x), (int)$x['price_pence']];
+    }
+    $head = '<tr><th></th>' . implode('', array_map(fn($g) => '<th>' . e($g['name']) . '</th>', $groups)) . '</tr>';
+    $body = '';
+    foreach ($rows as [$vid, $label, $full]) {
+        $body .= '<tr><td>' . e($label) . ' <span class="muted">' . money($full) . '</span></td>';
+        foreach ($groups as $g) {
+            $body .= '<td><div class="price" style="max-width:8rem"><span>£</span><input name="gp[' . (int)$g['id'] . '][' . $vid . ']" inputmode="decimal" value="'
+                   . e($val((int)$g['id'], $vid)) . '" placeholder="' . e(price_input($full - (int)round($full * group_rate(group_by_id((int)$g['id']), $p) / 100))) . '"'
+                   . ' aria-label="' . e($g['name'] . ' price for ' . $label) . '"></div></td>';
+        }
+        $body .= '</tr>';
+    }
+    $any = (bool)array_filter($have) || is_array($posted) && array_filter(array_map('array_filter', $posted));
+    return '<details class="opts" id="gprices"' . ($any ? ' open' : '') . '><summary>Group prices <span class="hint">(optional: a fixed price for a customer group)</span></summary>'
+        . '<p class="muted">Leave empty to use the group\'s discount (shown faded). A fixed price wins where it\'s set. Sale prices and codes still never add up with it: the customer gets whichever is cheapest.'
+        . ($vars ? ' A new choice with its own price can have group prices once it\'s saved.' : '') . '</p>'
+        . '<div class="gptable"><table>' . $head . $body . '</table></div></details>';
+}
+
+/* Read the Group prices boxes. Null if the form had none (leave them as they are). */
+function group_prices_read(array &$errors): ?array
+{
+    if (!is_array($_POST['gp'] ?? null)) {
+        return null;
+    }
+    $out = [];
+    foreach ($_POST['gp'] as $gid => $byVar) {
+        if (!is_array($byVar) || !group_by_id((int)$gid)) {
+            continue;
+        }
+        foreach ($byVar as $vid => $x) {
+            $x = is_string($x) ? trim($x) : '';
+            if ($x === '') {
+                continue;
+            }
+            $pp = parse_price($x);
+            if ($pp === null) {
+                $errors[] = 'Group price "' . $x . '" isn\'t a price, like 8.50.';
+                continue;
+            }
+            $out[(int)$gid][(int)$vid] = $pp;
+        }
+    }
+    return $out;
+}
+
+function group_prices_save(int $pid, ?array $in): void
+{
+    $pdo = db();
+    $live = array_map(fn($x) => (int)$x['id'], product_variants($pid));
+    if ($in !== null) {
+        $pdo->prepare('DELETE FROM group_prices WHERE product_id = ?')->execute([$pid]);
+        foreach ($in as $gid => $byVar) {
+            foreach ($byVar as $vid => $pp) {
+                if ($vid === 0 || in_array($vid, $live, true)) {
+                    $pdo->prepare('INSERT INTO group_prices (group_id, product_id, variant_id, price_pence) VALUES (?, ?, ?, ?)')->execute([$gid, $pid, $vid, $pp]);
+                }
+            }
+        }
+    }
+    // Choices that have gone take their group prices with them.
+    $pdo->prepare('DELETE FROM group_prices WHERE product_id = ? AND variant_id != 0' . ($live ? ' AND variant_id NOT IN (' . implode(',', $live) . ')' : ''))->execute([$pid]);
+}
+
+/* ========================================================== photo import
+   Photos for many products at once (1.3): a zip (or the photos themselves)
+   named by SKU or web address, or photo web addresses in the products CSV.
+   Either way the work goes in an import job and is done a batch at a time, so a
+   big import never hits the host's time limit; the progress page can be left
+   and come back to. Each photo records where it came from, so running the same
+   import again adds nothing twice. */
+
+const PHOTO_BATCH_SECONDS = 8;
+const PHOTO_EXTS = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+
+/* SKUs (products' and choices') and web addresses, lowercased => product id. */
+function photo_name_index(): array
+{
+    $idx = ['sku' => [], 'slug' => []];
+    foreach (db()->query('SELECT id, sku, slug FROM products') as $p) {
+        if ($p['sku'] !== '') {
+            $idx['sku'][mb_strtolower($p['sku'])] = (int)$p['id'];
+        }
+        $idx['slug'][mb_strtolower($p['slug'])] = (int)$p['id'];
+    }
+    foreach (db()->query("SELECT product_id, sku FROM variants WHERE sku != ''") as $v) {
+        $idx['sku'][mb_strtolower($v['sku'])] ??= (int)$v['product_id'];
+    }
+    return $idx;
+}
+
+/* Which product a file is for, and its place: "804501.jpg" => [id, 1], "804501-2.jpg" => [id, 2].
+   Null if nothing matches. A name that is itself a SKU wins over reading "-2" as a number. */
+function photo_match(string $file, array $idx): ?array
+{
+    $base = mb_strtolower(pathinfo(str_replace('\\', '/', $file), PATHINFO_FILENAME));
+    $find = function (string $b) use ($idx): ?int {
+        foreach ([$b, str_replace('_', '/', $b)] as $k) {   // a SKU's / can't be in a file name
+            if (isset($idx['sku'][$k])) {
+                return $idx['sku'][$k];
+            }
+        }
+        return $idx['slug'][$b] ?? null;
+    };
+    if (($id = $find($base)) !== null) {
+        return [$id, 1];
+    }
+    if (preg_match('/^(.+?)(?:[-_ ]|\s?\()(\d{1,2})\)?$/', $base, $m) && ($id = $find($m[1])) !== null) {
+        return [$id, max(1, (int)$m[2])];
+    }
+    return null;
+}
+
+/* The photo sources a product already has, so nothing is added twice. */
+function photo_sources(int $pid): array
+{
+    $st = db()->prepare("SELECT source FROM photos WHERE product_id = ? AND source != ''");
+    $st->execute([$pid]);
+    return array_flip($st->fetchAll(PDO::FETCH_COLUMN));
+}
+
+function photo_import_dir(string $token): string
+{
+    return data_dir() . '/photos-' . $token;
+}
+
+/* Remove a job's working folder (the uploaded zip or photos). */
+function photo_dir_remove(string $dir): void
+{
+    if ($dir === '' || !is_dir($dir) || !str_starts_with(basename($dir), 'photos-')) {
+        return;
+    }
+    foreach (glob($dir . '/*') ?: [] as $f) {
+        @unlink($f);
+    }
+    @rmdir($dir);
+}
+
+/* Look at an upload of a zip and/or photos. Returns the plan: items to add, files that
+   match nothing, and files already on their product. */
+function photo_upload_check(string $dir, array &$errors): array
+{
+    $plan = ['items' => [], 'unmatched' => [], 'already' => [], 'files' => 0];
+    $f = $_FILES['photos'] ?? null;
+    if (!$f || !is_array($f['name'] ?? null)) {
+        $errors[] = 'Choose a zip of photos, or the photos themselves.';
+        return $plan;
+    }
+    @mkdir($dir, 0700, true);
+    $idx = photo_name_index();
+    $have = [];
+    $consider = function (string $name, string $src, string $entry, string $source) use (&$plan, $idx, &$have) {
+        $plan['files']++;
+        $m = photo_match($name, $idx);
+        if (!$m) {
+            $plan['unmatched'][] = $name;
+            return;
+        }
+        $have[$m[0]] ??= photo_sources($m[0]);
+        if (isset($have[$m[0]][$source])) {
+            $plan['already'][] = $name;
+            return;
+        }
+        $have[$m[0]][$source] = true;
+        $plan['items'][] = ['pid' => $m[0], 'pos' => $m[1], 'name' => $name, 'src' => $src, 'entry' => $entry, 'source' => $source];
+    };
+    foreach ($f['name'] as $i => $name) {
+        $err = (int)($f['error'][$i] ?? UPLOAD_ERR_NO_FILE);
+        if ($err === UPLOAD_ERR_NO_FILE) {
+            continue;
+        }
+        $tmp = (string)$f['tmp_name'][$i];
+        $name = basename(str_replace('\\', '/', (string)$name));
+        if ($err !== UPLOAD_ERR_OK || !is_uploaded_file($tmp) && PHP_SAPI !== 'cli') {
+            $errors[] = $name . ($err === UPLOAD_ERR_INI_SIZE ? ' is bigger than this server accepts. ' . upload_limit_text() : ' didn\'t upload properly.');
+            continue;
+        }
+        $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+        if ($ext === 'zip') {
+            if (!class_exists('ZipArchive')) {
+                $errors[] = 'This server can\'t open zip files. Choose the photos themselves instead.';
+                continue;
+            }
+            $keep = $dir . '/upload-' . $i . '.zip';
+            move_uploaded_file($tmp, $keep) || rename($tmp, $keep);
+            $z = new ZipArchive();
+            if ($z->open($keep) !== true) {
+                $errors[] = $name . ' isn\'t a zip the shop can open.';
+                continue;
+            }
+            for ($k = 0; $k < $z->numFiles; $k++) {
+                $st = $z->statIndex($k);
+                $en = (string)$st['name'];
+                $bn = basename($en);
+                if (str_ends_with($en, '/') || str_contains($en, '__MACOSX') || $bn === '' || $bn[0] === '.'
+                    || !in_array(strtolower(pathinfo($bn, PATHINFO_EXTENSION)), PHOTO_EXTS, true)) {
+                    continue;
+                }
+                $consider($bn, basename($keep), $en, 'crc:' . sprintf('%08x', $st['crc'] & 0xffffffff) . ':' . $st['size']);
+            }
+            $z->close();
+        } elseif (in_array($ext, PHOTO_EXTS, true)) {
+            $keep = $dir . '/f' . $i . '.' . $ext;
+            move_uploaded_file($tmp, $keep) || rename($tmp, $keep);
+            $consider($name, basename($keep), '', 'crc:' . hash_file('crc32b', $keep) . ':' . filesize($keep));
+        } else {
+            $errors[] = $name . ' isn\'t a zip or a photo (JPEG, PNG, WebP).';
+        }
+    }
+    // Each product's photos in their numbered order.
+    usort($plan['items'], fn($a, $b) => [$a['pid'], $a['pos'], $a['name']] <=> [$b['pid'], $b['pos'], $b['name']]);
+    return $plan;
+}
+
+/* Start a job. Returns its id. */
+function photo_job_create(string $kind, string $label, array $items, bool $replace, string $dir = ''): int
+{
+    db()->prepare('INSERT INTO import_jobs (kind, label, items, replace_existing, dir, created) VALUES (?, ?, ?, ?, ?, ?)')
+        ->execute([$kind, $label, json_encode(array_values($items)), $replace ? 1 : 0, $dir, now()]);
+    return (int)db()->lastInsertId();
+}
+
+function photo_job(int $id): ?array
+{
+    $st = db()->prepare('SELECT * FROM import_jobs WHERE id = ?');
+    $st->execute([$id]);
+    $j = $st->fetch();
+    if (!$j) {
+        return null;
+    }
+    $j['items'] = json_decode($j['items'], true) ?: [];
+    $j['errors'] = json_decode($j['errors'], true) ?: [];
+    return $j;
+}
+
+/* Fetch a photo from the web into a temporary file. Only http(s), only public
+   addresses, at most 15 MB. Returns the file, or null and why. */
+function photo_download(string $url, ?string &$err): ?string
+{
+    $u = parse_url($url);
+    if (!$u || !in_array(strtolower($u['scheme'] ?? ''), ['http', 'https'], true) || empty($u['host'])) {
+        $err = 'isn\'t a web address';
+        return null;
+    }
+    $host = $u['host'];
+    $ips = filter_var($host, FILTER_VALIDATE_IP) ? [$host] : (gethostbynamel($host) ?: []);
+    if (!$ips) {
+        $err = 'couldn\'t be found (' . $host . ')';
+        return null;
+    }
+    $testing = getenv('WRENSHOP_TESTING') === '1';
+    foreach ($ips as $ip) {
+        if (!$testing && !filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            $err = 'is on a private network, so the shop won\'t fetch it';
+            return null;
+        }
+    }
+    $tmp = tempnam(sys_get_temp_dir(), 'wsp');
+    $fh = fopen($tmp, 'wb');
+    $port = (int)($u['port'] ?? (strtolower($u['scheme']) === 'https' ? 443 : 80));
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE => $fh, CURLOPT_FOLLOWLOCATION => false, CURLOPT_CONNECTTIMEOUT => 10, CURLOPT_TIMEOUT => 30,
+        CURLOPT_RESOLVE => [$host . ':' . $port . ':' . $ips[0]],   // the address that was checked, not a second lookup
+        CURLOPT_USERAGENT => 'WrenShop/' . SHOP_VERSION . ' (photo import)',
+        CURLOPT_NOPROGRESS => false,
+        CURLOPT_PROGRESSFUNCTION => fn($c, $dlTotal, $dl) => $dl > UPLOAD_MAX ? 1 : 0,
+    ]);
+    if (defined('CURLOPT_PROTOCOLS_STR')) {
+        curl_setopt($ch, CURLOPT_PROTOCOLS_STR, 'http,https');
+    }
+    $ok = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $loc = (string)curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+    $cerr = curl_error($ch);
+    curl_close($ch);
+    fclose($fh);
+    static $hops = 0;
+    if ($code >= 300 && $code < 400 && $loc !== '' && $hops < 3) {   // follow a redirect, checking where it goes
+        @unlink($tmp);
+        $hops++;
+        $r = photo_download($loc, $err);
+        $hops--;
+        return $r;
+    }
+    if (!$ok || $code !== 200) {
+        @unlink($tmp);
+        $err = $ok ? 'gave ' . $code . ' (not found or not allowed)' : (str_contains($cerr, 'callback') ? 'is over 15 MB' : 'couldn\'t be fetched (' . $cerr . ')');
+        return null;
+    }
+    return $tmp;
+}
+
+/* Do as much of a job as fits in a few seconds. */
+function photo_job_step(int $id): void
+{
+    $j = photo_job($id);
+    if (!$j || $j['finished'] !== '') {
+        return;
+    }
+    @set_time_limit(60);
+    $start = microtime(true);
+    $pdo = db();
+    $zips = [];
+    $i = (int)$j['done'];
+    $n = count($j['items']);
+    // The test suite shortens batches to see an import carried over several of them.
+    $budget = getenv('WRENSHOP_TESTING') === '1' && setting('test_photo_batch') !== '' ? (float)setting('test_photo_batch') : PHOTO_BATCH_SECONDS;
+    while ($i < $n && microtime(true) - $start < $budget) {
+        $it = $j['items'][$i];
+        $i++;
+        $p = product_by_id((int)$it['pid']);
+        if (!$p) {
+            $j['skipped']++;
+            continue;
+        }
+        // Replacing: the product's old photos go before its first new one.
+        if ((int)$j['replace_existing'] && ($it['first'] ?? false)) {
+            foreach (product_photos((int)$p['id']) as $ph) {
+                if ($ph['source'] !== $it['source']) {
+                    photo_delete_files($ph);
+                    $pdo->prepare('DELETE FROM photos WHERE id = ?')->execute([$ph['id']]);
+                }
+            }
+        }
+        if (isset(photo_sources((int)$p['id'])[$it['source']])) {
+            $j['skipped']++;
+            continue;
+        }
+        $file = null;
+        $err = null;
+        $temp = false;
+        if ($j['kind'] === 'urls') {
+            $file = photo_download($it['url'], $err);
+            $temp = true;
+            $err = $err !== null ? $it['url'] . ' ' . $err : null;
+        } elseif ($it['entry'] !== '') {
+            $zp = $j['dir'] . '/' . basename($it['src']);
+            if (!isset($zips[$zp])) {
+                $zips[$zp] = new ZipArchive();
+                if ($zips[$zp]->open($zp) !== true) {
+                    $zips[$zp] = null;
+                }
+            }
+            $data = $zips[$zp] ? $zips[$zp]->getFromName($it['entry'], UPLOAD_MAX + 1) : false;
+            if ($data === false || strlen($data) > UPLOAD_MAX) {
+                $err = $it['name'] . ($data === false ? ' couldn\'t be read from the zip' : ' is over 15 MB');
+            } else {
+                $file = tempnam(sys_get_temp_dir(), 'wsp');
+                file_put_contents($file, $data);
+                $temp = true;
+            }
+        } else {
+            $file = $j['dir'] . '/' . basename($it['src']);
+            if (!is_file($file)) {
+                $err = $it['name'] . ' has gone from the server';
+                $file = null;
+            }
+        }
+        if ($file !== null) {
+            $stored = photo_store(['name' => $it['name'] ?? basename((string)($it['url'] ?? 'photo')), 'tmp' => $file, 'error' => UPLOAD_ERR_OK,
+                                   'size' => (int)filesize($file)], $e2, true);
+            if ($temp) {
+                @unlink($file);
+            }
+            if ($stored) {
+                $pos = (int)$pdo->query('SELECT COALESCE(MAX(position), -1) + 1 FROM photos WHERE product_id = ' . (int)$p['id'])->fetchColumn();
+                $pdo->prepare('INSERT INTO photos (product_id, file, thumb, position, source) VALUES (?, ?, ?, ?, ?)')
+                    ->execute([$p['id'], $stored[0], $stored[1], $pos, $it['source']]);
+                $j['added']++;
+                if (!empty($it['show']) && !(int)$p['visible']) {   // the import asked for it to be shown once it had a photo
+                    $pdo->prepare('UPDATE products SET visible = 1 WHERE id = ?')->execute([$p['id']]);
+                }
+                continue;
+            }
+            $err = $e2;
+        }
+        $j['errors'][] = $p['name'] . ': ' . $err;
+    }
+    foreach ($zips as $z) {
+        $z?->close();
+    }
+    $done = $i >= $n;
+    $pdo->prepare('UPDATE import_jobs SET done = ?, added = ?, skipped = ?, errors = ?, finished = ? WHERE id = ?')
+        ->execute([$i, $j['added'], $j['skipped'], json_encode(array_slice($j['errors'], -500)), $done ? now() : '', $id]);
+    if ($done) {
+        photo_dir_remove($j['dir']);
+    }
+}
+
+/* Mark each product's first item, so replacing clears its old photos just once. */
+function photo_items_mark_first(array $items): array
+{
+    $seen = [];
+    foreach ($items as $k => $it) {
+        $items[$k]['first'] = !isset($seen[$it['pid']]);
+        $seen[$it['pid']] = true;
+    }
+    return $items;
+}
+
+/* The import page's Photos section. */
+function photo_import_section(): string
+{
+    $jobs = db()->query("SELECT * FROM import_jobs WHERE finished = '' ORDER BY id")->fetchAll();
+    $open = '';
+    foreach ($jobs as $j) {
+        $n = count(json_decode($j['items'], true) ?: []);
+        $open .= '<p class="flash">' . e($j['label']) . ': ' . (int)$j['done'] . ' of ' . $n . ' done. <a href="' . e(admin_url('import/job/' . $j['id'])) . '">Carry on</a></p>';
+    }
+    return '<h2 id="photos">Photos</h2>' . $open
+        . '<p class="muted">Name each photo after its product\'s SKU or web address: <code>804501.jpg</code>, then <code>804501-2.jpg</code> for a second. '
+        . 'Put them in a zip, or choose the photos themselves. You\'ll see which photo goes on which product before anything is added. '
+        . 'Photos are added after a product\'s own, and a photo already added is never added twice.</p>'
+        . '<form method="post" enctype="multipart/form-data">' . csrf_field() . '<input type="hidden" name="do" value="photos">'
+        . '<label>Zip or photos <input type="file" name="photos[]" accept=".zip,application/zip,image/jpeg,image/png,image/webp" multiple required></label>'
+        . '<label class="check"><input type="checkbox" name="replace" value="1"> Replace each product\'s existing photos</label>'
+        . '<button>Check these photos</button></form>'
+        . '<p class="muted">This server accepts up to ' . e((string)ini_get('upload_max_filesize')) . ' a file and ' . e((string)ini_get('max_file_uploads')) . ' files at once, '
+        . 'so for lots of photos use a zip (or several). Photo web addresses can go in a <code>photos</code> column of the products CSV instead.</p>';
+}
+
+/* The check before photos are added. */
+function photo_plan_html(array $plan, string $token, bool $replace): string
+{
+    $names = [];
+    $per = [];
+    foreach ($plan['items'] as $it) {
+        $per[$it['pid']][] = $it['name'];
+    }
+    $rows = '';
+    foreach (array_slice($per, 0, 300, true) as $pid => $files) {
+        $p = product_by_id((int)$pid);
+        $rows .= '<tr><td>' . e($p['name']) . ($p['sku'] !== '' ? ' <span class="muted">' . e($p['sku']) . '</span>' : '') . '</td><td>' . e(implode(', ', $files)) . '</td></tr>';
+    }
+    $n = count($plan['items']);
+    return '<div class="report"><p class="lede">Checked ' . $plan['files'] . ' photo' . ($plan['files'] === 1 ? '' : 's') . '. Nothing has been added yet.</p>'
+        . ($n ? '<p class="flash"><b>' . $n . ' photo' . ($n === 1 ? '' : 's') . ' for ' . count($per) . ' product' . (count($per) === 1 ? '' : 's') . '.</b>'
+            . ($replace ? ' Their existing photos will be replaced.' : '') . '</p>'
+            . '<table class="cols"><tr><th>Product</th><th>Photos, in order</th></tr>' . $rows . '</table>'
+            . (count($per) > 300 ? '<p class="muted">…and ' . (count($per) - 300) . ' more products.</p>' : '') : '<p class="flash">No photos to add.</p>')
+        . ($plan['unmatched'] ? '<div class="err"><b>' . count($plan['unmatched']) . ' match no product</b> (no SKU or web address with that name), so they\'ll be left out: '
+            . e(implode(', ', array_slice($plan['unmatched'], 0, 100))) . (count($plan['unmatched']) > 100 ? '…' : '') . '</div>' : '')
+        . ($plan['already'] ? '<p class="muted">' . count($plan['already']) . ' already added before, so left out: ' . e(implode(', ', array_slice($plan['already'], 0, 50))) . '</p>' : '')
+        . ($n ? '<form method="post">' . csrf_field() . '<input type="hidden" name="do" value="photos_apply"><input type="hidden" name="token" value="' . e($token) . '">'
+            . '<button>Add ' . $n . ' photo' . ($n === 1 ? '' : 's') . '</button> <a href="' . e(admin_url('import')) . '">Cancel</a></form>'
+            : '<p><a href="' . e(admin_url('import')) . '">Back</a></p>')
+        . '</div>';
+}
+
+/* Handle the Photos forms on the import page. Returns the page to show, or null. */
+function photo_import_post(): ?string
+{
+    if (post('do') === 'photos') {
+        $token = bin2hex(random_bytes(12));
+        $dir = photo_import_dir($token);
+        $errors = [];
+        $plan = photo_upload_check($dir, $errors);
+        if ($errors && !$plan['files']) {
+            photo_dir_remove($dir);
+            flash(implode(' ', $errors));
+            redirect(admin_url('import') . '#photos');
+        }
+        $replace = !empty($_POST['replace']);
+        file_put_contents($dir . '/plan.json', json_encode(['plan' => $plan, 'replace' => $replace]));
+        $_SESSION['shop_photos'] = $token;
+        return ($errors ? '<div class="err">' . implode('<br>', array_map('e', $errors)) . '</div>' : '') . photo_plan_html($plan, $token, $replace);
+    }
+    if (post('do') === 'photos_apply') {
+        $token = (string)($_SESSION['shop_photos'] ?? '');
+        $dir = photo_import_dir($token);
+        if ($token === '' || !hash_equals($token, post('token')) || !is_file($dir . '/plan.json')) {
+            flash('That check has expired. Please choose the photos again.');
+            redirect(admin_url('import') . '#photos');
+        }
+        unset($_SESSION['shop_photos']);
+        $saved = json_decode((string)file_get_contents($dir . '/plan.json'), true);
+        $items = photo_items_mark_first($saved['plan']['items']);
+        $id = photo_job_create('zip', count($items) . ' photo' . (count($items) === 1 ? '' : 's') . ' from ' . date('j M H:i'), $items, (bool)$saved['replace'], $dir);
+        redirect(admin_url('import/job/' . $id));
+    }
+    return null;
+}
+
+/* A job's progress page. Each visit by POST does a batch; the page carries on by itself. */
+function view_photo_job(int $id): never
+{
+    require_admin();
+    $j = photo_job($id);
+    if (!$j) {
+        redirect(admin_url('import'));
+    }
+    if (is_post()) {
+        csrf_check();
+        if (post('do') === 'stop' && $j['finished'] === '') {
+            db()->prepare('UPDATE import_jobs SET finished = ? WHERE id = ?')->execute([now(), $id]);
+            photo_dir_remove($j['dir']);
+            flash('Stopped. The photos added so far are kept.');
+        } else {
+            photo_job_step($id);
+        }
+        redirect(admin_url('import/job/' . $id));
+    }
+    $n = count($j['items']);
+    $pct = $n ? (int)floor($j['done'] * 100 / $n) : 100;
+    $running = $j['finished'] === '';
+    $errs = $j['errors'] ? '<div class="err"><b>' . count($j['errors']) . ' couldn\'t be added:</b><ul>'
+        . implode('', array_map(fn($x) => '<li>' . e($x) . '</li>', array_slice($j['errors'], 0, 200))) . '</ul></div>' : '';
+    admin_shell('Photo import', '<p class="muted"><a href="' . e(admin_url('import')) . '">&larr; Import and export</a></p>'
+        . '<h1>' . ($running ? 'Adding photos' : 'Photos added') . '</h1>'
+        . '<p class="lede">' . e($j['label']) . '</p>'
+        . '<div class="progress" role="progressbar" aria-valuenow="' . $pct . '" aria-valuemin="0" aria-valuemax="100"><span style="width:' . $pct . '%"></span></div>'
+        . '<p><b>' . (int)$j['done'] . ' of ' . $n . '</b> done: ' . (int)$j['added'] . ' added'
+        . ($j['skipped'] ? ', ' . (int)$j['skipped'] . ' already there' : '') . ($j['errors'] ? ', ' . count($j['errors']) . ' couldn\'t be added' : '') . '.</p>'
+        . ($running ? '<form method="post" id="go">' . csrf_field() . '<button>Carry on</button></form>'
+            . '<p class="muted">This page carries on by itself. You can leave it and come back: the import waits where it got to (Products → Import and export).</p>'
+            . '<form method="post" onsubmit="return confirm(\'Stop adding photos?\')">' . csrf_field() . '<input type="hidden" name="do" value="stop"><button class="quiet small">Stop</button></form>'
+            . '<script>setTimeout(function(){var f=document.getElementById("go");f.querySelector("button").disabled=true;f.submit();},400);</script>'
+            : '<p><a class="btn quiet" href="' . e(admin_url()) . '">See your products</a></p>')
+        . $errs);
+}
+
+/* ============================================== moving in from another shop
+   1.3: customers (keeping their WordPress passwords until they next sign in),
+   past orders (read-only: they never touch stock, send emails or use up
+   discount codes) and the old shop's addresses, for redirects. The converter in
+   tools/woo-to-wren.php turns WooCommerce's exports into these files. */
+
+/* ---------------------------------------------------------- passwords */
+
+/* Check a password against a WordPress hash, as WordPress does (6.8's $wp bcrypt,
+   phpass $P$/$H$, plain bcrypt, or very old MD5). */
+function wp_password_check(string $pass, string $hash): bool
+{
+    if (strlen($pass) > 4096 || $hash === '') {
+        return false;
+    }
+    if (strlen($hash) <= 32) {
+        return ctype_xdigit($hash) && hash_equals(strtolower($hash), md5($pass));
+    }
+    if (str_starts_with($hash, '$wp')) {
+        return password_verify(base64_encode(hash_hmac('sha384', $pass, 'wp-sha384', true)), substr($hash, 3));
+    }
+    if (str_starts_with($hash, '$P$') || str_starts_with($hash, '$H$')) {
+        return hash_equals($hash, phpass_crypt($pass, $hash));
+    }
+    return password_verify($pass, $hash);
+}
+
+/* phpass's portable hash (what WordPress used before 6.8). */
+function phpass_crypt(string $pass, string $setting): string
+{
+    $itoa = './0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+    $count = strpos($itoa, $setting[3] ?? '');
+    if ($count === false || $count < 7 || $count > 30 || strlen($setting) < 12) {
+        return '*';
+    }
+    $salt = substr($setting, 4, 8);
+    $h = md5($salt . $pass, true);
+    for ($n = 1 << $count; $n > 0; $n--) {
+        $h = md5($h . $pass, true);
+    }
+    $out = substr($setting, 0, 12);
+    $i = 0;
+    $len = 16;
+    do {   // phpass's own base-64
+        $v = ord($h[$i++]);
+        $out .= $itoa[$v & 0x3f];
+        if ($i < $len) {
+            $v |= ord($h[$i]) << 8;
+        }
+        $out .= $itoa[($v >> 6) & 0x3f];
+        if ($i++ >= $len) {
+            break;
+        }
+        if ($i < $len) {
+            $v |= ord($h[$i]) << 16;
+        }
+        $out .= $itoa[($v >> 12) & 0x3f];
+        if ($i++ >= $len) {
+            break;
+        }
+        $out .= $itoa[($v >> 18) & 0x3f];
+    } while ($i < $len);
+    return $out;
+}
+
+/* Is this a customer's password? Brought-across WordPress passwords ("wp:" + hash)
+   are checked WordPress's way once, then replaced with the shop's own. */
+function customer_password_ok(string $pass, ?array $c): bool
+{
+    $stored = (string)($c['password'] ?? '');
+    if (!$c || !str_starts_with($stored, 'wp:')) {
+        return password_verify($pass, $c ? $stored : dummy_hash());
+    }
+    if (!wp_password_check($pass, substr($stored, 3))) {
+        return false;
+    }
+    $new = password_hash($pass, PASSWORD_DEFAULT);
+    db()->prepare('UPDATE customers SET password = ? WHERE id = ?')->execute([$new, $c['id']]);
+    $GLOBALS['shop_rehashed'][$c['id']] = $new;
+    return true;
+}
+
+/* ---------------------------------------------------- reading the files */
+
+/* A CSV as rows of header => value, keyed by spreadsheet row number. */
+function moving_read(string $file, array $need, array &$errors): array
+{
+    $fh = fopen($file, 'r');
+    $head = fgetcsv($fh, null, ',', '"', '');
+    if ($head && isset($head[0])) {
+        $head[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$head[0]);
+    }
+    $cols = array_map(fn($h) => strtolower(trim((string)$h)), $head ?: []);
+    if ($miss = array_diff($need, $cols)) {
+        $errors[] = 'The file needs ' . (count($miss) === 1 ? 'a column called ' : 'columns called ') . implode(', ', $miss) . '.';
+        fclose($fh);
+        return [];
+    }
+    $rows = [];
+    $n = 1;
+    while (($r = fgetcsv($fh, null, ',', '"', '')) !== false) {
+        $n++;
+        if ($r === [null] || !array_filter($r, fn($x) => trim((string)$x) !== '')) {
+            continue;
+        }
+        $row = [];
+        foreach ($cols as $i => $c) {
+            $row[$c] = trim((string)($r[$i] ?? ''));
+        }
+        $rows[$n] = $row;
+    }
+    fclose($fh);
+    return $rows;
+}
+
+/* --------------------------------------------------------- customers */
+
+const CUSTOMER_CSV_COLUMNS = ['email', 'name', 'phone', 'password_hash', 'created',
+    'bill_name', 'bill_line1', 'bill_line2', 'bill_town', 'bill_postcode', 'ship_name', 'ship_line1', 'ship_line2', 'ship_town', 'ship_postcode'];
+
+/* Add customers. Existing accounts (by email) are never changed. Returns a report. */
+function customers_import(array $rows, bool $apply): array
+{
+    $rep = ['new' => 0, 'existing' => 0, 'passwords' => 0, 'errors' => []];
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    $seen = [];
+    foreach ($rows as $n => $r) {
+        $email = mb_strtolower($r['email'] ?? '');
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $rep['errors'][] = [$n, '"' . ($r['email'] ?? '') . '" isn\'t an email address.'];
+            continue;
+        }
+        if (isset($seen[$email])) {
+            $rep['errors'][] = [$n, $email . ' is also on row ' . $seen[$email] . '.'];
+            continue;
+        }
+        $seen[$email] = $n;
+        if (customer_by_email($email)) {
+            $rep['existing']++;
+            continue;
+        }
+        $hash = $r['password_hash'] ?? '';
+        if ($hash !== '' && !preg_match('/^(\$wp\$2[aby]\$|\$P\$|\$H\$|\$2[aby]\$|\$argon2)[^\s]{20,}$|^[a-f0-9]{32}$/i', $hash)) {
+            $rep['errors'][] = [$n, 'The password for ' . $email . ' isn\'t a WordPress password hash.'];
+            continue;
+        }
+        // No password: they set one with "Forgotten your password?". A random one stands in till then.
+        $stored = $hash !== '' ? 'wp:' . $hash : password_hash(bin2hex(random_bytes(16)), PASSWORD_DEFAULT);
+        $rep['passwords'] += $hash !== '' ? 1 : 0;
+        $created = strtotime($r['created'] ?? '') ? gmdate('Y-m-d H:i:s', strtotime($r['created'])) : now();
+        $a = [];
+        foreach (ADDRESS_FIELDS as $k) {
+            $a[$k] = mb_substr($r[$k] ?? '', 0, 120);
+        }
+        foreach (['bill_postcode', 'ship_postcode'] as $k) {
+            $a[$k] = uk_postcode($a[$k]) ?? $a[$k];
+        }
+        $same = $a['ship_line1'] === '' || ($a['ship_line1'] === $a['bill_line1'] && $a['ship_postcode'] === $a['bill_postcode']);
+        // Their address came from the old shop's own customers, so it counts as confirmed.
+        $pdo->prepare('INSERT INTO customers (email, password, name, phone, ' . implode(', ', ADDRESS_FIELDS) . ', same_address, verified_at, created)
+                       VALUES (?, ?, ?, ?, ' . implode(', ', array_fill(0, count(ADDRESS_FIELDS), '?')) . ', ?, ?, ?)')
+            ->execute([$email, $stored, mb_substr($r['name'] ?? '', 0, 120) ?: $a['bill_name'], mb_substr($r['phone'] ?? '', 0, 40), ...array_values($a), $same ? 1 : 0, now(), $created]);
+        $rep['new']++;
+    }
+    $pdo->exec($apply && !$rep['errors'] ? 'COMMIT' : 'ROLLBACK');
+    return $rep;
+}
+
+/* ------------------------------------------------------- past orders */
+
+const ORDER_CSV_COLUMNS = ['number', 'date', 'status', 'email', 'phone', 'bill_name', 'bill_line1', 'bill_line2', 'bill_town', 'bill_postcode',
+    'ship_name', 'ship_line1', 'ship_line2', 'ship_town', 'ship_postcode', 'delivery_method', 'postage', 'discount', 'discount_code', 'total', 'vat',
+    'payment', 'note', 'item_name', 'item_option', 'item_sku', 'item_qty', 'item_price'];
+
+/* WooCommerce's order statuses as Wren's: [status, fulfilled]. Null: left out. */
+function moving_status(string $s): ?array
+{
+    $s = strtolower(preg_replace('/^wc-/', '', trim($s)));
+    return match ($s) {
+        'completed', 'complete', 'paid', 'sent' => ['paid', 'sent'],
+        'processing'                            => ['paid', 'sent'],   // finish these in the old shop before moving
+        'refunded'                              => ['refunded', 'sent'],
+        'cancelled', 'canceled', 'failed'       => ['cancelled', ''],
+        default                                 => null,               // pending, on-hold, draft: not real orders yet
+    };
+}
+
+/* Add past orders, one CSV row per item. Orders already brought across are left alone. */
+function orders_import(array $rows, bool $apply): array
+{
+    $rep = ['new' => 0, 'again' => 0, 'left' => [], 'items' => 0, 'errors' => [], 'linked' => 0];
+    $orders = [];
+    foreach ($rows as $n => $r) {
+        $num = $r['number'] ?? '';
+        if (!ctype_digit($num) || (int)$num < 1) {
+            $rep['errors'][] = [$n, 'The order number "' . $num . '" should be a whole number.'];
+            continue;
+        }
+        $orders[(int)$num][$n] = $r;
+    }
+    $money = function (string $x, int $n, string $what) use (&$rep): int {
+        if ($x === '') {
+            return 0;
+        }
+        $p = parse_price(ltrim($x, '-'));
+        if ($p === null) {
+            $rep['errors'][] = [$n, 'The ' . $what . ' "' . $x . '" isn\'t an amount.'];
+            return 0;
+        }
+        return $p;
+    };
+    $pdo = db();
+    $pdo->exec('BEGIN IMMEDIATE');
+    foreach ($orders as $num => $lines) {
+        $n = array_key_first($lines);
+        $o = $lines[$n];
+        $st = $pdo->prepare('SELECT imported FROM orders WHERE number = ?');
+        $st->execute([$num]);
+        $was = $st->fetchColumn();
+        if ($was !== false) {
+            if ((int)$was) {
+                $rep['again']++;
+            } else {
+                $rep['errors'][] = [$n, 'Order ' . $num . ' is already a number in this shop. Old orders need numbers the shop hasn\'t used.'];
+            }
+            continue;
+        }
+        $state = moving_status($o['status'] ?? '');
+        if ($state === null) {
+            $rep['left'][$o['status'] ?? ''] = ($rep['left'][$o['status'] ?? ''] ?? 0) + 1;
+            continue;
+        }
+        $when = strtotime($o['date'] ?? '');
+        if (!$when) {
+            $rep['errors'][] = [$n, 'Order ' . $num . ' has no date we can read ("' . ($o['date'] ?? '') . '").'];
+            continue;
+        }
+        $email = mb_strtolower($o['email'] ?? '');
+        $items = [];
+        $sub = 0;
+        foreach ($lines as $ln => $l) {
+            if (($l['item_name'] ?? '') === '') {
+                continue;
+            }
+            $qty = ctype_digit($l['item_qty'] ?? '') ? (int)$l['item_qty'] : 1;
+            $unit = $money($l['item_price'] ?? '', $ln, 'item price');
+            $items[] = [$l['item_name'], $l['item_option'] ?? '', $l['item_sku'] ?? '', max(1, $qty), $unit];
+            $sub += max(1, $qty) * $unit;
+        }
+        $post = $money($o['postage'] ?? '', $n, 'postage');
+        $disc = $money($o['discount'] ?? '', $n, 'discount');
+        $total = ($o['total'] ?? '') !== '' ? $money($o['total'], $n, 'total') : $sub - $disc + $post;
+        $vat = ($o['vat'] ?? '') !== '' ? $money($o['vat'], $n, 'VAT') : null;
+        $c = filter_var($email, FILTER_VALIDATE_EMAIL) ? customer_by_email($email) : null;
+        $rep['linked'] += $c ? 1 : 0;
+        $date = gmdate('Y-m-d H:i:s', $when);
+        $deliver = trim(($o['ship_line1'] ?? '') . ($o['ship_postcode'] ?? '')) !== '';
+        $pdo->prepare('INSERT INTO orders (number, token, status, payment_method, delivery, email, phone,
+                       bill_name, bill_line1, bill_line2, bill_town, bill_postcode, ship_name, ship_line1, ship_line2, ship_town, ship_postcode,
+                       same_address, customer_note, subtotal_pence, postage_pence, total_pence, vat_pence, vat_number, created, updated, customer_id,
+                       discount_code, discount_pence, paid_at, fulfilled, fulfilled_at, delivery_method, imported)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)')
+            ->execute([$num, bin2hex(random_bytes(16)), $state[0], mb_substr($o['payment'] ?? '', 0, 60) ?: 'old shop', $deliver ? 'deliver' : 'collect', $email,
+                       $o['phone'] ?? '', $o['bill_name'] ?? '', $o['bill_line1'] ?? '', $o['bill_line2'] ?? '', $o['bill_town'] ?? '', $o['bill_postcode'] ?? '',
+                       $o['ship_name'] ?? '', $o['ship_line1'] ?? '', $o['ship_line2'] ?? '', $o['ship_town'] ?? '', $o['ship_postcode'] ?? '',
+                       mb_substr($o['note'] ?? '', 0, 500), $sub, $post, $total, $vat, '', $date, $date, $c ? (int)$c['id'] : null,
+                       $o['discount_code'] ?? '', $disc, $state[0] === 'cancelled' ? '' : $date, $state[1], $state[1] !== '' ? $date : '',
+                       mb_substr($o['delivery_method'] ?? '', 0, 60)]);
+        $oid = (int)$pdo->lastInsertId();
+        foreach ($items as [$name, $opt, $sku, $qty, $unit]) {
+            $pid = 0;
+            if ($sku !== '') {   // linked to the product where its SKU is known, for reports
+                $s2 = $pdo->prepare('SELECT id FROM products WHERE sku = ? COLLATE NOCASE UNION SELECT product_id FROM variants WHERE sku = ? COLLATE NOCASE LIMIT 1');
+                $s2->execute([$sku, $sku]);
+                $pid = (int)$s2->fetchColumn();
+            }
+            $pdo->prepare('INSERT INTO order_items (order_id, product_id, name, option_label, unit_pence, qty, sku) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                ->execute([$oid, $pid, mb_substr($name, 0, 200), mb_substr($opt, 0, 200), $unit, $qty, mb_substr($sku, 0, 40)]);
+            $rep['items']++;
+        }
+        $rep['new']++;
+    }
+    $pdo->exec($apply && !$rep['errors'] ? 'COMMIT' : 'ROLLBACK');
+    return $rep;
+}
+
+/* -------------------------------------------------------------- page */
+
+/* Customers → Import: customers and past orders from the old shop. */
+function view_admin_moving(): never
+{
+    require_admin();
+    $report = '';
+    if (is_post()) {
+        csrf_check();
+        $kind = post('kind') === 'orders' ? 'orders' : 'customers';
+        $file = data_dir() . '/moving-' . $kind . '.csv';
+        if (post('do') === 'apply') {
+            if (!is_file($file) || !hash_equals((string)($_SESSION['shop_moving_' . $kind] ?? ''), post('token'))) {
+                flash('That check has expired. Please choose the file again.');
+                redirect(admin_url('moving'));
+            }
+        } else {
+            $f = $_FILES['file'] ?? null;
+            if (!is_array($f) || ($f['error'] ?? 1) !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) {
+                flash(($f['error'] ?? 0) === UPLOAD_ERR_INI_SIZE ? 'That file is bigger than this server accepts. ' . upload_limit_text() : 'Choose a CSV file to check.');
+                redirect(admin_url('moving'));
+            }
+            move_uploaded_file($f['tmp_name'], $file);
+            @chmod($file, 0600);
+        }
+        $errors = [];
+        $rows = moving_read($file, $kind === 'orders' ? ['number', 'date', 'status'] : ['email'], $errors);
+        $apply = post('do') === 'apply';
+        $rep = $errors ? ['errors' => array_map(fn($x) => [0, $x], $errors)] : ($kind === 'orders' ? orders_import($rows, $apply) : customers_import($rows, $apply));
+        if ($apply) {
+            @unlink($file);
+            unset($_SESSION['shop_moving_' . $kind]);
+            flash($rep['errors'] ? 'The file has problems now, so nothing was imported. Please check it again.'
+                : ($kind === 'orders' ? 'Brought across ' . $rep['new'] . ' past order' . ($rep['new'] === 1 ? '' : 's') . '.'
+                                      : 'Brought across ' . $rep['new'] . ' customer' . ($rep['new'] === 1 ? '' : 's') . '.'));
+            redirect(admin_url($kind === 'orders' && !$rep['errors'] ? 'orders' : 'moving'));
+        }
+        $token = bin2hex(random_bytes(12));
+        $_SESSION['shop_moving_' . $kind] = $token;
+        $report = moving_report_html($kind, $rep, count($rows), $token);
+    }
+    admin_shell('Import customers and orders', '<h1>Import customers and past orders</h1>' . ($report !== '' ? $report : '
+      <p class="lede">For moving from another shop, like WooCommerce. Bring customers across first, then their past orders. The converter that comes with
+      Wren Shop (<code>tools/woo-to-wren.php</code>) makes both files from WooCommerce\'s exports.</p>
+      <h2>Customers</h2>
+      <p class="muted">One row per customer: <code>' . implode('</code>, <code>', CUSTOMER_CSV_COLUMNS) . '</code>. Only <code>email</code> is needed.
+      With a WordPress <code>password_hash</code>, customers sign in with the password they already have (it\'s changed to Wren Shop\'s own as they do).
+      Without one, they use "Forgotten your password?". Accounts that already exist here are left as they are.</p>
+      <form method="post" enctype="multipart/form-data">' . csrf_field() . '<input type="hidden" name="kind" value="customers">
+        <label>Customers CSV <input type="file" name="file" accept=".csv,text/csv" required></label><button>Check this file</button></form>
+      <h2>Past orders</h2>
+      <p class="muted">One row per item: <code>' . implode('</code>, <code>', ORDER_CSV_COLUMNS) . '</code>. They keep their old numbers, show in each customer\'s
+      account and in Orders, marked as from your old shop. They\'re a record only: they never change stock, send emails or count towards discount codes.
+      Completed, processing, refunded and cancelled orders come across; pending and on-hold ones don\'t. Finish any you\'re still sending in the old shop first.
+      Bringing the same file again adds nothing twice.</p>
+      <form method="post" enctype="multipart/form-data">' . csrf_field() . '<input type="hidden" name="kind" value="orders">
+        <label>Orders CSV <input type="file" name="file" accept=".csv,text/csv" required></label><button>Check this file</button></form>
+      ' . redirects_section()));
+}
+
+function moving_report_html(string $kind, array $rep, int $rows, string $token): string
+{
+    $out = '<div class="report"><p class="lede">Checked ' . number_format($rows) . ' row' . ($rows === 1 ? '' : 's') . '. Nothing has changed yet.</p>';
+    if ($rep['errors']) {
+        return $out . '<div class="err"><b>' . count($rep['errors']) . ' problem' . (count($rep['errors']) === 1 ? '' : 's') . '.</b> Nothing can be imported until they\'re fixed.'
+            . '<table class="errs">' . implode('', array_map(fn($x) => '<tr><td>' . ($x[0] ? 'Row ' . $x[0] : 'File') . '</td><td>' . e($x[1]) . '</td></tr>', array_slice($rep['errors'], 0, 300))) . '</table></div>'
+            . '<p><a class="btn quiet" href="' . e(admin_url('moving')) . '">Check another file</a></p></div>';
+    }
+    if ($kind === 'customers') {
+        $out .= '<p class="flash"><b>' . $rep['new'] . ' new customer' . ($rep['new'] === 1 ? '' : 's') . '</b>, ' . $rep['passwords'] . ' keeping their password.'
+              . ($rep['existing'] ? ' ' . $rep['existing'] . ' already have an account here and are left as they are.' : '') . '</p>';
+    } else {
+        $out .= '<p class="flash"><b>' . $rep['new'] . ' past order' . ($rep['new'] === 1 ? '' : 's') . '</b> with ' . $rep['items'] . ' item' . ($rep['items'] === 1 ? '' : 's') . ', '
+              . $rep['linked'] . ' matched to a customer\'s account.' . ($rep['again'] ? ' ' . $rep['again'] . ' brought across before, so left alone.' : '') . '</p>'
+              . ($rep['left'] ? '<p class="muted">Left out: ' . e(implode(', ', array_map(fn($s, $c) => $c . ' ' . ($s ?: 'with no status'), array_keys($rep['left']), $rep['left']))) . '.</p>' : '');
+    }
+    return $out . ($rep['new'] ? '<form method="post" class="actions-row" style="border:0;padding:0">' . csrf_field()
+            . '<input type="hidden" name="kind" value="' . $kind . '"><input type="hidden" name="do" value="apply"><input type="hidden" name="token" value="' . e($token) . '">'
+            . '<button>Bring them across</button> <a href="' . e(admin_url('moving')) . '">Cancel</a></form>'
+            : '<p><a class="btn quiet" href="' . e(admin_url('moving')) . '">Back</a></p>') . '</div>';
+}
+
+/* ---------------------------------------------------------- redirects */
+
+/* The old shop's address for a product, from the products CSV's old_url column. */
+function redirect_set(string $oldUrl, int $pid): ?string
+{
+    $path = parse_url(trim($oldUrl), PHP_URL_PATH);
+    if (!is_string($path) || $path === '' || $path === '/' || !preg_match('#^/[A-Za-z0-9._~%/+-]*$#', $path)) {
+        return 'The old address ' . $oldUrl . ' isn\'t a web address path like /product/wishbone-front/.';
+    }
+    $path = '/' . trim(rawurldecode($path), '/') . '/';
+    db()->prepare('INSERT OR REPLACE INTO redirects (old_path, product_id) VALUES (?, ?)')->execute([$path, $pid]);
+    return null;
+}
+
+/* Rewrite rules for the site's .htaccess: each old address to its product or category. */
+function redirect_rules(bool $woocats): array
+{
+    $rules = [];
+    $bad = [];
+    $q = preg_quote(...);
+    foreach (db()->query('SELECT r.old_path, p.slug, p.visible, p.name FROM redirects r LEFT JOIN products p ON p.id = r.product_id ORDER BY r.old_path') as $r) {
+        if ($r['slug'] === null || !(int)$r['visible']) {
+            $bad[] = $r['old_path'] . ($r['slug'] === null ? ' (its product has been deleted)' : ' (' . $r['name'] . ' is hidden)');
+            if ($r['slug'] === null) {
+                continue;
+            }
+        }
+        $rules[] = 'RewriteRule ^' . $q(ltrim(rtrim($r['old_path'], '/'), '/')) . '/?$ ' . shop_base_path() . '/p/' . $r['slug'] . ' [R=301,L]';
+    }
+    if ($woocats) {   // WooCommerce's /product-category/parent/child/ addresses
+        foreach (cat_tree() as $c) {
+            $parts = array_map(fn($x) => wp_slug($x['name']), cat_trail((int)$c['id']));
+            $rules[] = 'RewriteRule ^product-category/' . $q(implode('/', $parts)) . '/?$ ' . shop_base_path() . '/c/' . $c['slug'] . ' [R=301,L]';
+        }
+    }
+    return [$rules, $bad];
+}
+
+/* A name as WordPress makes it into an address: "Oils & Fluids" -> oils-fluids. */
+function wp_slug(string $s): string
+{
+    $s = html_entity_decode($s, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $s = str_replace(['&', "'", '’'], '', $s);
+    if (function_exists('iconv')) {
+        $s = (string)@iconv('UTF-8', 'ASCII//TRANSLIT', $s);
+    }
+    return trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($s)), '-');
+}
+
+/* /shop, or wherever the shop lives on the site. */
+function shop_base_path(): string
+{
+    return rtrim((string)parse_url(abs_shop_url(), PHP_URL_PATH), '/') ?: '/shop';
+}
+
+function redirects_section(): string
+{
+    $n = (int)db()->query('SELECT COUNT(*) FROM redirects')->fetchColumn();
+    if (!$n && !cat_tree()) {
+        return '';
+    }
+    [$rules, $bad] = redirect_rules(true);
+    return '<h2 id="redirects">Old addresses</h2>'
+        . '<p class="muted">So links and search results for your old shop still work, your site sends each old address on to its new one. '
+        . ($n ? $n . ' old product address' . ($n === 1 ? '' : 'es') . ' came from the <code>old_url</code> column of your products import. ' : 'Add an <code>old_url</code> column to your products import to list them. ')
+        . 'WooCommerce\'s category addresses (<code>/product-category/…/</code>) are included, made from your categories\' names.</p>'
+        . ($bad ? '<div class="err"><b>' . count($bad) . ' won\'t reach a product in the shop:</b> ' . e(implode('; ', array_slice($bad, 0, 30))) . '</div>' : '')
+        . '<p><a class="btn quiet" href="' . e(url_with(admin_url('moving'), ['rules' => '1'])) . '">Download the redirect rules</a></p>'
+        . '<p class="muted">Put them in your site\'s main <code>.htaccess</code> (the one beside Wren\'s <code>index.php</code>), straight after the line '
+        . '<code>RewriteEngine On</code>, so they come before Wren\'s own rules.</p>';
+}
+
+function redirect_rules_download(): never
+{
+    [$rules] = redirect_rules(true);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Content-Disposition: attachment; filename="wren-shop-redirects.txt"');
+    echo "# Wren Shop: old shop addresses to their new ones (" . gmdate('Y-m-d') . ")\n"
+       . "# Paste straight after \"RewriteEngine On\" in the site's main .htaccess.\n"
+       . implode("\n", $rules) . "\n";
+    exit;
+}
+
+/* ========================================================= related products
+   "You might also like" (1.3): up to 8 products chosen on a product's form (or
+   in the CSV's related column), in that order; with none chosen, others from
+   the same category. Hidden products never show. */
+
+const RELATED_MAX = 8;
+const RELATED_NEIGHBOURS = 4;
+
+function related_ids(int $pid): array
+{
+    $st = db()->prepare('SELECT related_id FROM product_related WHERE product_id = ? ORDER BY position');
+    $st->execute([$pid]);
+    return array_map('intval', $st->fetchAll(PDO::FETCH_COLUMN));
+}
+
+/* The products to show under this one. */
+function related_for(array $p): array
+{
+    $ids = related_ids((int)$p['id']);
+    if ($ids) {
+        $st = db()->prepare('SELECT * FROM products WHERE visible = 1 AND id IN (' . implode(',', $ids) . ')');
+        $st->execute();
+        $by = array_column($st->fetchAll(), null, 'id');
+        return array_values(array_filter(array_map(fn($i) => $by[$i] ?? null, $ids)));
+    }
+    if (!(int)$p['category_id']) {
+        return [];
+    }
+    // Neighbours: the same main category (or shown in it), newest first.
+    $st = db()->prepare('SELECT * FROM products p WHERE p.visible = 1 AND p.id != ? AND (p.category_id = ?
+                         OR p.id IN (SELECT product_id FROM product_categories WHERE category_id = ?)) ORDER BY p.created DESC, p.id DESC LIMIT ' . RELATED_NEIGHBOURS);
+    $st->execute([$p['id'], $p['category_id'], $p['category_id']]);
+    return $st->fetchAll();
+}
+
+function related_html(array $p): string
+{
+    $rows = related_for($p);
+    return $rows ? '<section class="shop-related"><h2 class="shop-h2">You might also like</h2><div class="shop-grid">' . product_cards($rows) . '</div></section>' : '';
+}
+
+/* A product named by SKU (its own or a choice's), web address or exact name. */
+function product_by_ref(string $ref): ?array
+{
+    $ref = trim($ref);
+    if ($ref === '') {
+        return null;
+    }
+    foreach (['SELECT * FROM products WHERE sku = ? COLLATE NOCASE', 'SELECT * FROM products WHERE slug = ?',
+              'SELECT p.* FROM products p JOIN variants v ON v.product_id = p.id WHERE v.sku = ? COLLATE NOCASE',
+              'SELECT * FROM products WHERE name = ? COLLATE NOCASE'] as $sql) {
+        $st = db()->prepare($sql . ' LIMIT 2');
+        $st->execute([$ref]);
+        $r = $st->fetchAll();
+        if (count($r) === 1) {
+            return $r[0];
+        }
+    }
+    return null;
+}
+
+/* Read a list of related products ("SKU, web address, ..."). Returns ids, adding errors. */
+function related_parse(string $list, int $self, array &$errors): array
+{
+    $ids = [];
+    foreach (preg_split('/\s*[,|\n]\s*/', trim($list), -1, PREG_SPLIT_NO_EMPTY) as $ref) {
+        $p = product_by_ref(preg_replace('/\s+—\s+.*$/u', '', $ref));   // "SKU — name" from the suggestions
+        if (!$p) {
+            $errors[] = 'No product has the SKU or web address "' . $ref . '" (for related products).';
+        } elseif ((int)$p['id'] !== $self && !in_array((int)$p['id'], $ids, true)) {
+            $ids[] = (int)$p['id'];
+        }
+    }
+    if (count($ids) > RELATED_MAX) {
+        $errors[] = 'Up to ' . RELATED_MAX . ' related products, please.';
+    }
+    return array_slice($ids, 0, RELATED_MAX);
+}
+
+function related_save(int $pid, array $ids): void
+{
+    $pdo = db();
+    $pdo->prepare('DELETE FROM product_related WHERE product_id = ?')->execute([$pid]);
+    foreach (array_values($ids) as $i => $rid) {
+        $pdo->prepare('INSERT INTO product_related (product_id, related_id, position) VALUES (?, ?, ?)')->execute([$pid, $rid, $i]);
+    }
+}
+
+/* How a product is named in the related list: its SKU, else its web address. */
+function related_ref(array $p): string
+{
+    return $p['sku'] !== '' ? $p['sku'] : $p['slug'];
+}
+
+function related_refs(int $pid): string
+{
+    $out = [];
+    foreach (related_ids($pid) as $id) {
+        if ($r = product_by_id($id)) {
+            $out[] = related_ref($r);
+        }
+    }
+    return implode(', ', $out);
+}
+
+/* The product form's Related products section. */
+function related_form_html(?array $p, array $v): string
+{
+    $val = $v['related'] ?? ($p ? related_refs((int)$p['id']) : '');
+    $n = (int)db()->query('SELECT COUNT(*) FROM products')->fetchColumn();
+    $opts = '';
+    if ($n <= 3000) {   // suggestions as you type
+        foreach (db()->query('SELECT sku, slug, name FROM products ORDER BY name COLLATE NOCASE') as $r) {
+            $opts .= '<option value="' . e(($r['sku'] !== '' ? $r['sku'] : $r['slug']) . ' — ' . $r['name']) . '">';
+        }
+    }
+    return '<details class="opts" id="related"' . ($val !== '' ? ' open' : '') . '><summary>Related products <span class="hint">(optional: "You might also like")</span></summary>'
+        . '<p class="muted">Up to ' . RELATED_MAX . ' SKUs or web addresses, separated by commas, in the order to show them. Leave empty to show others from the same category.</p>'
+        . '<input name="related" value="' . e($val) . '" list="related-list" placeholder="e.g. 804501, shock-oil-400cps" aria-label="Related products">'
+        . ($opts !== '' ? '<datalist id="related-list">' . $opts . '</datalist>' : '')
+        . '</details>';
+}
+
+/* ============================================================ sales reports
+   Orders → Reports: paid orders by month, best sellers and sales by category,
+   for a date range (UK dates of when orders were placed, as in the orders CSV).
+   Refunded orders are left out of the sales and shown on their own. */
+
+function report_range(): array
+{
+    $tz = new DateTimeZone('Europe/London');
+    $today = new DateTimeImmutable('now', $tz);
+    $ok = fn($d) => is_string($d) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $d) && strtotime($d) ? $d : null;
+    $to = $ok($_GET['to'] ?? null) ?? $today->format('Y-m-d');
+    $from = $ok($_GET['from'] ?? null) ?? $today->modify('first day of this month')->modify('-11 months')->format('Y-m-d');
+    return $from <= $to ? [$from, $to] : [$to, $from];
+}
+
+/* Paid and refunded orders placed in the range, each with its UK month. */
+function report_orders(string $from, string $to): array
+{
+    $tz = new DateTimeZone('Europe/London');
+    $utc = fn(string $d, bool $end) => (new DateTimeImmutable($d . ($end ? ' 23:59:59' : ' 00:00:00'), $tz))->setTimezone(new DateTimeZone('UTC'))->format('Y-m-d H:i:s');
+    $st = db()->prepare("SELECT * FROM orders WHERE status IN ('paid', 'refunded') AND created >= ? AND created <= ? ORDER BY created");
+    $st->execute([$utc($from, false), $utc($to, true)]);
+    $out = [];
+    foreach ($st->fetchAll() as $o) {
+        $o['month'] = (new DateTimeImmutable($o['created'], new DateTimeZone('UTC')))->setTimezone($tz)->format('Y-m');
+        $out[] = $o;
+    }
+    return $out;
+}
+
+function report_data(string $from, string $to): array
+{
+    $orders = report_orders($from, $to);
+    $months = [];
+    // Every month in the range, even quiet ones.
+    for ($m = new DateTimeImmutable(substr($from, 0, 7) . '-01'); $m->format('Y-m') <= substr($to, 0, 7); $m = $m->modify('+1 month')) {
+        $months[$m->format('Y-m')] = ['orders' => 0, 'goods' => 0, 'discounts' => 0, 'delivery' => 0, 'vat' => 0, 'total' => 0, 'refunds' => 0, 'refunded' => 0];
+    }
+    $paid = [];
+    foreach ($orders as $o) {
+        $r = &$months[$o['month']];
+        if ($o['status'] === 'refunded') {
+            $r['refunds']++;
+            $r['refunded'] += (int)$o['total_pence'];
+            continue;
+        }
+        $paid[] = (int)$o['id'];
+        $r['orders']++;
+        $r['goods'] += (int)$o['subtotal_pence'] - (int)$o['group_pence'];
+        $r['discounts'] += (int)$o['discount_pence'];
+        $r['delivery'] += (int)$o['postage_pence'];
+        $r['vat'] += (int)($o['vat_pence'] ?? 0);
+        $r['total'] += (int)$o['total_pence'];
+        unset($r);
+    }
+    // Best sellers and categories, from the items of paid orders (at the prices charged).
+    $best = [];
+    $cats = [];
+    if ($paid) {
+        foreach (array_chunk($paid, 500) as $chunk) {
+            $rows = db()->query('SELECT i.product_id, i.name, i.qty, i.unit_pence, p.category_id, p.name AS pname FROM order_items i
+                                 LEFT JOIN products p ON p.id = i.product_id WHERE i.order_id IN (' . implode(',', $chunk) . ')')->fetchAll();
+            foreach ($rows as $i) {
+                $key = (int)$i['product_id'] && $i['pname'] !== null ? 'p' . $i['product_id'] : 'n' . mb_strtolower($i['name']);
+                $best[$key] ??= ['name' => $i['pname'] ?? $i['name'], 'qty' => 0, 'value' => 0, 'id' => (int)$i['product_id']];
+                $best[$key]['qty'] += (int)$i['qty'];
+                $best[$key]['value'] += (int)$i['qty'] * (int)$i['unit_pence'];
+                $top = $i['category_id'] !== null && (int)$i['category_id'] ? (cat_trail((int)$i['category_id'])[0] ?? null) : null;
+                $ck = $top ? (int)$top['id'] : 0;
+                $cats[$ck] ??= ['name' => $top ? $top['name'] : 'No category', 'qty' => 0, 'value' => 0];
+                $cats[$ck]['qty'] += (int)$i['qty'];
+                $cats[$ck]['value'] += (int)$i['qty'] * (int)$i['unit_pence'];
+            }
+        }
+    }
+    $byQty = array_values($best);
+    usort($byQty, fn($a, $b) => [$b['qty'], $b['value']] <=> [$a['qty'], $a['value']]);
+    $byValue = array_values($best);
+    usort($byValue, fn($a, $b) => [$b['value'], $b['qty']] <=> [$a['value'], $a['qty']]);
+    $cats = array_values($cats);
+    usort($cats, fn($a, $b) => $b['value'] <=> $a['value']);
+    return ['months' => $months, 'qty' => array_slice($byQty, 0, 20), 'value' => array_slice($byValue, 0, 20), 'cats' => $cats];
+}
+
+/* A bar chart of sales by month, drawn as SVG by the page itself. */
+function report_chart(array $months): string
+{
+    $max = max(1, ...array_values(array_map(fn($m) => $m["total"], $months)));
+    $n = count($months);
+    $w = 640;
+    $h = 180;
+    $bw = $w / max(1, $n);
+    $bars = '';
+    $i = 0;
+    foreach ($months as $key => $m) {
+        $bh = (int)round($m['total'] / $max * ($h - 30));
+        $x = $i * $bw;
+        $label = (new DateTimeImmutable($key . '-01'))->format($n > 12 ? 'M y' : 'M');
+        $bar = min($bw * 0.7, 56);   // slim bars even with only a few months
+        $bars .= '<g><title>' . e($label . ': ' . money($m['total']) . ', ' . $m['orders'] . ' orders') . '</title>'
+               . '<rect x="' . round($x + ($bw - $bar) / 2, 1) . '" y="' . ($h - 20 - $bh) . '" width="' . round($bar, 1) . '" height="' . max($bh, $m['total'] ? 1 : 0) . '" rx="2"></rect>'
+               . '<text x="' . round($x + $bw / 2, 1) . '" y="' . ($h - 5) . '" text-anchor="middle">' . e($label) . '</text></g>';
+        $i++;
+    }
+    return '<svg class="chart" viewBox="0 0 ' . $w . ' ' . $h . '" role="img" aria-label="Sales by month, the highest ' . e(money($max)) . '">' . $bars . '</svg>';
+}
+
+/* One report table as CSV rows. */
+function report_table(array $d, string $which): array
+{
+    $m = fn(int $p) => price_input($p);
+    return match ($which) {
+        'months' => array_merge([['Month', 'Orders', 'Goods', 'Discounts', 'Delivery', 'VAT included', 'Total', 'Refunded orders', 'Refunded']],
+            array_map(fn($k, $r) => [(new DateTimeImmutable($k . '-01'))->format('F Y'), $r['orders'], $m($r['goods']), $m($r['discounts']),
+                $m($r['delivery']), $m($r['vat']), $m($r['total']), $r['refunds'], $m($r['refunded'])], array_keys($d['months']), $d['months'])),
+        'qty', 'value' => array_merge([['Product', 'Sold', 'Sales']], array_map(fn($r) => [$r['name'], $r['qty'], $m($r['value'])], $d[$which])),
+        'cats' => array_merge([['Category', 'Sold', 'Sales']], array_map(fn($r) => [$r['name'], $r['qty'], $m($r['value'])], $d['cats'])),
+        default => [],
+    };
+}
+
+function view_admin_reports(): never
+{
+    require_admin();
+    [$from, $to] = report_range();
+    $d = report_data($from, $to);
+    if (isset($_GET['csv']) && in_array($_GET['csv'], ['months', 'qty', 'value', 'cats'], true)) {
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="sales-' . $_GET['csv'] . '-' . $from . '-to-' . $to . '.csv"');
+        header('Cache-Control: no-store');
+        echo "\xEF\xBB\xBF";
+        foreach (report_table($d, $_GET['csv']) as $r) {
+            echo implode(',', array_map('csv_cell', $r)), "\r\n";
+        }
+        exit;
+    }
+    $csv = fn(string $w) => '<a class="rcsv" href="' . e(url_with(admin_url('reports'), ['from' => $from, 'to' => $to, 'csv' => $w])) . '">Download CSV</a>';
+    $sum = array_reduce($d['months'], fn($c, $r) => array_map(fn($a, $b) => $a + $b, $c, $r), array_fill(0, 8, 0));
+    $sum = array_combine(array_keys(reset($d['months']) ?: ['orders' => 0, 'goods' => 0, 'discounts' => 0, 'delivery' => 0, 'vat' => 0, 'total' => 0, 'refunds' => 0, 'refunded' => 0]), $sum);
+    $rows = '';
+    foreach (array_reverse($d['months'], true) as $k => $r) {
+        $rows .= '<tr><td>' . e((new DateTimeImmutable($k . '-01'))->format('F Y')) . '</td><td class="num">' . $r['orders'] . '</td><td class="num">' . money($r['goods'])
+               . '</td><td class="num">' . ($r['discounts'] ? '−' . money($r['discounts']) : '') . '</td><td class="num">' . money($r['delivery'])
+               . '</td><td class="num">' . money($r['vat']) . '</td><td class="num"><b>' . money($r['total']) . '</b></td><td class="num muted">'
+               . ($r['refunds'] ? $r['refunds'] . ' · ' . money($r['refunded']) : '') . '</td></tr>';
+    }
+    $tbl = function (array $list, string $first) {
+        $out = '';
+        foreach ($list as $i => $r) {
+            $out .= '<tr><td>' . ($i + 1) . '.</td><td>' . (!empty($r['id']) ? '<a href="' . e(admin_url('edit/' . $r['id'])) . '">' . e($r['name']) . '</a>' : e($r['name']))
+                  . '</td><td class="num">' . $r['qty'] . '</td><td class="num">' . money($r['value']) . '</td></tr>';
+        }
+        return $out !== '' ? '<table class="rtable"><tr><th></th><th>' . $first . '</th><th class="num">Sold</th><th class="num">Sales</th></tr>' . $out . '</table>' : '<p class="muted">None in these dates.</p>';
+    };
+    $presets = [];
+    $tz = new DateTimeZone('Europe/London');
+    $now = new DateTimeImmutable('now', $tz);
+    foreach (['This month' => [$now->modify('first day of this month'), $now], 'Last month' => [$now->modify('first day of last month'), $now->modify('last day of last month')],
+              'Last 12 months' => [$now->modify('first day of this month')->modify('-11 months'), $now],
+              'This year' => [$now->setDate((int)$now->format('Y'), 1, 1), $now]] as $label => [$a, $b]) {
+        $presets[] = '<a href="' . e(url_with(admin_url('reports'), ['from' => $a->format('Y-m-d'), 'to' => $b->format('Y-m-d')])) . '">' . $label . '</a>';
+    }
+    admin_shell('Reports', '<h1>Sales reports</h1>'
+        . '<form method="get" action="' . e(admin_url('reports')) . '" class="rrange">'
+        . (str_contains(admin_url('reports'), '?') ? '<input type="hidden" name="q" value="admin/reports">' : '')
+        . '<label>From <input type="date" name="from" value="' . e($from) . '"></label><label>To <input type="date" name="to" value="' . e($to) . '"></label>'
+        . '<button class="quiet">Show</button><span class="muted">' . implode(' · ', $presets) . '</span></form>'
+        . '<p class="muted">Paid orders placed in these dates (UK dates, as in the orders CSV). Refunded orders aren\'t counted as sales; they\'re shown on their own. '
+        . 'Prices include VAT. Orders brought across from an old shop are included.</p>'
+        . '<div class="rsum"><div><span>' . money($sum['total']) . '</span>Sales</div><div><span>' . $sum['orders'] . '</span>Orders</div>'
+        . '<div><span>' . ($sum['orders'] ? money(intdiv($sum['total'], $sum['orders'])) : '–') . '</span>Average order</div>'
+        . '<div><span>' . money($sum['vat']) . '</span>VAT included</div></div>'
+        . report_chart($d['months'])
+        . '<div class="rhead"><h2>By month</h2>' . $csv('months') . '</div>'
+        . '<div class="rwrap"><table class="rtable"><tr><th>Month</th><th class="num">Orders</th><th class="num">Goods</th><th class="num">Discounts</th><th class="num">Delivery</th>'
+        . '<th class="num">VAT incl.</th><th class="num">Total</th><th class="num">Refunded</th></tr>' . $rows
+        . '<tr class="rtot"><td>Total</td><td class="num">' . $sum['orders'] . '</td><td class="num">' . money($sum['goods']) . '</td><td class="num">'
+        . ($sum['discounts'] ? '−' . money($sum['discounts']) : '') . '</td><td class="num">' . money($sum['delivery']) . '</td><td class="num">' . money($sum['vat'])
+        . '</td><td class="num">' . money($sum['total']) . '</td><td class="num muted">' . ($sum['refunds'] ? $sum['refunds'] . ' · ' . money($sum['refunded']) : '') . '</td></tr></table></div>'
+        . '<div class="rcols"><div><div class="rhead"><h2>Best sellers by quantity</h2>' . $csv('qty') . '</div>' . $tbl($d['qty'], 'Product') . '</div>'
+        . '<div><div class="rhead"><h2>Best sellers by sales</h2>' . $csv('value') . '</div>' . $tbl($d['value'], 'Product') . '</div></div>'
+        . '<div class="rhead"><h2>By category</h2>' . $csv('cats') . '</div>' . $tbl($d['cats'], 'Category')
+        . '<p class="muted">Best sellers and categories count items at the prices charged, before any discount code on the whole order, and by each product\'s main category today.</p>');
+}
 /* ------------------------------------------------------------------ router */
 
 $q = trim(str_in($_GET['q'] ?? ''), '/');
@@ -10409,6 +13180,10 @@ if (($seg[0] ?? '') === 'admin') {
         $sub === 'customers'                    => view_admin_customers(),
         $sub === 'discounts'                    => view_admin_discounts(),
         $sub === 'groups'                       => view_admin_groups(),
+        $sub === 'trade'                        => view_admin_trade(),
+        $sub === 'moving' && ($_GET['rules'] ?? '') === '1' => (function () { require_admin(); redirect_rules_download(); })(),
+        $sub === 'moving'                       => view_admin_moving(),
+        $sub === 'reports'                      => view_admin_reports(),
         $sub === 'ready'                        => view_admin_ready(),
         $sub === 'export'                       => view_admin_export(),
         $sub === 'licences'                     => view_admin_licences(),
@@ -10448,6 +13223,7 @@ if (($seg[0] ?? '') === 'account') {
         $sub === 'delete'                            => view_account_delete(),
         $sub === 'from-order' && is_post()           => account_from_order(),
         $sub === 'licences'                          => view_account_licences(),
+        $sub === 'trade'                             => view_account_trade(),
         $sub === 'licence' && isset($seg[2])         => view_account_licence((int)$seg[2]),
         $sub === 'download' && isset($seg[2])        => account_download((int)$seg[2]),
         default                                      => view_404(),

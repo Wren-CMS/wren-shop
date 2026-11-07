@@ -6,18 +6,20 @@ Wren Shop lives in its own `/shop/` folder and borrows your Wren site's theme an
 
 It's one PHP file and a SQLite database, made for UK businesses, from a handful of products to a few thousand.
 
-- Products with photos, SKUs, options (sizes, colours) with their own prices, stock and SKUs
+- Products with photos, SKUs, and one or two options (colour and size) with their own prices, stock, SKUs and weights; combinations not made can be switched off
 - Categories inside categories (three levels), products in several categories, with dropdown menus
 - Sale prices with optional start and end dates, and backorders for stock that's on its way
-- Product import and export by spreadsheet (CSV), checked before anything changes, plus a WooCommerce converter
+- Product import and export by spreadsheet (CSV), checked before anything changes, and photo import (a zip named by SKU, or web addresses), done in batches
+- Moving from WooCommerce: products, photos, customers keeping their passwords, past orders and redirects from the old addresses
 - Search, with part numbers first and your own synonyms; paged and sortable lists
-- Basket with UK delivery, free delivery over an amount, or collection
+- Delivery methods (standard, next day, courier, collection) priced flat, by order value or by weight, with UK postcode zones, and free delivery over an amount
 - Payment by **PayPal**, **bank transfer** or **pay on collection**
 - VAT shown for VAT-registered shops, and printable VAT invoices (receipts for other shops)
 - Order emails over your own SMTP, packing slips, refunds through PayPal
 - Customer accounts (guest checkout always works), discount codes, and customer groups such as reseller prices
+- Trade accounts: fixed trade prices, prices shown without VAT, minimum orders, ways to pay per group and an application form
 - **Digital downloads**, including Wren themes licensed per website, with renewals for updates
-- Low-stock emails, CSV export for bookkeeping, and a tool for customers' data requests
+- Sales reports (by month, best sellers, categories), related products, low-stock emails, CSV export for bookkeeping, and a tool for customers' data requests
 - A full-width admin with sections down the side and tabs along the top that works on a phone, with two-factor sign-in and a "Getting ready" checklist for launch or handover
 
 **Demo:** [wrencms.com/shop](https://wrencms.com/shop/)
@@ -26,7 +28,7 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 ## Requirements
 
 - A Wren CMS site
-- PHP 8.1 or newer with SQLite (PDO), GD, cURL and mbstring
+- PHP 8.1 or newer with SQLite (PDO), GD, cURL and mbstring (and Zip, to import a zip of photos)
 - Apache or LiteSpeed (nginx works with two extra rules; see the guide)
 - An SSL certificate (`https://`)
 
@@ -42,11 +44,13 @@ It's one PHP file and a SQLite database, made for UK businesses, from a handful 
 
 Upload only the new `shop/index.php`, replacing the old one. Never replace the `data` or `media` folders. Then open the shop admin once.
 
+Upgrading to 1.3.0 from any earlier version is the same; a shop with one delivery price looks exactly as it did. If you use **Proxy or CDN: Cloudflare**, upgrade soon: earlier versions showed an error page with it on.
+
 Upgrading from 0.12.0 or earlier: the shop now learns its web address from your signed-in visit to the admin, so it uses a plain version of your theme and sends no emails until you've opened the admin once.
 
 ## Moving from WooCommerce
 
-`tools/woo-to-wren.php` turns a WooCommerce product export into a Wren Shop import file, with a report of anything that doesn't map. See [Importing and exporting products](https://github.com/Wren-CMS/wren-shop/wiki/Importing-and-exporting-products) in the guide.
+`tools/woo-to-wren.php` turns WooCommerce's exports into Wren Shop import files: products (with photos and each product's old address), and optionally customers (with their password hashes), past orders and redirects from the old shop's sitemap, with a report of anything that doesn't map. See [Moving from WooCommerce](https://github.com/Wren-CMS/wren-shop/wiki/Moving-from-WooCommerce) in the guide.
 
 ## Demo products
 
